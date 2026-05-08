@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 
@@ -75,13 +76,120 @@ class _LibraryToolbarState extends State<LibraryToolbar> {
           const SizedBox(width: 10),
           ListenableBuilder(
             listenable: widget.controller,
-            builder: (context, _) => ToolbarToggle(
-              label: 'Unreviewed only',
-              value: widget.controller.unreviewedOnly,
-              onTap: widget.controller.toggleUnreviewedOnly,
-            ),
+            builder: (context, _) {
+              final recent = widget.controller.recentReviewedTracks;
+              return Row(
+                children: [
+                  if (recent.isNotEmpty) ...[
+                    _RecentReviewedButton(
+                      tracks: recent,
+                      onSelected: widget.controller.play,
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  ToolbarToggle(
+                    label: 'Unreviewed only',
+                    value: widget.controller.unreviewedOnly,
+                    onTap: widget.controller.toggleUnreviewedOnly,
+                  ),
+                ],
+              );
+            },
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _RecentReviewedButton extends StatelessWidget {
+  final List<Track> tracks;
+  final void Function(String trackId) onSelected;
+
+  const _RecentReviewedButton({
+    required this.tracks,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<String>(
+      tooltip: 'Recently reviewed',
+      onSelected: onSelected,
+      color: AppColors.surface,
+      elevation: 6,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(6),
+        side: const BorderSide(color: AppColors.border),
+      ),
+      itemBuilder: (context) => [
+        for (final t in tracks)
+          PopupMenuItem<String>(
+            value: t.id,
+            height: 32,
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.replay_rounded,
+                  size: 14,
+                  color: AppColors.textSecondary,
+                ),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Text(
+                    t.title,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+                if (t.artist.isNotEmpty) ...[
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Text(
+                      t.artist,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: AppColors.textSecondary,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+      ],
+      child: Material(
+        color: AppColors.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(6),
+          side: const BorderSide(color: AppColors.border),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(
+            children: [
+              const Icon(
+                Icons.history_rounded,
+                size: 14,
+                color: AppColors.textSecondary,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                'Recent (${tracks.length})',
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  height: 1.0,
+                  color: AppColors.textPrimary,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

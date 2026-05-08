@@ -10,10 +10,18 @@ class AppColors {
   static const accent = Color(0xFF7C5CFF);
   static const favorite = Color(0xFFFFC857);
   static const reviewed = Color(0xFF4CAF7E);
+  static const trail = Color(0xFFC8523F);
 
   static final hoverRow = accent.withValues(alpha: 0.06);
   static final selectedRow = accent.withValues(alpha: 0.14);
   static final focusOverlay = accent.withValues(alpha: 0.20);
+
+  static const trailAlphas = <double>[0.18, 0.13, 0.09, 0.06, 0.03];
+
+  static Color? trailTint(int? index) {
+    if (index == null || index < 0 || index >= trailAlphas.length) return null;
+    return trail.withValues(alpha: trailAlphas[index]);
+  }
 }
 
 ThemeData buildAppTheme() {

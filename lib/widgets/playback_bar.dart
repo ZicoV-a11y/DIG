@@ -12,28 +12,24 @@ class PlaybackBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 92,
+      height: 116,
       color: AppColors.surface,
-      padding: const EdgeInsets.fromLTRB(14, 10, 16, 10),
+      padding: const EdgeInsets.fromLTRB(16, 12, 18, 12),
       child: ListenableBuilder(
         listenable: controller,
         builder: (context, _) {
           final track = controller.currentTrack;
-          final pos = controller.currentPosition;
           final dur = track?.duration ?? Duration.zero;
-          final progress = dur.inMilliseconds == 0
-              ? 0.0
-              : (pos.inMilliseconds / dur.inMilliseconds).clamp(0.0, 1.0);
           final hasTrack = track != null;
 
           return Row(
             children: [
               if (hasTrack) ...[
-                TrackArtwork(seed: track.title, size: 64),
-                const SizedBox(width: 12),
+                TrackArtwork(seed: track.title, size: 76),
+                const SizedBox(width: 14),
               ],
               SizedBox(
-                width: 180,
+                width: 200,
                 child: hasTrack
                     ? Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -109,24 +105,24 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
-                        const SizedBox(width: 6),
+                        const SizedBox(width: 14),
                         _CircleIconButton(
                           tooltip: 'Previous',
                           icon: Icons.skip_previous_rounded,
                           onPressed: controller.previous,
                         ),
-                        const SizedBox(width: 2),
+                        const SizedBox(width: 4),
                         _PlayPauseButton(
                           isPlaying: controller.isPlaying,
                           onPressed: controller.togglePlayPause,
                         ),
-                        const SizedBox(width: 2),
+                        const SizedBox(width: 4),
                         _CircleIconButton(
                           tooltip: 'Next',
                           icon: Icons.skip_next_rounded,
                           onPressed: controller.next,
                         ),
-                        const SizedBox(width: 6),
+                        const SizedBox(width: 14),
                         SkipButton(
                           label: '+5',
                           onPressed: hasTrack
@@ -161,57 +157,11 @@ class PlaybackBar extends StatelessWidget {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        SizedBox(
-                          width: 40,
-                          child: Text(
-                            _fmt(pos),
-                            textAlign: TextAlign.right,
-                            style: const TextStyle(
-                              color: AppColors.textSecondary,
-                              fontSize: 11,
-                              fontFeatures: [FontFeature.tabularFigures()],
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: SliderTheme(
-                            data: const SliderThemeData(
-                              trackHeight: 2,
-                              activeTrackColor: AppColors.accent,
-                              inactiveTrackColor: AppColors.border,
-                              thumbColor: AppColors.accent,
-                              thumbShape: RoundSliderThumbShape(
-                                enabledThumbRadius: 4,
-                              ),
-                              overlayShape: RoundSliderOverlayShape(
-                                overlayRadius: 8,
-                              ),
-                            ),
-                            child: Slider(
-                              value: progress,
-                              onChanged: hasTrack
-                                  ? controller.seekToFraction
-                                  : null,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        SizedBox(
-                          width: 40,
-                          child: Text(
-                            _fmtDuration(dur),
-                            style: const TextStyle(
-                              color: AppColors.textSecondary,
-                              fontSize: 11,
-                              fontFeatures: [FontFeature.tabularFigures()],
-                            ),
-                          ),
-                        ),
-                      ],
+                    const SizedBox(height: 8),
+                    _PositionRow(
+                      controller: controller,
+                      duration: dur,
+                      enabled: hasTrack,
                     ),
                   ],
                 ),
@@ -222,6 +172,75 @@ class PlaybackBar extends StatelessWidget {
           );
         },
       ),
+    );
+  }
+}
+
+class _PositionRow extends StatelessWidget {
+  final LibraryController controller;
+  final Duration duration;
+  final bool enabled;
+
+  const _PositionRow({
+    required this.controller,
+    required this.duration,
+    required this.enabled,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<Duration>(
+      valueListenable: controller.positionListenable,
+      builder: (context, pos, _) {
+        final progress = duration.inMilliseconds == 0
+            ? 0.0
+            : (pos.inMilliseconds / duration.inMilliseconds).clamp(0.0, 1.0);
+        return Row(
+          children: [
+            SizedBox(
+              width: 48,
+              child: Text(
+                _fmt(pos),
+                textAlign: TextAlign.right,
+                style: const TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 12,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: SliderTheme(
+                data: const SliderThemeData(
+                  trackHeight: 4,
+                  activeTrackColor: AppColors.accent,
+                  inactiveTrackColor: AppColors.border,
+                  thumbColor: AppColors.accent,
+                  thumbShape: RoundSliderThumbShape(enabledThumbRadius: 7),
+                  overlayShape: RoundSliderOverlayShape(overlayRadius: 18),
+                ),
+                child: Slider(
+                  value: progress,
+                  onChanged: enabled ? controller.seekToFraction : null,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            SizedBox(
+              width: 48,
+              child: Text(
+                _fmtDuration(duration),
+                style: const TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 12,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -251,9 +270,9 @@ class _CircleIconButton extends StatelessWidget {
           hoverColor: AppColors.hoverRow,
           focusColor: AppColors.focusOverlay,
           child: SizedBox(
-            width: 28,
-            height: 28,
-            child: Icon(icon, size: 20, color: AppColors.textPrimary),
+            width: 38,
+            height: 38,
+            child: Icon(icon, size: 24, color: AppColors.textPrimary),
           ),
         ),
       ),
@@ -277,12 +296,12 @@ class _PlayPauseButton extends StatelessWidget {
         hoverColor: Colors.white.withValues(alpha: 0.10),
         focusColor: Colors.white.withValues(alpha: 0.18),
         child: SizedBox(
-          width: 34,
-          height: 34,
+          width: 46,
+          height: 46,
           child: Icon(
             isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
             color: Colors.white,
-            size: 20,
+            size: 26,
           ),
         ),
       ),

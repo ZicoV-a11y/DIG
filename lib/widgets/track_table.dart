@@ -98,7 +98,7 @@ class _TableHeader extends StatelessWidget {
       child: Row(
         children: [
           _HeaderCell(
-            width: 32,
+            width: 38,
             label: '★',
             column: TrackSortColumn.favorite,
             controller: controller,
@@ -106,7 +106,7 @@ class _TableHeader extends StatelessWidget {
           ),
           const SizedBox(width: 6),
           _HeaderCell(
-            width: 36,
+            width: 40,
             label: 'REV',
             column: TrackSortColumn.reviewed,
             controller: controller,
@@ -227,9 +227,13 @@ class _TrackRow extends StatelessWidget {
     final isCurrent = controller.currentTrackId == track.id;
     final titleColor = isCurrent ? AppColors.accent : AppColors.textPrimary;
     final titleWeight = isCurrent ? FontWeight.w600 : FontWeight.w500;
+    final trailIndex = isCurrent ? null : controller.trailIndexOf(track.id);
+    final rowColor = isCurrent
+        ? AppColors.selectedRow
+        : (AppColors.trailTint(trailIndex) ?? Colors.transparent);
 
     return Material(
-      color: isCurrent ? AppColors.selectedRow : Colors.transparent,
+      color: rowColor,
       child: InkWell(
         onTap: () => controller.play(track.id),
         hoverColor: AppColors.hoverRow,
@@ -251,7 +255,7 @@ class _TrackRow extends StatelessWidget {
               child: Row(
                 children: [
                   SizedBox(
-                    width: 32,
+                    width: 38,
                     child: _IconAction(
                       tooltip: track.favorite ? 'Unfavorite' : 'Favorite',
                       icon: track.favorite
@@ -265,12 +269,12 @@ class _TrackRow extends StatelessWidget {
                   ),
                   const SizedBox(width: 6),
                   SizedBox(
-                    width: 36,
+                    width: 40,
                     child: Text(
                       track.reviewed ? '✔' : '○',
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        fontSize: 14,
+                        fontSize: 17,
                         height: 1.0,
                         color: track.reviewed
                             ? AppColors.reviewed
@@ -410,11 +414,11 @@ class _IconAction extends StatelessWidget {
       waitDuration: const Duration(milliseconds: 600),
       child: InkResponse(
         onTap: onPressed,
-        radius: 14,
+        radius: 18,
         containedInkWell: false,
         child: Padding(
-          padding: const EdgeInsets.all(4),
-          child: Icon(icon, size: 16, color: color),
+          padding: const EdgeInsets.all(5),
+          child: Icon(icon, size: 20, color: color),
         ),
       ),
     );

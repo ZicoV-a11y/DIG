@@ -2,6 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:music_tracker/main.dart';
+import 'package:music_tracker/services/database.dart';
+import 'package:music_tracker/services/library_repository.dart';
+import 'package:music_tracker/services/playback_engine.dart';
+import 'package:music_tracker/state/library_controller.dart';
 
 void main() {
   testWidgets('App renders empty library shell', (WidgetTester tester) async {
@@ -10,7 +14,18 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
-    await tester.pumpWidget(const MusicTrackerApp());
+    final db = AppDatabase();
+    await db.openInMemory();
+    addTearDown(db.close);
+
+    final repo = LibraryRepository(db);
+    final engine = PlaybackEngine();
+    final controller = LibraryController(engine: engine, repo: repo);
+    await controller.hydrate();
+
+    await tester.pumpWidget(
+      MusicTrackerApp(engine: engine, controller: controller, db: db),
+    );
     await tester.pump();
 
     expect(find.text('LIBRARY'), findsOneWidget);

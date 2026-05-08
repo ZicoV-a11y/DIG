@@ -5,12 +5,17 @@ class PlaybackEngine {
 
   String? _currentPath;
 
+  late final Stream<Duration> _positionStream = _player.createPositionStream(
+    minPeriod: const Duration(milliseconds: 16),
+    maxPeriod: const Duration(milliseconds: 16),
+  );
+
   String? get currentPath => _currentPath;
   bool get isPlaying => _player.playing;
   Duration get position => _player.position;
   Duration? get duration => _player.duration;
 
-  Stream<Duration> get positionStream => _player.positionStream;
+  Stream<Duration> get positionStream => _positionStream;
   Stream<Duration?> get durationStream => _player.durationStream;
   Stream<bool> get playingStream => _player.playingStream;
   Stream<ProcessingState> get processingStateStream =>

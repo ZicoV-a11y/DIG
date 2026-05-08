@@ -15,11 +15,68 @@ class TrackTable extends StatefulWidget {
 
 class _TrackTableState extends State<TrackTable> {
   final ScrollController _scroll = ScrollController();
+  String? _lastScrolledSelection;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.revealTick.addListener(_onRevealRequested);
+  }
 
   @override
   void dispose() {
+    widget.controller.revealTick.removeListener(_onRevealRequested);
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _onRevealRequested() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _centerOnCurrent();
+    });
+  }
+
+  void _centerOnCurrent() {
+    if (!_scroll.hasClients) return;
+    final c = widget.controller;
+    final id = c.currentTrackId;
+    if (id == null) return;
+    final tracks = c.visibleTracks;
+    final idx = tracks.indexWhere((t) => t.id == id);
+    if (idx < 0) return;
+    final extent = c.showArtwork ? 48.0 : 32.0;
+    final view = _scroll.position.viewportDimension;
+    final maxScroll = _scroll.position.maxScrollExtent;
+    final target = (idx * extent - view / 2 + extent / 2).clamp(
+      0.0,
+      maxScroll,
+    );
+    _scroll.animateTo(
+      target,
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOut,
+    );
+  }
+
+  void _ensureSelectedVisible() {
+    if (!_scroll.hasClients) return;
+    final c = widget.controller;
+    final id = c.selectedTrackId;
+    if (id == null || id == _lastScrolledSelection) return;
+    final tracks = c.visibleTracks;
+    final idx = tracks.indexWhere((t) => t.id == id);
+    if (idx < 0) return;
+    final extent = c.showArtwork ? 48.0 : 32.0;
+    final target = idx * extent;
+    final view = _scroll.position.viewportDimension;
+    final current = _scroll.offset;
+    final maxScroll = _scroll.position.maxScrollExtent;
+    if (target < current) {
+      _scroll.jumpTo(target.clamp(0.0, maxScroll));
+    } else if (target + extent > current + view) {
+      _scroll.jumpTo((target + extent - view).clamp(0.0, maxScroll));
+    }
+    _lastScrolledSelection = id;
   }
 
   @override
@@ -30,6 +87,9 @@ class _TrackTableState extends State<TrackTable> {
         final c = widget.controller;
         final tracks = c.visibleTracks;
         final showArtwork = c.showArtwork;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _ensureSelectedVisible();
+        });
         return Column(
           children: [
             _TableHeader(controller: c),
@@ -91,6 +151,9 @@ class _TableHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final ratio = controller.titleArtistRatio;
+    final titleFlex = (ratio * 1000).round().clamp(1, 1000);
+    final artistFlex = (1000 - titleFlex).clamp(1, 1000);
     return Container(
       height: 30,
       color: AppColors.surface,
@@ -98,22 +161,33 @@ class _TableHeader extends StatelessWidget {
       child: Row(
         children: [
           _HeaderCell(
-            width: 38,
+            width: controller.colFavWidth,
             label: '★',
             column: TrackSortColumn.favorite,
             controller: controller,
             align: TextAlign.center,
           ),
-          const SizedBox(width: 6),
+          _ResizeHandle(
+            onDelta: (dx) => controller.setColumnWidth(
+              'fav',
+              controller.colFavWidth + dx,
+            ),
+          ),
           _HeaderCell(
-            width: 40,
+            width: controller.colRevWidth,
             label: 'REV',
             column: TrackSortColumn.reviewed,
             controller: controller,
             align: TextAlign.center,
           ),
-          const SizedBox(width: 6),
+          _ResizeHandle(
+            onDelta: (dx) => controller.setColumnWidth(
+              'rev',
+              controller.colRevWidth + dx,
+            ),
+          ),
           Expanded(
+            flex: titleFlex,
             child: _HeaderCell(
               label: 'TITLE',
               column: TrackSortColumn.title,
@@ -121,23 +195,103 @@ class _TableHeader extends StatelessWidget {
               align: TextAlign.left,
             ),
           ),
-          const SizedBox(width: 6),
+          _TitleArtistSplitter(controller: controller),
+          Expanded(
+            flex: artistFlex,
+            child: _HeaderCell(
+              label: 'ARTIST',
+              column: TrackSortColumn.artist,
+              controller: controller,
+              align: TextAlign.left,
+            ),
+          ),
+          _ResizeHandle(
+            onDelta: (dx) => controller.setColumnWidth(
+              'bpm',
+              controller.colBpmWidth - dx,
+            ),
+          ),
           _HeaderCell(
-            width: 60,
+            width: controller.colBpmWidth,
+            label: 'BPM',
+            column: TrackSortColumn.bpm,
+            controller: controller,
+            align: TextAlign.right,
+          ),
+          _ResizeHandle(
+            onDelta: (dx) => controller.setColumnWidth(
+              'time',
+              controller.colTimeWidth - dx,
+            ),
+          ),
+          _HeaderCell(
+            width: controller.colTimeWidth,
             label: 'TIME',
             column: TrackSortColumn.duration,
             controller: controller,
             align: TextAlign.right,
           ),
-          const SizedBox(width: 6),
+          _ResizeHandle(
+            onDelta: (dx) => controller.setColumnWidth(
+              'plays',
+              controller.colPlaysWidth - dx,
+            ),
+          ),
           _HeaderCell(
-            width: 50,
+            width: controller.colPlaysWidth,
             label: 'PLAYS',
             column: TrackSortColumn.plays,
             controller: controller,
             align: TextAlign.right,
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ResizeHandle extends StatelessWidget {
+  final ValueChanged<double> onDelta;
+  const _ResizeHandle({required this.onDelta});
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onHorizontalDragUpdate: (d) => onDelta(d.delta.dx),
+        child: const SizedBox(width: 6, height: double.infinity),
+      ),
+    );
+  }
+}
+
+class _TitleArtistSplitter extends StatelessWidget {
+  final LibraryController controller;
+  const _TitleArtistSplitter({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onHorizontalDragUpdate: (d) {
+          // Estimate flex pool from the row width by grabbing this widget's
+          // ancestor RenderBox. ~5px nudge is fine for a session-length drag.
+          final box = context.findRenderObject() as RenderBox?;
+          final parent = box?.parent;
+          double flexWidth = 800;
+          if (parent is RenderBox) {
+            flexWidth = parent.size.width;
+          }
+          if (flexWidth <= 0) return;
+          final newRatio =
+              controller.titleArtistRatio + (d.delta.dx / flexWidth);
+          controller.setTitleArtistRatio(newRatio);
+        },
+        child: const SizedBox(width: 6, height: double.infinity),
       ),
     );
   }
@@ -222,17 +376,68 @@ class _TrackRow extends StatelessWidget {
     required this.showArtwork,
   });
 
+  Future<void> _showContextMenu(BuildContext context, Offset position) async {
+    final overlayState = Overlay.of(context);
+    final overlayBox = overlayState.context.findRenderObject() as RenderBox;
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromPoints(position, position),
+        Offset.zero & overlayBox.size,
+      ),
+      color: AppColors.surface,
+      elevation: 6,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(6),
+        side: const BorderSide(color: AppColors.border),
+      ),
+      items: const [
+        PopupMenuItem<String>(
+          value: 'reveal',
+          height: 32,
+          child: Row(
+            children: [
+              Icon(
+                Icons.folder_open_rounded,
+                size: 14,
+                color: AppColors.textSecondary,
+              ),
+              SizedBox(width: 8),
+              Text(
+                'Show in Finder',
+                style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+    if (result == 'reveal') {
+      await controller.showTrackInFinder(track.id);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final isCurrent = controller.currentTrackId == track.id;
+    final isSelected = !isCurrent && controller.selectedTrackId == track.id;
     final titleColor = isCurrent ? AppColors.accent : AppColors.textPrimary;
     final titleWeight = isCurrent ? FontWeight.w600 : FontWeight.w500;
     final trailIndex = isCurrent ? null : controller.trailIndexOf(track.id);
-    final rowColor = isCurrent
-        ? AppColors.selectedRow
-        : (AppColors.trailTint(trailIndex) ?? Colors.transparent);
+    Color rowColor;
+    if (isCurrent) {
+      rowColor = AppColors.selectedRow;
+    } else if (isSelected) {
+      rowColor = AppColors.accent.withValues(alpha: 0.07);
+    } else {
+      rowColor = AppColors.trailTint(trailIndex) ?? Colors.transparent;
+    }
 
-    return Material(
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onSecondaryTapDown: (details) =>
+          _showContextMenu(context, details.globalPosition),
+      child: Material(
       color: rowColor,
       child: InkWell(
         onTap: () => controller.play(track.id),
@@ -255,7 +460,7 @@ class _TrackRow extends StatelessWidget {
               child: Row(
                 children: [
                   SizedBox(
-                    width: 38,
+                    width: controller.colFavWidth,
                     child: _IconAction(
                       tooltip: track.favorite ? 'Unfavorite' : 'Favorite',
                       icon: track.favorite
@@ -269,7 +474,7 @@ class _TrackRow extends StatelessWidget {
                   ),
                   const SizedBox(width: 6),
                   SizedBox(
-                    width: 40,
+                    width: controller.colRevWidth,
                     child: Text(
                       track.reviewed ? '✔' : '○',
                       textAlign: TextAlign.center,
@@ -284,6 +489,11 @@ class _TrackRow extends StatelessWidget {
                   ),
                   const SizedBox(width: 6),
                   Expanded(
+                    flex:
+                        (controller.titleArtistRatio * 1000).round().clamp(
+                          1,
+                          1000,
+                        ),
                     child: _TitleCell(
                       track: track,
                       isCurrent: isCurrent,
@@ -293,8 +503,35 @@ class _TrackRow extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 6),
+                  Expanded(
+                    flex:
+                        (1000 - (controller.titleArtistRatio * 1000).round())
+                            .clamp(1, 1000),
+                    child: Text(
+                      track.artist.isEmpty ? '—' : track.artist,
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                      style: TextStyle(
+                        color: track.artist.isEmpty
+                            ? AppColors.textSecondary
+                            : AppColors.textPrimary,
+                        fontSize: 12,
+                        height: 1.0,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
                   SizedBox(
-                    width: 60,
+                    width: controller.colBpmWidth,
+                    child: Text(
+                      _formatBpm(track.bpm),
+                      textAlign: TextAlign.right,
+                      style: _numStyle,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  SizedBox(
+                    width: controller.colTimeWidth,
                     child: Text(
                       _formatDuration(track.duration),
                       textAlign: TextAlign.right,
@@ -303,7 +540,7 @@ class _TrackRow extends StatelessWidget {
                   ),
                   const SizedBox(width: 6),
                   SizedBox(
-                    width: 50,
+                    width: controller.colPlaysWidth,
                     child: Text(
                       '${track.playCount}',
                       textAlign: TextAlign.right,
@@ -315,6 +552,7 @@ class _TrackRow extends StatelessWidget {
             ),
           ],
         ),
+      ),
       ),
     );
   }
@@ -360,32 +598,15 @@ class _TitleCell extends StatelessWidget {
           const SizedBox(width: 8),
         ],
         Flexible(
-          child: RichText(
+          child: Text(
+            track.title,
             overflow: TextOverflow.ellipsis,
             maxLines: 1,
-            text: TextSpan(
-              children: [
-                TextSpan(
-                  text: track.title,
-                  style: TextStyle(
-                    color: titleColor,
-                    fontSize: 13,
-                    fontWeight: titleWeight,
-                    height: 1.0,
-                  ),
-                ),
-                if (track.artist.isNotEmpty) ...[
-                  const TextSpan(text: '   '),
-                  TextSpan(
-                    text: track.artist,
-                    style: const TextStyle(
-                      color: AppColors.textSecondary,
-                      fontSize: 12,
-                      height: 1.0,
-                    ),
-                  ),
-                ],
-              ],
+            style: TextStyle(
+              color: titleColor,
+              fontSize: 13,
+              fontWeight: titleWeight,
+              height: 1.0,
             ),
           ),
         ),
@@ -437,4 +658,9 @@ String _formatDuration(Duration d) {
   final m = d.inMinutes;
   final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
   return '$m:$s';
+}
+
+String _formatBpm(double? bpm) {
+  if (bpm == null || bpm <= 0) return '—';
+  return bpm.round().toString();
 }

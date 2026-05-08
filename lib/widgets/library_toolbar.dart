@@ -3,29 +3,19 @@ import 'package:flutter/material.dart';
 import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
+import 'keyboard_shortcuts_help.dart';
 
-class LibraryToolbar extends StatefulWidget {
+class LibraryToolbar extends StatelessWidget {
   final LibraryController controller;
-  const LibraryToolbar({super.key, required this.controller});
+  final TextEditingController searchTextController;
+  final FocusNode searchFocusNode;
 
-  @override
-  State<LibraryToolbar> createState() => _LibraryToolbarState();
-}
-
-class _LibraryToolbarState extends State<LibraryToolbar> {
-  late final TextEditingController _searchCtrl;
-
-  @override
-  void initState() {
-    super.initState();
-    _searchCtrl = TextEditingController(text: widget.controller.searchQuery);
-  }
-
-  @override
-  void dispose() {
-    _searchCtrl.dispose();
-    super.dispose();
-  }
+  const LibraryToolbar({
+    super.key,
+    required this.controller,
+    required this.searchTextController,
+    required this.searchFocusNode,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -39,8 +29,10 @@ class _LibraryToolbarState extends State<LibraryToolbar> {
             child: SizedBox(
               height: 32,
               child: TextField(
-                controller: _searchCtrl,
-                onChanged: widget.controller.setSearchQuery,
+                controller: searchTextController,
+                focusNode: searchFocusNode,
+                onChanged: controller.setSearchQuery,
+                onTapOutside: (_) => searchFocusNode.unfocus(),
                 style: const TextStyle(fontSize: 13),
                 decoration: InputDecoration(
                   hintText: 'Search title or artist…',
@@ -75,28 +67,126 @@ class _LibraryToolbarState extends State<LibraryToolbar> {
           ),
           const SizedBox(width: 10),
           ListenableBuilder(
-            listenable: widget.controller,
+            listenable: controller,
             builder: (context, _) {
-              final recent = widget.controller.recentReviewedTracks;
+              final recent = controller.recentReviewedTracks;
               return Row(
                 children: [
                   if (recent.isNotEmpty) ...[
                     _RecentReviewedButton(
                       tracks: recent,
-                      onSelected: widget.controller.play,
+                      onSelected: (id) =>
+                          controller.play(id, reveal: true),
                     ),
                     const SizedBox(width: 8),
                   ],
                   ToolbarToggle(
                     label: 'Unreviewed only',
-                    value: widget.controller.unreviewedOnly,
-                    onTap: widget.controller.toggleUnreviewedOnly,
+                    value: controller.unreviewedOnly,
+                    onTap: controller.toggleUnreviewedOnly,
+                  ),
+                  const SizedBox(width: 8),
+                  _PlayThresholdPill(controller: controller),
+                  const SizedBox(width: 8),
+                  _ToolbarIconButton(
+                    icon: Icons.keyboard_outlined,
+                    tooltip: 'Keyboard shortcuts',
+                    onTap: () => showKeyboardShortcutsDialog(context),
                   ),
                 ],
               );
             },
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _PlayThresholdPill extends StatelessWidget {
+  final LibraryController controller;
+  const _PlayThresholdPill({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'Play threshold (click to cycle)',
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: AppColors.surfaceAlt,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(5),
+          side: const BorderSide(color: AppColors.border),
+        ),
+        child: InkWell(
+          onTap: controller.cyclePlayThreshold,
+          borderRadius: BorderRadius.circular(5),
+          hoverColor: AppColors.hoverRow,
+          focusColor: AppColors.focusOverlay,
+          child: Container(
+            constraints: const BoxConstraints(minHeight: 32, minWidth: 70),
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.timer_outlined,
+                  size: 14,
+                  color: AppColors.accent,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  'Play ${controller.playThresholdSeconds}s',
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.4,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ToolbarIconButton extends StatelessWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  const _ToolbarIconButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: AppColors.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(6),
+          side: const BorderSide(color: AppColors.border),
+        ),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(6),
+          hoverColor: AppColors.hoverRow,
+          focusColor: AppColors.focusOverlay,
+          child: SizedBox(
+            width: 32,
+            height: 32,
+            child: Icon(icon, size: 16, color: AppColors.textSecondary),
+          ),
+        ),
       ),
     );
   }

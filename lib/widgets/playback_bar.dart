@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import 'skip_button.dart';
@@ -25,47 +26,29 @@ class PlaybackBar extends StatelessWidget {
           return Row(
             children: [
               if (hasTrack) ...[
-                TrackArtwork(seed: track.title, size: 76),
-                const SizedBox(width: 14),
+                _NowPlayingBlock(
+                  track: track,
+                  onTap: controller.revealCurrent,
+                ),
+                const SizedBox(width: 6),
+                _NowPlayingFavorite(
+                  isFavorite: track.favorite,
+                  onPressed: () => controller.toggleFavorite(track.id),
+                ),
+                const SizedBox(width: 10),
+              ] else ...[
+                const SizedBox(
+                  width: 200,
+                  child: Text(
+                    'No track selected',
+                    style: TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
               ],
-              SizedBox(
-                width: 200,
-                child: hasTrack
-                    ? Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Text(
-                            track.title,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: AppColors.textPrimary,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w600,
-                              height: 1.1,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            track.artist,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: AppColors.textSecondary,
-                              fontSize: 11,
-                              height: 1.1,
-                            ),
-                          ),
-                        ],
-                      )
-                    : const Text(
-                        'No track selected',
-                        style: TextStyle(
-                          color: AppColors.textSecondary,
-                          fontSize: 12,
-                        ),
-                      ),
-              ),
-              const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -167,10 +150,69 @@ class PlaybackBar extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
-              const SizedBox(width: 40),
+              _PlaybackModeIndicator(controller: controller),
             ],
           );
         },
+      ),
+    );
+  }
+}
+
+class _PlaybackModeIndicator extends StatelessWidget {
+  final LibraryController controller;
+  const _PlaybackModeIndicator({required this.controller});
+
+  IconData _iconFor(PlaybackMode m) {
+    switch (m) {
+      case PlaybackMode.sequential:
+        return Icons.arrow_forward_rounded;
+      case PlaybackMode.shuffle:
+        return Icons.shuffle_rounded;
+      case PlaybackMode.shuffleUnreviewed:
+        return Icons.shuffle_rounded;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final mode = controller.playbackMode;
+    return Tooltip(
+      message: 'Playback mode (S to cycle)',
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: AppColors.surfaceAlt,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(5),
+          side: const BorderSide(color: AppColors.border),
+        ),
+        child: InkWell(
+          onTap: controller.cyclePlaybackMode,
+          borderRadius: BorderRadius.circular(5),
+          hoverColor: AppColors.hoverRow,
+          focusColor: AppColors.focusOverlay,
+          child: Container(
+            constraints: const BoxConstraints(minHeight: 32, minWidth: 78),
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(_iconFor(mode), size: 14, color: AppColors.accent),
+                const SizedBox(width: 6),
+                Text(
+                  mode.label,
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.6,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -241,6 +283,108 @@ class _PositionRow extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+class _NowPlayingBlock extends StatelessWidget {
+  final Track track;
+  final VoidCallback onTap;
+
+  const _NowPlayingBlock({required this.track, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'Jump to current track',
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(6),
+          hoverColor: AppColors.hoverRow,
+          focusColor: AppColors.focusOverlay,
+          child: Padding(
+            padding: const EdgeInsets.all(2),
+            child: Row(
+              children: [
+                TrackArtwork(seed: track.title, size: 76),
+                const SizedBox(width: 14),
+                SizedBox(
+                  width: 200,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        track.title,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: AppColors.textPrimary,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          height: 1.1,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        track.artist,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: AppColors.textSecondary,
+                          fontSize: 11,
+                          height: 1.1,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _NowPlayingFavorite extends StatelessWidget {
+  final bool isFavorite;
+  final VoidCallback onPressed;
+
+  const _NowPlayingFavorite({
+    required this.isFavorite,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: isFavorite ? 'Unfavorite' : 'Favorite',
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: Colors.transparent,
+        shape: const CircleBorder(),
+        child: InkWell(
+          onTap: onPressed,
+          customBorder: const CircleBorder(),
+          hoverColor: AppColors.hoverRow,
+          focusColor: AppColors.focusOverlay,
+          child: SizedBox(
+            width: 38,
+            height: 38,
+            child: Icon(
+              isFavorite ? Icons.star_rounded : Icons.star_border_rounded,
+              size: 22,
+              color: isFavorite
+                  ? AppColors.favorite
+                  : AppColors.textSecondary,
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

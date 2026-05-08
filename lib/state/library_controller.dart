@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart' show ProcessingState;
 
@@ -7,9 +8,25 @@ import '../models/track.dart';
 import '../models/watched_folder.dart';
 import '../services/audio_scanner.dart';
 import '../services/library_repository.dart';
+import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
 
-enum TrackSortColumn { favorite, reviewed, title, duration, plays }
+enum TrackSortColumn { favorite, reviewed, title, artist, bpm, duration, plays }
+
+enum PlaybackMode { sequential, shuffle, shuffleUnreviewed }
+
+extension PlaybackModeView on PlaybackMode {
+  String get label {
+    switch (this) {
+      case PlaybackMode.sequential:
+        return 'SEQ';
+      case PlaybackMode.shuffle:
+        return 'SHUF';
+      case PlaybackMode.shuffleUnreviewed:
+        return 'UNREV';
+    }
+  }
+}
 
 class LibraryController extends ChangeNotifier {
   final PlaybackEngine engine;
@@ -17,10 +34,13 @@ class LibraryController extends ChangeNotifier {
 
   static const _recentBufferCapacity = 8;
   static const _trailVisibleCount = 5;
+  static const _metadataBatchSize = 100;
 
   final List<WatchedFolder> _folders = [];
   final List<Track> _tracks = [];
   final List<String> _recentReviewedIds = [];
+  final List<String> _metadataQueue = [];
+  bool _metadataProcessing = false;
 
   String? _selectedFolderPath;
   String _searchQuery = '';
@@ -31,18 +51,31 @@ class LibraryController extends ChangeNotifier {
   bool _sortAscending = true;
 
   String? _currentTrackId;
+  String? _selectedTrackId;
+  PlaybackMode _playbackMode = PlaybackMode.sequential;
+  final Random _rng = Random();
   bool _isPlaying = false;
   Duration _lastTickPosition = Duration.zero;
   Duration _sessionListened = Duration.zero;
   bool _sessionPlayCounted = false;
-  static const _sessionPlayThreshold = Duration(seconds: 3);
+  int _playThresholdSeconds = 10;
+
+  // Column layout (resizable; persisted via app_settings).
+  double _colFavWidth = 38;
+  double _colRevWidth = 40;
+  double _colBpmWidth = 50;
+  double _colTimeWidth = 60;
+  double _colPlaysWidth = 50;
+  double _titleArtistRatio = 5 / 9; // share of title within title+artist flex
   final ValueNotifier<Duration> _positionNotifier = ValueNotifier(
     Duration.zero,
   );
+  final ValueNotifier<int> _revealTick = ValueNotifier(0);
 
   int _libraryVersion = 0;
   List<Track>? _visibleCache;
   int _visibleCacheVersion = -1;
+  int? _lockedCurrentIndex;
 
   StreamSubscription<Duration>? _positionSub;
   StreamSubscription<bool>? _playingSub;
@@ -59,6 +92,23 @@ class LibraryController extends ChangeNotifier {
   }
 
   Future<void> hydrate() async {
+    final settings = await repo.loadSettings();
+    _playThresholdSeconds =
+        int.tryParse(settings['play_threshold_seconds'] ?? '') ?? 10;
+    _colFavWidth =
+        double.tryParse(settings['col_fav_width'] ?? '') ?? _colFavWidth;
+    _colRevWidth =
+        double.tryParse(settings['col_rev_width'] ?? '') ?? _colRevWidth;
+    _colBpmWidth =
+        double.tryParse(settings['col_bpm_width'] ?? '') ?? _colBpmWidth;
+    _colTimeWidth =
+        double.tryParse(settings['col_time_width'] ?? '') ?? _colTimeWidth;
+    _colPlaysWidth =
+        double.tryParse(settings['col_plays_width'] ?? '') ?? _colPlaysWidth;
+    _titleArtistRatio =
+        double.tryParse(settings['col_title_artist_ratio'] ?? '') ??
+            _titleArtistRatio;
+
     final folders = await repo.loadFolders();
     final tracks = await repo.loadTracks();
     _folders
@@ -69,6 +119,106 @@ class LibraryController extends ChangeNotifier {
       ..addAll(tracks);
     _markLibraryDirty();
     notifyListeners();
+
+    final unread = tracks
+        .where((t) => t.metadataReadAt == null)
+        .map((t) => t.id)
+        .toList();
+    debugPrint(
+      '[meta] hydrate loaded ${tracks.length} tracks (${unread.length} need metadata)',
+    );
+    _enqueueMetadata(unread);
+  }
+
+  void _enqueueMetadata(Iterable<String> paths) {
+    final list = paths.toList(growable: false);
+    if (list.isEmpty) {
+      debugPrint('[meta] enqueue called with 0 paths — skipping');
+      return;
+    }
+    debugPrint(
+      '[meta] enqueue +${list.length} (queue=${_metadataQueue.length + list.length}, processing=$_metadataProcessing)',
+    );
+    _metadataQueue.addAll(list);
+    if (!_metadataProcessing) {
+      _processMetadataQueue();
+    }
+  }
+
+  Future<void> _processMetadataQueue() async {
+    if (_metadataProcessing) return;
+    _metadataProcessing = true;
+    debugPrint('[meta] processor starting (queue=${_metadataQueue.length})');
+    try {
+      while (_metadataQueue.isNotEmpty) {
+        final batch = _metadataQueue
+            .take(_metadataBatchSize)
+            .toList(growable: false);
+        _metadataQueue.removeRange(0, batch.length);
+
+        final stopwatch = Stopwatch()..start();
+        debugPrint(
+          '[meta] batch start (${batch.length} files, queue remaining=${_metadataQueue.length})',
+        );
+
+        List<TrackMetadata> results;
+        try {
+          results = await MetadataExtractor.extractBatch(batch);
+        } catch (e, st) {
+          debugPrint('[meta] batch FAILED in isolate: $e');
+          debugPrint('$st');
+          continue;
+        }
+
+        var withTitle = 0;
+        var withArtist = 0;
+        var withBpm = 0;
+        var withDuration = 0;
+        var failures = 0;
+        for (final m in results) {
+          if (!m.readSucceeded) failures++;
+          if (m.title != null) withTitle++;
+          if (m.artist != null) withArtist++;
+          if (m.bpm != null) withBpm++;
+          if (m.duration != null && m.duration! > Duration.zero) withDuration++;
+          final t = _trackById(m.path);
+          if (t == null) continue;
+          _applyMetadata(t, m);
+        }
+        debugPrint(
+          '[meta] batch done in ${stopwatch.elapsedMilliseconds}ms: '
+          'extracted=${results.length} fail=$failures '
+          'titles=$withTitle artists=$withArtist bpm=$withBpm duration=$withDuration',
+        );
+
+        try {
+          await repo.updateMetadataBatch(results);
+          debugPrint('[meta] DB updated for ${results.length} rows');
+        } catch (e) {
+          debugPrint('[meta] DB update FAILED: $e');
+        }
+
+        _markLibraryDirty();
+        notifyListeners();
+      }
+    } finally {
+      _metadataProcessing = false;
+      debugPrint('[meta] processor idle');
+    }
+  }
+
+  void _applyMetadata(Track t, TrackMetadata m) {
+    if (m.title != null) t.title = m.title!;
+    if (m.artist != null) t.artist = m.artist!;
+    if (m.album != null) t.album = m.album!;
+    if (m.genre != null) t.genre = m.genre!;
+    if (m.musicalKey != null) t.musicalKey = m.musicalKey!;
+    if (m.bpm != null) t.bpm = m.bpm;
+    if (m.duration != null && m.duration! > Duration.zero) {
+      t.duration = m.duration!;
+    }
+    t.hasArtwork = m.hasArtwork;
+    t.metadataReadAt = DateTime.now();
   }
 
   List<WatchedFolder> get folders => List.unmodifiable(_folders);
@@ -81,12 +231,75 @@ class LibraryController extends ChangeNotifier {
   bool get sortAscending => _sortAscending;
 
   String? get currentTrackId => _currentTrackId;
+  String? get selectedTrackId => _selectedTrackId;
+  PlaybackMode get playbackMode => _playbackMode;
   bool get isPlaying => _isPlaying;
   Duration get currentPosition => _positionNotifier.value;
   ValueListenable<Duration> get positionListenable => _positionNotifier;
+  ValueListenable<int> get revealTick => _revealTick;
 
   int get totalTrackCount => _tracks.length;
   int get libraryVersion => _libraryVersion;
+
+  int get playThresholdSeconds => _playThresholdSeconds;
+  double get colFavWidth => _colFavWidth;
+  double get colRevWidth => _colRevWidth;
+  double get colBpmWidth => _colBpmWidth;
+  double get colTimeWidth => _colTimeWidth;
+  double get colPlaysWidth => _colPlaysWidth;
+  double get titleArtistRatio => _titleArtistRatio;
+
+  static const _playThresholdPresets = <int>[3, 5, 10, 15, 30];
+
+  Future<void> cyclePlayThreshold() async {
+    final idx = _playThresholdPresets.indexOf(_playThresholdSeconds);
+    final next =
+        _playThresholdPresets[(idx + 1) % _playThresholdPresets.length];
+    await _setPlayThresholdSeconds(next);
+  }
+
+  Future<void> _setPlayThresholdSeconds(int s) async {
+    _playThresholdSeconds = s;
+    notifyListeners();
+    await repo.setSetting('play_threshold_seconds', s.toString());
+  }
+
+  Future<void> setColumnWidth(String column, double width) async {
+    double clamped;
+    switch (column) {
+      case 'fav':
+        clamped = width.clamp(28.0, 80.0);
+        _colFavWidth = clamped;
+        break;
+      case 'rev':
+        clamped = width.clamp(28.0, 80.0);
+        _colRevWidth = clamped;
+        break;
+      case 'bpm':
+        clamped = width.clamp(36.0, 120.0);
+        _colBpmWidth = clamped;
+        break;
+      case 'time':
+        clamped = width.clamp(40.0, 120.0);
+        _colTimeWidth = clamped;
+        break;
+      case 'plays':
+        clamped = width.clamp(36.0, 120.0);
+        _colPlaysWidth = clamped;
+        break;
+      default:
+        return;
+    }
+    notifyListeners();
+    await repo.setSetting('col_${column}_width', clamped.toString());
+  }
+
+  Future<void> setTitleArtistRatio(double ratio) async {
+    final clamped = ratio.clamp(0.2, 0.85);
+    _titleArtistRatio = clamped;
+    notifyListeners();
+    await repo.setSetting('col_title_artist_ratio', clamped.toString());
+  }
 
   int folderTrackCount(String folderPath) {
     var count = 0;
@@ -175,12 +388,39 @@ class LibraryController extends ChangeNotifier {
         case TrackSortColumn.title:
           return dir *
               a.title.toLowerCase().compareTo(b.title.toLowerCase());
+        case TrackSortColumn.artist:
+          final aa = a.artist.toLowerCase();
+          final ba = b.artist.toLowerCase();
+          if (aa.isEmpty && ba.isEmpty) return 0;
+          if (aa.isEmpty) return 1;
+          if (ba.isEmpty) return -1;
+          return dir * aa.compareTo(ba);
+        case TrackSortColumn.bpm:
+          final ab = a.bpm;
+          final bb = b.bpm;
+          if (ab == null && bb == null) return 0;
+          if (ab == null) return 1;
+          if (bb == null) return -1;
+          return dir * ab.compareTo(bb);
         case TrackSortColumn.duration:
           return dir * a.duration.compareTo(b.duration);
         case TrackSortColumn.plays:
           return dir * a.playCount.compareTo(b.playCount);
       }
     });
+
+    if (_currentTrackId != null) {
+      final naturalIdx = result.indexWhere((t) => t.id == _currentTrackId);
+      if (naturalIdx >= 0) {
+        if (_lockedCurrentIndex == null) {
+          _lockedCurrentIndex = naturalIdx;
+        } else if (naturalIdx != _lockedCurrentIndex) {
+          final t = result.removeAt(naturalIdx);
+          final insertAt = _lockedCurrentIndex!.clamp(0, result.length);
+          result.insert(insertAt, t);
+        }
+      }
+    }
 
     _visibleCache = result;
     _visibleCacheVersion = _libraryVersion;
@@ -190,6 +430,10 @@ class LibraryController extends ChangeNotifier {
   void _markLibraryDirty() {
     _libraryVersion++;
     _visibleCache = null;
+  }
+
+  void _invalidateLock() {
+    _lockedCurrentIndex = null;
   }
 
   Future<void> addWatchedFolder(String path) async {
@@ -222,7 +466,9 @@ class LibraryController extends ChangeNotifier {
         _tracks.add(t);
       }
       await repo.insertTracksBatch(newTracks);
+      _invalidateLock();
       _markLibraryDirty();
+      _enqueueMetadata(newTracks.map((t) => t.id));
     } finally {
       _isScanning = false;
       notifyListeners();
@@ -245,24 +491,28 @@ class LibraryController extends ChangeNotifier {
       _sessionListened = Duration.zero;
       _sessionPlayCounted = false;
     }
+    _invalidateLock();
     _markLibraryDirty();
     notifyListeners();
   }
 
   void selectFolder(String? path) {
     _selectedFolderPath = path;
+    _invalidateLock();
     _markLibraryDirty();
     notifyListeners();
   }
 
   void setSearchQuery(String value) {
     _searchQuery = value;
+    _invalidateLock();
     _markLibraryDirty();
     notifyListeners();
   }
 
   void toggleUnreviewedOnly() {
     _unreviewedOnly = !_unreviewedOnly;
+    _invalidateLock();
     _markLibraryDirty();
     notifyListeners();
   }
@@ -279,6 +529,7 @@ class LibraryController extends ChangeNotifier {
       _sortColumn = column;
       _sortAscending = true;
     }
+    _invalidateLock();
     _markLibraryDirty();
     notifyListeners();
   }
@@ -291,7 +542,101 @@ class LibraryController extends ChangeNotifier {
     repo.updateTrackState(t);
   }
 
-  Future<void> play(String trackId) async {
+  void toggleReviewed(String trackId) {
+    final t = _tracks.firstWhere((t) => t.id == trackId);
+    if (t.reviewed) {
+      t.cumulativeListened = Duration.zero;
+    } else {
+      t.cumulativeListened = const Duration(seconds: 3);
+      _pushRecentReviewed(trackId);
+    }
+    _markLibraryDirty();
+    notifyListeners();
+    repo.updateTrackState(t);
+  }
+
+  void cyclePlaybackMode() {
+    final values = PlaybackMode.values;
+    _playbackMode = values[(_playbackMode.index + 1) % values.length];
+    notifyListeners();
+  }
+
+  void selectTrack(String? trackId) {
+    if (_selectedTrackId == trackId) return;
+    _selectedTrackId = trackId;
+    notifyListeners();
+  }
+
+  void selectNextVisible() {
+    final list = visibleTracks;
+    if (list.isEmpty) return;
+    final cursor = _selectedTrackId ?? _currentTrackId;
+    if (cursor == null) {
+      _selectedTrackId = list.first.id;
+    } else {
+      final idx = list.indexWhere((t) => t.id == cursor);
+      if (idx < 0) {
+        _selectedTrackId = list.first.id;
+      } else if (idx < list.length - 1) {
+        _selectedTrackId = list[idx + 1].id;
+      } else {
+        _selectedTrackId = list.last.id;
+      }
+    }
+    notifyListeners();
+  }
+
+  void selectPreviousVisible() {
+    final list = visibleTracks;
+    if (list.isEmpty) return;
+    final cursor = _selectedTrackId ?? _currentTrackId;
+    if (cursor == null) {
+      _selectedTrackId = list.first.id;
+    } else {
+      final idx = list.indexWhere((t) => t.id == cursor);
+      if (idx <= 0) {
+        _selectedTrackId = list.first.id;
+      } else {
+        _selectedTrackId = list[idx - 1].id;
+      }
+    }
+    notifyListeners();
+  }
+
+  Future<void> playSelected() async {
+    final id = _selectedTrackId;
+    if (id == null) return;
+    await play(id, reveal: true);
+  }
+
+  void revealCurrent() {
+    if (_currentTrackId == null) return;
+    if (_selectedTrackId != _currentTrackId) {
+      _selectedTrackId = _currentTrackId;
+      notifyListeners();
+    }
+    _revealTick.value = _revealTick.value + 1;
+  }
+
+  Future<void> showTrackInFinder(String trackId) async {
+    if (!Platform.isMacOS) return;
+    try {
+      await Process.run('open', ['-R', trackId]);
+    } catch (_) {
+      // file may have moved or sandbox restricted; best-effort
+    }
+  }
+
+  Future<void> goBack() async {
+    if (_recentReviewedIds.isNotEmpty &&
+        _recentReviewedIds[0] != _currentTrackId) {
+      await play(_recentReviewedIds[0], reveal: true);
+    } else {
+      await previous();
+    }
+  }
+
+  Future<void> play(String trackId, {bool reveal = false}) async {
     final track = _tracks.firstWhere(
       (t) => t.id == trackId,
       orElse: () => throw StateError('Track not found: $trackId'),
@@ -299,12 +644,16 @@ class LibraryController extends ChangeNotifier {
     final isNewTrack = _currentTrackId != trackId;
     if (isNewTrack) {
       await _flushCurrentTrack();
+      final visible = visibleTracks;
+      final displayedIdx = visible.indexWhere((t) => t.id == trackId);
       _currentTrackId = trackId;
+      _selectedTrackId = trackId;
+      _lockedCurrentIndex = displayedIdx >= 0 ? displayedIdx : null;
       _positionNotifier.value = Duration.zero;
       _lastTickPosition = Duration.zero;
       _sessionListened = Duration.zero;
       _sessionPlayCounted = false;
-      if (_unreviewedOnly) _markLibraryDirty();
+      _markLibraryDirty();
       notifyListeners();
       try {
         await engine.setTrack(track.id);
@@ -316,6 +665,9 @@ class LibraryController extends ChangeNotifier {
       repo.markPlayed(trackId);
     }
     await engine.play();
+    if (reveal) {
+      _revealTick.value = _revealTick.value + 1;
+    }
   }
 
   Future<void> _flushCurrentTrack() async {
@@ -339,9 +691,28 @@ class LibraryController extends ChangeNotifier {
   Future<void> next() async {
     final list = visibleTracks;
     if (list.isEmpty || _currentTrackId == null) return;
+
+    if (_playbackMode == PlaybackMode.shuffleUnreviewed) {
+      final pool = list
+          .where((t) => !t.reviewed && t.id != _currentTrackId)
+          .toList();
+      if (pool.isEmpty) return;
+      await play(pool[_rng.nextInt(pool.length)].id, reveal: true);
+      return;
+    }
+
+    if (_playbackMode == PlaybackMode.shuffle && list.length > 1) {
+      String pickId;
+      do {
+        pickId = list[_rng.nextInt(list.length)].id;
+      } while (pickId == _currentTrackId);
+      await play(pickId, reveal: true);
+      return;
+    }
+
     final idx = list.indexWhere((t) => t.id == _currentTrackId);
     if (idx >= 0 && idx < list.length - 1) {
-      await play(list[idx + 1].id);
+      await play(list[idx + 1].id, reveal: true);
     }
   }
 
@@ -350,7 +721,7 @@ class LibraryController extends ChangeNotifier {
     if (list.isEmpty || _currentTrackId == null) return;
     final idx = list.indexWhere((t) => t.id == _currentTrackId);
     if (idx > 0) {
-      await play(list[idx - 1].id);
+      await play(list[idx - 1].id, reveal: true);
     }
   }
 
@@ -389,7 +760,8 @@ class LibraryController extends ChangeNotifier {
 
         final crossedReviewed = !wasReviewed && track.reviewed;
         final shouldCountSession =
-            !_sessionPlayCounted && _sessionListened >= _sessionPlayThreshold;
+            !_sessionPlayCounted &&
+            _sessionListened >= Duration(seconds: _playThresholdSeconds);
 
         if (crossedReviewed || shouldCountSession) {
           if (shouldCountSession) {
@@ -452,6 +824,7 @@ class LibraryController extends ChangeNotifier {
     _durationSub?.cancel();
     _processingSub?.cancel();
     _positionNotifier.dispose();
+    _revealTick.dispose();
     super.dispose();
   }
 }

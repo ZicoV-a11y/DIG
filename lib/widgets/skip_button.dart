@@ -12,7 +12,7 @@ class SkipButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final enabled = onPressed != null;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 2),
+      padding: const EdgeInsets.symmetric(horizontal: 1),
       child: Material(
         color: AppColors.surfaceAlt,
         shape: RoundedRectangleBorder(
@@ -25,9 +25,9 @@ class SkipButton extends StatelessWidget {
           hoverColor: AppColors.hoverRow,
           focusColor: AppColors.focusOverlay,
           child: Container(
-            constraints: const BoxConstraints(minWidth: 46, minHeight: 32),
+            constraints: const BoxConstraints(minWidth: 38, minHeight: 32),
             alignment: Alignment.center,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 4),
             child: Text(
               label,
               style: TextStyle(

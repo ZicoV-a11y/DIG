@@ -60,13 +60,27 @@ class LibraryController extends ChangeNotifier {
   bool _sessionPlayCounted = false;
   int _playThresholdSeconds = 10;
 
-  // Column layout (resizable; persisted via app_settings).
-  double _colFavWidth = 38;
-  double _colRevWidth = 40;
-  double _colBpmWidth = 50;
-  double _colTimeWidth = 60;
-  double _colPlaysWidth = 50;
-  double _titleArtistRatio = 5 / 9; // share of title within title+artist flex
+  // Utility columns: locked widths, content-fitted (label + glyph + small
+  // horizontal padding). Not resizable, not loaded from persistence.
+  double _colFavWidth = 32;
+  double _colRevWidth = 38;
+  double _colBpmWidth = 38;
+  double _colTimeWidth = 50;
+  double _colPlaysWidth = 52;
+  // Text columns: absolute stored widths, persisted. Each has its own
+  // right-edge resize handle. Dragging only changes that column's width;
+  // neighbours get pushed (and horizontal scroll engages if the row
+  // exceeds the viewport).
+  double _colTitleWidth = 350;
+  double _colArtistWidth = 240;
+
+  // Column order. All seven ids must be present exactly once; user can
+  // reorder via long-press-drag on any header cell. Persisted as a
+  // comma-separated string in app_settings under `column_order`.
+  static const List<String> _defaultColumnOrder = [
+    'fav', 'rev', 'title', 'artist', 'bpm', 'time', 'plays',
+  ];
+  List<String> _columnOrder = List.of(_defaultColumnOrder);
   final ValueNotifier<Duration> _positionNotifier = ValueNotifier(
     Duration.zero,
   );
@@ -95,19 +109,23 @@ class LibraryController extends ChangeNotifier {
     final settings = await repo.loadSettings();
     _playThresholdSeconds =
         int.tryParse(settings['play_threshold_seconds'] ?? '') ?? 10;
-    _colFavWidth =
-        double.tryParse(settings['col_fav_width'] ?? '') ?? _colFavWidth;
-    _colRevWidth =
-        double.tryParse(settings['col_rev_width'] ?? '') ?? _colRevWidth;
-    _colBpmWidth =
-        double.tryParse(settings['col_bpm_width'] ?? '') ?? _colBpmWidth;
-    _colTimeWidth =
-        double.tryParse(settings['col_time_width'] ?? '') ?? _colTimeWidth;
-    _colPlaysWidth =
-        double.tryParse(settings['col_plays_width'] ?? '') ?? _colPlaysWidth;
-    _titleArtistRatio =
-        double.tryParse(settings['col_title_artist_ratio'] ?? '') ??
-            _titleArtistRatio;
+    // Utility column widths are locked — defaults always used, never
+    // restored from SQLite. TITLE / ARTIST are user-resizable; load
+    // their stored absolute widths.
+    _colTitleWidth =
+        double.tryParse(settings['col_title_width'] ?? '') ?? _colTitleWidth;
+    _colArtistWidth =
+        double.tryParse(settings['col_artist_width'] ?? '') ?? _colArtistWidth;
+    final orderStr = settings['column_order'];
+    if (orderStr != null && orderStr.isNotEmpty) {
+      final parsed = orderStr.split(',').map((s) => s.trim()).toList();
+      // Validate: must contain all seven default ids exactly once.
+      if (parsed.length == _defaultColumnOrder.length &&
+          parsed.toSet().length == _defaultColumnOrder.length &&
+          parsed.toSet().containsAll(_defaultColumnOrder)) {
+        _columnOrder = parsed;
+      }
+    }
 
     final folders = await repo.loadFolders();
     final tracks = await repo.loadTracks();
@@ -247,7 +265,28 @@ class LibraryController extends ChangeNotifier {
   double get colBpmWidth => _colBpmWidth;
   double get colTimeWidth => _colTimeWidth;
   double get colPlaysWidth => _colPlaysWidth;
-  double get titleArtistRatio => _titleArtistRatio;
+  double get colTitleWidth => _colTitleWidth;
+  double get colArtistWidth => _colArtistWidth;
+
+  /// Read-only view of the current column order. Indexes 0..6 in the
+  /// canonical seven-column set.
+  List<String> get columnOrder => List.unmodifiable(_columnOrder);
+
+  /// Move [column] so it ends up at [targetIndex] in the order list.
+  /// `targetIndex` is the slot index *before any removal* — values up to
+  /// `columnOrder.length` mean "drop after the last column". Notifies
+  /// once and persists the new order to SQLite (single write).
+  Future<void> moveColumn(String column, int targetIndex) async {
+    final from = _columnOrder.indexOf(column);
+    if (from < 0) return;
+    final adjusted = targetIndex > from ? targetIndex - 1 : targetIndex;
+    final clamped = adjusted.clamp(0, _columnOrder.length - 1);
+    if (clamped == from) return;
+    _columnOrder.removeAt(from);
+    _columnOrder.insert(clamped, column);
+    notifyListeners();
+    await repo.setSetting('column_order', _columnOrder.join(','));
+  }
 
   static const _playThresholdPresets = <int>[3, 5, 10, 15, 30];
 
@@ -264,7 +303,15 @@ class LibraryController extends ChangeNotifier {
     await repo.setSetting('play_threshold_seconds', s.toString());
   }
 
-  Future<void> setColumnWidth(String column, double width) async {
+  /// Update [column]'s stored width. During an active drag the caller
+  /// passes `commit: false` per frame so we only update the in-memory
+  /// value and notify; SQLite writes are deferred to a single
+  /// `commit: true` call on drag end. This keeps drag at 60 fps.
+  Future<void> setColumnWidth(
+    String column,
+    double width, {
+    bool commit = true,
+  }) async {
     double clamped;
     switch (column) {
       case 'fav':
@@ -287,18 +334,21 @@ class LibraryController extends ChangeNotifier {
         clamped = width.clamp(36.0, 120.0);
         _colPlaysWidth = clamped;
         break;
+      case 'title':
+        clamped = width.clamp(120.0, 1500.0);
+        _colTitleWidth = clamped;
+        break;
+      case 'artist':
+        clamped = width.clamp(100.0, 1200.0);
+        _colArtistWidth = clamped;
+        break;
       default:
         return;
     }
     notifyListeners();
-    await repo.setSetting('col_${column}_width', clamped.toString());
-  }
-
-  Future<void> setTitleArtistRatio(double ratio) async {
-    final clamped = ratio.clamp(0.2, 0.85);
-    _titleArtistRatio = clamped;
-    notifyListeners();
-    await repo.setSetting('col_title_artist_ratio', clamped.toString());
+    if (commit) {
+      await repo.setSetting('col_${column}_width', clamped.toString());
+    }
   }
 
   int folderTrackCount(String folderPath) {

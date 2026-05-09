@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -20,6 +21,8 @@ class _HomeScreenState extends State<HomeScreen> {
   late final TextEditingController _searchTextController;
   late final FocusNode _searchFocusNode;
   late final FocusNode _bodyFocusNode;
+  final ScrollController _tableScroll = ScrollController();
+  final GlobalKey _tableAreaKey = GlobalKey();
 
   @override
   void initState() {
@@ -38,7 +41,31 @@ class _HomeScreenState extends State<HomeScreen> {
     _searchTextController.dispose();
     _searchFocusNode.dispose();
     _bodyFocusNode.dispose();
+    _tableScroll.dispose();
     super.dispose();
+  }
+
+  /// Forward a scroll wheel event to the table's controller when the cursor
+  /// sits over a non-scrollable region (toolbar, playback bar, gaps). When
+  /// the cursor is already over the table, the table's own Scrollable
+  /// handles it natively — we skip forwarding so the user doesn't get
+  /// double-speed scroll.
+  void _handlePointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    if (!_tableScroll.hasClients) return;
+    final ctx = _tableAreaKey.currentContext;
+    if (ctx != null) {
+      final box = ctx.findRenderObject() as RenderBox?;
+      if (box != null) {
+        final origin = box.localToGlobal(Offset.zero);
+        final bounds = origin & box.size;
+        if (bounds.contains(event.position)) return; // native scroll wins
+      }
+    }
+    final pos = _tableScroll.position;
+    final next = (pos.pixels + event.scrollDelta.dy)
+        .clamp(pos.minScrollExtent, pos.maxScrollExtent);
+    _tableScroll.jumpTo(next);
   }
 
   void _focusSearch() {
@@ -161,37 +188,67 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final c = widget.controller;
-    return Focus(
-      focusNode: _bodyFocusNode,
-      autofocus: true,
-      child: Scaffold(
-        body: Column(
-          children: [
-            Expanded(
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  FolderSidebar(controller: c),
-                  const VerticalDivider(width: 1, color: AppColors.border),
-                  Expanded(
-                    child: Column(
-                      children: [
-                        LibraryToolbar(
-                          controller: c,
-                          searchTextController: _searchTextController,
-                          searchFocusNode: _searchFocusNode,
+    return Shortcuts(
+      shortcuts: const <ShortcutActivator, Intent>{
+        SingleActivator(LogicalKeyboardKey.arrowUp):
+            DoNothingAndStopPropagationIntent(),
+        SingleActivator(LogicalKeyboardKey.arrowDown):
+            DoNothingAndStopPropagationIntent(),
+        SingleActivator(LogicalKeyboardKey.arrowLeft):
+            DoNothingAndStopPropagationIntent(),
+        SingleActivator(LogicalKeyboardKey.arrowRight):
+            DoNothingAndStopPropagationIntent(),
+        SingleActivator(LogicalKeyboardKey.arrowLeft, shift: true):
+            DoNothingAndStopPropagationIntent(),
+        SingleActivator(LogicalKeyboardKey.arrowRight, shift: true):
+            DoNothingAndStopPropagationIntent(),
+      },
+      child: Focus(
+        focusNode: _bodyFocusNode,
+        autofocus: true,
+        child: Listener(
+          onPointerSignal: _handlePointerSignal,
+          child: Scaffold(
+            body: Column(
+              children: [
+                Expanded(
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      FolderSidebar(controller: c),
+                      const VerticalDivider(
+                        width: 1,
+                        color: AppColors.border,
+                      ),
+                      Expanded(
+                        child: Column(
+                          children: [
+                            LibraryToolbar(
+                              controller: c,
+                              searchTextController: _searchTextController,
+                              searchFocusNode: _searchFocusNode,
+                            ),
+                            const Divider(
+                              height: 1,
+                              color: AppColors.border,
+                            ),
+                            Expanded(
+                              child: KeyedSubtree(
+                                key: _tableAreaKey,
+                                child: TrackTable(controller: c),
+                              ),
+                            ),
+                          ],
                         ),
-                        const Divider(height: 1, color: AppColors.border),
-                        Expanded(child: TrackTable(controller: c)),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+                const Divider(height: 1, color: AppColors.border),
+                PlaybackBar(controller: c),
+              ],
             ),
-            const Divider(height: 1, color: AppColors.border),
-            PlaybackBar(controller: c),
-          ],
+          ),
         ),
       ),
     );

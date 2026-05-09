@@ -13,9 +13,8 @@ class PlaybackBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 116,
+      height: 180,
       color: AppColors.surface,
-      padding: const EdgeInsets.fromLTRB(16, 12, 18, 12),
       child: ListenableBuilder(
         listenable: controller,
         builder: (context, _) {
@@ -24,32 +23,19 @@ class PlaybackBar extends StatelessWidget {
           final hasTrack = track != null;
 
           return Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              if (hasTrack) ...[
-                _NowPlayingBlock(
+              const SizedBox(width: 28),
+              SizedBox(
+                width: 280,
+                child: _NowPlayingBlock(
                   track: track,
-                  onTap: controller.revealCurrent,
+                  onTap: hasTrack ? controller.revealCurrent : null,
                 ),
-                const SizedBox(width: 6),
-                _NowPlayingFavorite(
-                  isFavorite: track.favorite,
-                  onPressed: () => controller.toggleFavorite(track.id),
-                ),
-                const SizedBox(width: 10),
-              ] else ...[
-                const SizedBox(
-                  width: 200,
-                  child: Text(
-                    'No track selected',
-                    style: TextStyle(
-                      color: AppColors.textSecondary,
-                      fontSize: 12,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-              ],
+              ),
+              const SizedBox(width: 24),
               Expanded(
+                child: _TransportSubZone(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
@@ -64,6 +50,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
+                        const SizedBox(width: 14),
                         SkipButton(
                           label: '-30',
                           onPressed: hasTrack
@@ -72,6 +59,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
+                        const SizedBox(width: 14),
                         SkipButton(
                           label: '-10',
                           onPressed: hasTrack
@@ -80,6 +68,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
+                        const SizedBox(width: 14),
                         SkipButton(
                           label: '-5',
                           onPressed: hasTrack
@@ -88,24 +77,24 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: 28),
                         _CircleIconButton(
                           tooltip: 'Previous',
                           icon: Icons.skip_previous_rounded,
                           onPressed: controller.previous,
                         ),
-                        const SizedBox(width: 4),
+                        const SizedBox(width: 10),
                         _PlayPauseButton(
                           isPlaying: controller.isPlaying,
                           onPressed: controller.togglePlayPause,
                         ),
-                        const SizedBox(width: 4),
+                        const SizedBox(width: 10),
                         _CircleIconButton(
                           tooltip: 'Next',
                           icon: Icons.skip_next_rounded,
                           onPressed: controller.next,
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: 28),
                         SkipButton(
                           label: '+5',
                           onPressed: hasTrack
@@ -114,6 +103,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
+                        const SizedBox(width: 14),
                         SkipButton(
                           label: '+10',
                           onPressed: hasTrack
@@ -122,6 +112,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
+                        const SizedBox(width: 14),
                         SkipButton(
                           label: '+30',
                           onPressed: hasTrack
@@ -130,6 +121,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
+                        const SizedBox(width: 14),
                         SkipButton(
                           label: '+1m',
                           onPressed: hasTrack
@@ -140,7 +132,7 @@ class PlaybackBar extends StatelessWidget {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 12),
                     _PositionRow(
                       controller: controller,
                       duration: dur,
@@ -148,9 +140,11 @@ class PlaybackBar extends StatelessWidget {
                     ),
                   ],
                 ),
+                ),
               ),
-              const SizedBox(width: 12),
-              _PlaybackModeIndicator(controller: controller),
+              const SizedBox(width: 24),
+              _DeckArtwork(track: track),
+              const SizedBox(width: 28),
             ],
           );
         },
@@ -159,61 +153,18 @@ class PlaybackBar extends StatelessWidget {
   }
 }
 
-class _PlaybackModeIndicator extends StatelessWidget {
-  final LibraryController controller;
-  const _PlaybackModeIndicator({required this.controller});
+/// Wrapper for the center transport sub-zone. Adds consistent internal
+/// padding around the transport row + position row.
+class _TransportSubZone extends StatelessWidget {
+  final Widget child;
 
-  IconData _iconFor(PlaybackMode m) {
-    switch (m) {
-      case PlaybackMode.sequential:
-        return Icons.arrow_forward_rounded;
-      case PlaybackMode.shuffle:
-        return Icons.shuffle_rounded;
-      case PlaybackMode.shuffleUnreviewed:
-        return Icons.shuffle_rounded;
-    }
-  }
+  const _TransportSubZone({required this.child});
 
   @override
   Widget build(BuildContext context) {
-    final mode = controller.playbackMode;
-    return Tooltip(
-      message: 'Playback mode (S to cycle)',
-      waitDuration: const Duration(milliseconds: 600),
-      child: Material(
-        color: AppColors.surfaceAlt,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(5),
-          side: const BorderSide(color: AppColors.border),
-        ),
-        child: InkWell(
-          onTap: controller.cyclePlaybackMode,
-          borderRadius: BorderRadius.circular(5),
-          hoverColor: AppColors.hoverRow,
-          focusColor: AppColors.focusOverlay,
-          child: Container(
-            constraints: const BoxConstraints(minHeight: 32, minWidth: 78),
-            alignment: Alignment.center,
-            padding: const EdgeInsets.symmetric(horizontal: 10),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(_iconFor(mode), size: 14, color: AppColors.accent),
-                const SizedBox(width: 6),
-                Text(
-                  mode.label,
-                  style: const TextStyle(
-                    color: AppColors.textPrimary,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.6,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      child: child,
     );
   }
 }
@@ -255,7 +206,7 @@ class _PositionRow extends StatelessWidget {
             Expanded(
               child: SliderTheme(
                 data: const SliderThemeData(
-                  trackHeight: 4,
+                  trackHeight: 6,
                   activeTrackColor: AppColors.accent,
                   inactiveTrackColor: AppColors.border,
                   thumbColor: AppColors.accent,
@@ -288,60 +239,98 @@ class _PositionRow extends StatelessWidget {
 }
 
 class _NowPlayingBlock extends StatelessWidget {
-  final Track track;
-  final VoidCallback onTap;
+  final Track? track;
+  final VoidCallback? onTap;
 
-  const _NowPlayingBlock({required this.track, required this.onTap});
+  const _NowPlayingBlock({
+    required this.track,
+    required this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
+    final t = track;
+    if (t == null) {
+      return const Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          'No track selected',
+          style: TextStyle(
+            color: AppColors.textSecondary,
+            fontSize: 12,
+          ),
+        ),
+      );
+    }
+
+    final split = _splitTitleAndMix(t.title);
+
     return Tooltip(
       message: 'Jump to current track',
       waitDuration: const Duration(milliseconds: 600),
       child: Material(
         color: Colors.transparent,
-        borderRadius: BorderRadius.circular(6),
         child: InkWell(
           onTap: onTap,
-          borderRadius: BorderRadius.circular(6),
           hoverColor: AppColors.hoverRow,
           focusColor: AppColors.focusOverlay,
           child: Padding(
-            padding: const EdgeInsets.all(2),
-            child: Row(
-              children: [
-                TrackArtwork(seed: track.title, size: 76),
-                const SizedBox(width: 14),
-                SizedBox(
-                  width: 200,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text(
-                        track.title,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: AppColors.textPrimary,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          height: 1.1,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        track.artist,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: AppColors.textSecondary,
-                          fontSize: 11,
-                          height: 1.1,
-                        ),
-                      ),
-                    ],
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: SizedBox(
+              width: double.infinity,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+              Text(
+                split.primary,
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+                style: const TextStyle(
+                  color: AppColors.textPrimary,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w600,
+                  height: 1.15,
+                ),
+              ),
+              if (split.subtitle != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  split.subtitle!,
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1,
+                  style: const TextStyle(
+                    color: AppColors.textSecondary,
+                    fontSize: 16,
+                    height: 1.15,
                   ),
                 ),
               ],
+              const SizedBox(height: 4),
+              Text(
+                t.artist.isEmpty ? '—' : t.artist,
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+                style: const TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 14,
+                  height: 1.15,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                _formatTrackMeta(t),
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+                style: const TextStyle(
+                  color: AppColors.textTertiary,
+                  fontSize: 14,
+                  height: 1.15,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+                ],
+              ),
             ),
           ),
         ),
@@ -350,43 +339,63 @@ class _NowPlayingBlock extends StatelessWidget {
   }
 }
 
-class _NowPlayingFavorite extends StatelessWidget {
-  final bool isFavorite;
-  final VoidCallback onPressed;
-
-  const _NowPlayingFavorite({
-    required this.isFavorite,
-    required this.onPressed,
-  });
+/// 130 × 130 album artwork tile shown at the far right of the playback
+/// header. Renders a placeholder square when no track is current.
+class _DeckArtwork extends StatelessWidget {
+  final Track? track;
+  const _DeckArtwork({required this.track});
 
   @override
   Widget build(BuildContext context) {
-    return Tooltip(
-      message: isFavorite ? 'Unfavorite' : 'Favorite',
-      waitDuration: const Duration(milliseconds: 600),
-      child: Material(
-        color: Colors.transparent,
-        shape: const CircleBorder(),
-        child: InkWell(
-          onTap: onPressed,
-          customBorder: const CircleBorder(),
-          hoverColor: AppColors.hoverRow,
-          focusColor: AppColors.focusOverlay,
-          child: SizedBox(
-            width: 38,
-            height: 38,
-            child: Icon(
-              isFavorite ? Icons.star_rounded : Icons.star_border_rounded,
-              size: 22,
-              color: isFavorite
-                  ? AppColors.favorite
-                  : AppColors.textSecondary,
-            ),
-          ),
+    final t = track;
+    if (t == null) {
+      return Container(
+        width: 130,
+        height: 130,
+        decoration: BoxDecoration(
+          color: AppColors.surfaceAlt,
+          borderRadius: BorderRadius.zero,
         ),
-      ),
+      );
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.zero,
+      child: TrackArtwork(seed: t.title, size: 130),
     );
   }
+}
+
+/// Extracts a trailing parenthetical mix/version label from a track title.
+/// Display-only — never mutates the underlying `track.title` string.
+({String primary, String? subtitle}) _splitTitleAndMix(String title) {
+  final trimmed = title.trim();
+  if (!trimmed.endsWith(')')) {
+    return (primary: trimmed, subtitle: null);
+  }
+  // Walk backward to find the matching open paren — depth-aware so
+  // nested brackets like "feat. (X)" before the trailing group don't
+  // throw off the split.
+  var depth = 0;
+  int? openIdx;
+  for (var i = trimmed.length - 1; i >= 0; i--) {
+    final c = trimmed[i];
+    if (c == ')') {
+      depth++;
+    } else if (c == '(') {
+      depth--;
+      if (depth == 0) {
+        openIdx = i;
+        break;
+      }
+    }
+  }
+  if (openIdx == null || openIdx == 0) {
+    return (primary: trimmed, subtitle: null);
+  }
+  final primary = trimmed.substring(0, openIdx).trim();
+  final subtitle = trimmed.substring(openIdx);
+  if (primary.isEmpty) return (primary: trimmed, subtitle: null);
+  return (primary: primary, subtitle: subtitle);
 }
 
 class _CircleIconButton extends StatelessWidget {
@@ -407,16 +416,16 @@ class _CircleIconButton extends StatelessWidget {
       waitDuration: const Duration(milliseconds: 600),
       child: Material(
         color: Colors.transparent,
-        shape: const CircleBorder(),
+        shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
         child: InkWell(
           onTap: onPressed,
-          customBorder: const CircleBorder(),
+          customBorder: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
           hoverColor: AppColors.hoverRow,
           focusColor: AppColors.focusOverlay,
           child: SizedBox(
-            width: 38,
-            height: 38,
-            child: Icon(icon, size: 24, color: AppColors.textPrimary),
+            width: 48,
+            height: 48,
+            child: Icon(icon, size: 28, color: AppColors.textPrimary),
           ),
         ),
       ),
@@ -433,19 +442,19 @@ class _PlayPauseButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return Material(
       color: AppColors.accent,
-      shape: const CircleBorder(),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
       child: InkWell(
         onTap: onPressed,
-        customBorder: const CircleBorder(),
+        customBorder: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
         hoverColor: Colors.white.withValues(alpha: 0.10),
         focusColor: Colors.white.withValues(alpha: 0.18),
         child: SizedBox(
-          width: 46,
-          height: 46,
+          width: 80,
+          height: 80,
           child: Icon(
             isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
             color: Colors.white,
-            size: 26,
+            size: 32,
           ),
         ),
       ),
@@ -460,3 +469,10 @@ String _fmt(Duration d) {
 }
 
 String _fmtDuration(Duration d) => d == Duration.zero ? '—' : _fmt(d);
+
+String _formatTrackMeta(Track t) {
+  final dur = t.duration > Duration.zero ? _fmt(t.duration) : '—';
+  final bpm = (t.bpm != null && t.bpm! > 0) ? '${t.bpm!.round()}' : '—';
+  final key = t.musicalKey.trim().isEmpty ? '—' : t.musicalKey.trim();
+  return '$dur • $bpm BPM • $key';
+}

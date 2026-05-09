@@ -8,6 +8,7 @@ import '../widgets/folder_sidebar.dart';
 import '../widgets/library_toolbar.dart';
 import '../widgets/playback_bar.dart';
 import '../widgets/track_table.dart';
+import '../widgets/utility_rail.dart';
 
 class HomeScreen extends StatefulWidget {
   final LibraryController controller;
@@ -134,6 +135,14 @@ class _HomeScreenState extends State<HomeScreen> {
       _focusSearch();
       return true;
     }
+    if (key == LogicalKeyboardKey.backslash &&
+        isMeta &&
+        !isCtrl &&
+        !isAlt &&
+        !isShift) {
+      widget.controller.toggleSidebarVisible();
+      return true;
+    }
 
     // Suppress single-key shortcuts while typing in any text input.
     if (_isFocusInTextInput()) return false;
@@ -209,47 +218,105 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Listener(
           onPointerSignal: _handlePointerSignal,
           child: Scaffold(
-            body: Column(
-              children: [
-                Expanded(
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      FolderSidebar(controller: c),
-                      const VerticalDivider(
-                        width: 1,
-                        color: AppColors.border,
-                      ),
-                      Expanded(
-                        child: Column(
-                          children: [
-                            LibraryToolbar(
-                              controller: c,
-                              searchTextController: _searchTextController,
-                              searchFocusNode: _searchFocusNode,
-                            ),
-                            const Divider(
-                              height: 1,
-                              color: AppColors.border,
-                            ),
-                            Expanded(
-                              child: KeyedSubtree(
-                                key: _tableAreaKey,
-                                child: TrackTable(controller: c),
-                              ),
-                            ),
-                          ],
+            body: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Expanded(
+                    child: Column(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.zero,
+                          child: PlaybackBar(controller: c),
                         ),
-                      ),
-                    ],
+                        const SizedBox(height: 4),
+                        Expanded(
+                          child: ListenableBuilder(
+                            listenable: c,
+                            builder: (ctx, _) => Row(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                if (c.sidebarVisible) ...[
+                                  SizedBox(
+                                    width: c.sidebarWidth,
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.zero,
+                                      child: FolderSidebar(controller: c),
+                                    ),
+                                  ),
+                                  _SidebarResizeHandle(controller: c),
+                                ],
+                                Expanded(
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.zero,
+                                  child: Container(
+                                    color: AppColors.workspaceSurface,
+                                    child: Column(
+                                      children: [
+                                        LibraryToolbar(
+                                          controller: c,
+                                          searchTextController:
+                                              _searchTextController,
+                                          searchFocusNode: _searchFocusNode,
+                                        ),
+                                        Expanded(
+                                          child: KeyedSubtree(
+                                            key: _tableAreaKey,
+                                            child: TrackTable(controller: c),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                const Divider(height: 1, color: AppColors.border),
-                PlaybackBar(controller: c),
-              ],
+                  const SizedBox(width: 4),
+                  ClipRRect(
+                    borderRadius: BorderRadius.zero,
+                    child: UtilityRail(controller: c),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 4 px vertical drag handle that lives on the right edge of the sidebar.
+/// Drags update `controller.setSidebarWidth(...)` live (no SQLite write per
+/// frame); the final width is committed on drag end. Dragging past the
+/// minimum collapses the sidebar (visibility off) — the toggle button or
+/// keyboard shortcut brings it back.
+class _SidebarResizeHandle extends StatelessWidget {
+  final LibraryController controller;
+  const _SidebarResizeHandle({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onHorizontalDragUpdate: (d) => controller.setSidebarWidth(
+          controller.sidebarWidth + d.delta.dx,
+          commit: false,
+        ),
+        onHorizontalDragEnd: (_) => controller.setSidebarWidth(
+          controller.sidebarWidth,
+          commit: true,
+        ),
+        child: const SizedBox(width: 4, height: double.infinity),
       ),
     );
   }

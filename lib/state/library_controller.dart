@@ -8,6 +8,7 @@ import '../models/track.dart';
 import '../models/watched_folder.dart';
 import '../services/audio_scanner.dart';
 import '../services/library_repository.dart';
+import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
 
@@ -59,6 +60,15 @@ class LibraryController extends ChangeNotifier {
   Duration _sessionListened = Duration.zero;
   bool _sessionPlayCounted = false;
   int _playThresholdSeconds = 10;
+  double _volume = 1.0;
+  final ValueNotifier<double> volumeListenable = ValueNotifier<double>(1.0);
+
+  bool _sidebarVisible = true;
+  double _sidebarWidth = 260;
+  static const double sidebarMinWidth = 200;
+  static const double sidebarMaxWidth = 360;
+
+  final MediaKeysBridge _media = MediaKeysBridge();
 
   // Utility columns: locked widths, content-fitted (label + glyph + small
   // horizontal padding). Not resizable, not loaded from persistence.
@@ -103,12 +113,70 @@ class LibraryController extends ChangeNotifier {
     _playingSub = engine.playingStream.listen(_onPlaying);
     _durationSub = engine.durationStream.listen(_onDuration);
     _processingSub = engine.processingStateStream.listen(_onProcessing);
+    _wireMediaBridge();
   }
+
+  void _wireMediaBridge() {
+    _media.onPlay = () async {
+      if (!_isPlaying) await togglePlayPause();
+    };
+    _media.onPause = () async {
+      if (_isPlaying) await togglePlayPause();
+    };
+    _media.onTogglePlayPause = () => togglePlayPause();
+    _media.onNext = () => next();
+    _media.onPrevious = () => previous();
+    _media.onSeek = (seconds) async {
+      final track = currentTrack;
+      if (track == null) return;
+      final pos = Duration(milliseconds: (seconds * 1000).round());
+      _positionNotifier.value = pos;
+      _lastTickPosition = pos;
+      await engine.seek(pos);
+    };
+  }
+
+  void _pushNowPlaying() {
+    final track = currentTrack;
+    if (track == null) {
+      _media.clearNowPlaying();
+      return;
+    }
+    _media.updateNowPlaying(
+      title: track.title.isEmpty ? null : track.title,
+      artist: track.artist.isEmpty ? null : track.artist,
+      durationSeconds: track.duration.inMilliseconds / 1000.0,
+      positionSeconds: _positionNotifier.value.inMilliseconds / 1000.0,
+      isPlaying: _isPlaying,
+    );
+  }
+
+  // Throttle Now-Playing position updates so the system center doesn't get
+  // hammered every 16 ms — once a second is plenty for the lock-screen
+  // / Touch Bar / Control Center scrubber.
+  DateTime _lastNowPlayingPushAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   Future<void> hydrate() async {
     final settings = await repo.loadSettings();
     _playThresholdSeconds =
         int.tryParse(settings['play_threshold_seconds'] ?? '') ?? 10;
+    final savedVolume = double.tryParse(settings['volume'] ?? '');
+    if (savedVolume != null) {
+      _volume = savedVolume.clamp(0.0, 1.0).toDouble();
+      volumeListenable.value = _volume;
+      await engine.setVolume(_volume);
+    }
+    final savedSidebar = settings['sidebar_visible'];
+    if (savedSidebar != null) {
+      _sidebarVisible = savedSidebar != '0';
+    }
+    final savedSidebarWidth = double.tryParse(settings['sidebar_width'] ?? '');
+    if (savedSidebarWidth != null) {
+      _sidebarWidth = savedSidebarWidth.clamp(
+        sidebarMinWidth,
+        sidebarMaxWidth,
+      ).toDouble();
+    }
     // Utility column widths are locked — defaults always used, never
     // restored from SQLite. TITLE / ARTIST are user-resizable; load
     // their stored absolute widths.
@@ -295,6 +363,52 @@ class LibraryController extends ChangeNotifier {
     final next =
         _playThresholdPresets[(idx + 1) % _playThresholdPresets.length];
     await _setPlayThresholdSeconds(next);
+  }
+
+  double get volume => _volume;
+
+  /// Update playback volume. During an active slider drag the caller passes
+  /// `commit: false` per frame — engine + listenable update, no SQLite
+  /// write. On drag end, `commit: true` flushes the value once.
+  Future<void> setVolume(double v, {bool commit = false}) async {
+    final clamped = v.clamp(0.0, 1.0).toDouble();
+    if (clamped == _volume) {
+      if (commit) await repo.setSetting('volume', _volume.toString());
+      return;
+    }
+    _volume = clamped;
+    volumeListenable.value = _volume;
+    await engine.setVolume(_volume);
+    if (commit) await repo.setSetting('volume', _volume.toString());
+  }
+
+  bool get sidebarVisible => _sidebarVisible;
+  double get sidebarWidth => _sidebarWidth;
+
+  Future<void> toggleSidebarVisible() async {
+    _sidebarVisible = !_sidebarVisible;
+    notifyListeners();
+    await repo.setSetting('sidebar_visible', _sidebarVisible ? '1' : '0');
+  }
+
+  /// Update the sidebar width during/after a drag. The width is clamped to
+  /// `[sidebarMinWidth, sidebarMaxWidth]` — dragging past either bound
+  /// stops at the bound (no auto-collapse). Hide is only via the toggle
+  /// button or `⌘\`. `commit: false` is used per drag-update frame (no
+  /// SQLite write); `commit: true` flushes the final width on drag end.
+  Future<void> setSidebarWidth(double w, {bool commit = false}) async {
+    final clamped = w.clamp(sidebarMinWidth, sidebarMaxWidth).toDouble();
+    if (clamped == _sidebarWidth) {
+      if (commit) {
+        await repo.setSetting('sidebar_width', _sidebarWidth.toString());
+      }
+      return;
+    }
+    _sidebarWidth = clamped;
+    notifyListeners();
+    if (commit) {
+      await repo.setSetting('sidebar_width', _sidebarWidth.toString());
+    }
   }
 
   Future<void> _setPlayThresholdSeconds(int s) async {
@@ -713,6 +827,7 @@ class LibraryController extends ChangeNotifier {
         return;
       }
       repo.markPlayed(trackId);
+      _pushNowPlaying();
     }
     await engine.play();
     if (reveal) {
@@ -827,6 +942,11 @@ class LibraryController extends ChangeNotifier {
     }
     _lastTickPosition = pos;
     _positionNotifier.value = pos;
+    final now = DateTime.now();
+    if (now.difference(_lastNowPlayingPushAt).inMilliseconds >= 1000) {
+      _lastNowPlayingPushAt = now;
+      _pushNowPlaying();
+    }
   }
 
   void _onPlaying(bool playing) {
@@ -842,6 +962,7 @@ class LibraryController extends ChangeNotifier {
       _flushTimer = null;
       _flushCurrentTrack();
     }
+    _pushNowPlaying();
     notifyListeners();
   }
 

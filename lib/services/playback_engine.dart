@@ -32,5 +32,9 @@ class PlaybackEngine {
   Future<void> stop() => _player.stop();
   Future<void> seek(Duration position) => _player.seek(position);
 
+  double get volume => _player.volume;
+  Future<void> setVolume(double v) =>
+      _player.setVolume(v.clamp(0.0, 1.0).toDouble());
+
   Future<void> dispose() => _player.dispose();
 }

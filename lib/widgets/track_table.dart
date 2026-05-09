@@ -46,7 +46,7 @@ class _TrackTableState extends State<TrackTable> {
     final tracks = c.visibleTracks;
     final idx = tracks.indexWhere((t) => t.id == id);
     if (idx < 0) return;
-    final extent = c.showArtwork ? 48.0 : 32.0;
+    final extent = c.showArtwork ? 56.0 : 44.0;
     final view = _scroll.position.viewportDimension;
     final maxScroll = _scroll.position.maxScrollExtent;
     final target = (idx * extent - view / 2 + extent / 2).clamp(
@@ -68,7 +68,7 @@ class _TrackTableState extends State<TrackTable> {
     final tracks = c.visibleTracks;
     final idx = tracks.indexWhere((t) => t.id == id);
     if (idx < 0) return;
-    final extent = c.showArtwork ? 48.0 : 32.0;
+    final extent = c.showArtwork ? 56.0 : 44.0;
     final target = idx * extent;
     final view = _scroll.position.viewportDimension;
     final current = _scroll.offset;
@@ -153,7 +153,7 @@ class _TrackTableState extends State<TrackTable> {
                               behavior: noDefaultScrollbars,
                               child: ListView.builder(
                                 controller: _scroll,
-                                itemExtent: showArtwork ? 48 : 32,
+                                itemExtent: showArtwork ? 56 : 44,
                                 itemCount: tracks.length,
                                 itemBuilder: (context, index) {
                                   final t = tracks[index];
@@ -397,8 +397,8 @@ class _HeaderCell extends StatelessWidget {
                   textAlign: align,
                   style: const TextStyle(
                     color: AppColors.textSecondary,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w700,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
                     letterSpacing: 1.0,
                   ),
                 ),
@@ -548,27 +548,33 @@ Widget _buildRowInner(
     case 'title':
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
-        child: _TitleCell(
-          track: t,
-          isCurrent: isCurrent,
-          showArtwork: showArtwork,
-          titleColor: titleColor,
-          titleWeight: titleWeight,
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: _TitleCell(
+            track: t,
+            isCurrent: isCurrent,
+            showArtwork: showArtwork,
+            titleColor: titleColor,
+            titleWeight: titleWeight,
+          ),
         ),
       );
     case 'artist':
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
-        child: Text(
-          t.artist.isEmpty ? '—' : t.artist,
-          overflow: TextOverflow.ellipsis,
-          maxLines: 1,
-          style: TextStyle(
-            color: t.artist.isEmpty
-                ? AppColors.textSecondary
-                : AppColors.textPrimary,
-            fontSize: 12,
-            height: 1.0,
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            t.artist.isEmpty ? '—' : t.artist,
+            overflow: TextOverflow.ellipsis,
+            maxLines: 1,
+            style: TextStyle(
+              color: t.artist.isEmpty
+                  ? AppColors.textSecondary
+                  : AppColors.textPrimary,
+              fontSize: 12,
+              height: 1.0,
+            ),
           ),
         ),
       );
@@ -661,7 +667,7 @@ class _DraggableHeaderCell extends StatelessWidget {
                         color: AppColors.accent,
                         width: 1,
                       ),
-                      borderRadius: BorderRadius.circular(3),
+                      borderRadius: BorderRadius.zero,
                     ),
                     child: child,
                   ),
@@ -715,7 +721,7 @@ class _TrackRow extends StatelessWidget {
       color: AppColors.surface,
       elevation: 6,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.zero,
         side: const BorderSide(color: AppColors.border),
       ),
       items: const [
@@ -790,7 +796,7 @@ class _TrackRow extends StatelessWidget {
                   const animDuration = Duration(milliseconds: 220);
                   const animCurve = Curves.easeOutCubic;
                   const dividerWidth = 6.0;
-                  final rowHeight = showArtwork ? 48.0 : 32.0;
+                  final rowHeight = showArtwork ? 56.0 : 44.0;
 
                   final children = <Widget>[];
                   var x = 0.0;

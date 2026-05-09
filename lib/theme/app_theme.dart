@@ -1,13 +1,16 @@
 import 'package:flutter/material.dart';
 
 class AppColors {
-  static const background = Color(0xFF0E0E10);
-  static const surface = Color(0xFF18181B);
+  static const background = Color(0xFF08090C);
+  static const navSurface = Color(0xFF111114);
+  static const workspaceSurface = Color(0xFF13161D);
+  static const surface = Color(0xFF0F1116);
   static const surfaceAlt = Color(0xFF1F1F23);
-  static const border = Color(0xFF2A2A2F);
+  static const border = Color(0xFF23262E);
   static const textPrimary = Color(0xFFE7E7EA);
   static const textSecondary = Color(0xFF8A8A90);
-  static const accent = Color(0xFF7C5CFF);
+  static const textTertiary = Color(0xFF5C5C62);
+  static const accent = Color(0xFF6E4DFF);
   static const favorite = Color(0xFFFFC857);
   static const reviewed = Color(0xFF4CAF7E);
   static const trail = Color(0xFFC8523F);

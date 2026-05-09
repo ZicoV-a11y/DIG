@@ -19,8 +19,7 @@ class FolderSidebar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 220,
-      color: AppColors.surface,
+      color: AppColors.navSurface,
       child: ListenableBuilder(
         listenable: controller,
         builder: (context, _) {
@@ -212,7 +211,7 @@ class _FolderTileState extends State<_FolderTile> {
                       if (_hovering && widget.onRemove != null)
                         InkWell(
                           onTap: widget.onRemove,
-                          borderRadius: BorderRadius.circular(3),
+                          borderRadius: BorderRadius.zero,
                           child: const Padding(
                             padding: EdgeInsets.all(2),
                             child: Icon(

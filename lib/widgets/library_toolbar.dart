@@ -21,10 +21,24 @@ class LibraryToolbar extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: 52,
-      color: AppColors.background,
-      padding: const EdgeInsets.symmetric(horizontal: 14),
+      padding: const EdgeInsets.symmetric(horizontal: 24),
       child: Row(
         children: [
+          ListenableBuilder(
+            listenable: controller,
+            builder: (context, _) {
+              return _ToolbarIconButton(
+                icon: controller.sidebarVisible
+                    ? Icons.view_sidebar_outlined
+                    : Icons.view_sidebar_rounded,
+                tooltip: controller.sidebarVisible
+                    ? 'Hide sidebar (⌘\\)'
+                    : 'Show sidebar (⌘\\)',
+                onTap: controller.toggleSidebarVisible,
+              );
+            },
+          ),
+          const SizedBox(width: 10),
           Expanded(
             child: SizedBox(
               height: 32,
@@ -50,15 +64,15 @@ class LibraryToolbar extends StatelessWidget {
                   fillColor: AppColors.surface,
                   contentPadding: const EdgeInsets.symmetric(vertical: 6),
                   border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(6),
+                    borderRadius: BorderRadius.zero,
                     borderSide: const BorderSide(color: AppColors.border),
                   ),
                   enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(6),
+                    borderRadius: BorderRadius.zero,
                     borderSide: const BorderSide(color: AppColors.border),
                   ),
                   focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(6),
+                    borderRadius: BorderRadius.zero,
                     borderSide: const BorderSide(color: AppColors.accent),
                   ),
                 ),
@@ -86,8 +100,6 @@ class LibraryToolbar extends StatelessWidget {
                     onTap: controller.toggleUnreviewedOnly,
                   ),
                   const SizedBox(width: 8),
-                  _PlayThresholdPill(controller: controller),
-                  const SizedBox(width: 8),
                   _ToolbarIconButton(
                     icon: Icons.keyboard_outlined,
                     tooltip: 'Keyboard shortcuts',
@@ -98,57 +110,6 @@ class LibraryToolbar extends StatelessWidget {
             },
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _PlayThresholdPill extends StatelessWidget {
-  final LibraryController controller;
-  const _PlayThresholdPill({required this.controller});
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: 'Play threshold (click to cycle)',
-      waitDuration: const Duration(milliseconds: 600),
-      child: Material(
-        color: AppColors.surfaceAlt,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(5),
-          side: const BorderSide(color: AppColors.border),
-        ),
-        child: InkWell(
-          onTap: controller.cyclePlayThreshold,
-          borderRadius: BorderRadius.circular(5),
-          hoverColor: AppColors.hoverRow,
-          focusColor: AppColors.focusOverlay,
-          child: Container(
-            constraints: const BoxConstraints(minHeight: 32, minWidth: 70),
-            alignment: Alignment.center,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(
-                  Icons.timer_outlined,
-                  size: 14,
-                  color: AppColors.accent,
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  'Play ${controller.playThresholdSeconds}s',
-                  style: const TextStyle(
-                    color: AppColors.textPrimary,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.4,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
       ),
     );
   }
@@ -173,18 +134,20 @@ class _ToolbarIconButton extends StatelessWidget {
       child: Material(
         color: AppColors.surface,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.zero,
           side: const BorderSide(color: AppColors.border),
         ),
         child: InkWell(
           onTap: onTap,
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.zero,
           hoverColor: AppColors.hoverRow,
           focusColor: AppColors.focusOverlay,
           child: SizedBox(
             width: 32,
             height: 32,
-            child: Icon(icon, size: 16, color: AppColors.textSecondary),
+            child: Center(
+              child: Icon(icon, size: 16, color: AppColors.textSecondary),
+            ),
           ),
         ),
       ),
@@ -209,7 +172,7 @@ class _RecentReviewedButton extends StatelessWidget {
       color: AppColors.surface,
       elevation: 6,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.zero,
         side: const BorderSide(color: AppColors.border),
       ),
       itemBuilder: (context) => [
@@ -255,7 +218,7 @@ class _RecentReviewedButton extends StatelessWidget {
       child: Material(
         color: AppColors.surface,
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(6),
+          borderRadius: BorderRadius.zero,
           side: const BorderSide(color: AppColors.border),
         ),
         child: Padding(
@@ -304,14 +267,14 @@ class ToolbarToggle extends StatelessWidget {
           ? AppColors.accent.withValues(alpha: 0.15)
           : AppColors.surface,
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.zero,
         side: BorderSide(
           color: value ? AppColors.accent : AppColors.border,
         ),
       ),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(6),
+        borderRadius: BorderRadius.zero,
         hoverColor: AppColors.hoverRow,
         focusColor: AppColors.focusOverlay,
         child: Padding(

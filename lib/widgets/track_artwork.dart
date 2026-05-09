@@ -30,7 +30,7 @@ class TrackArtwork extends StatelessWidget {
           end: Alignment.bottomRight,
           colors: [base, shade],
         ),
-        borderRadius: BorderRadius.circular(3),
+        borderRadius: BorderRadius.zero,
         border: Border.all(
           color: highlight ? AppColors.accent : AppColors.border,
           width: highlight ? 1.2 : 0.5,

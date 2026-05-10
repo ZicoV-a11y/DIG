@@ -252,77 +252,87 @@ class _NowPlayingBlock extends StatelessWidget {
 
     final split = _splitTitleAndMix(t.displayTitle);
 
-    return Tooltip(
-      message: 'Jump to current track',
-      waitDuration: const Duration(milliseconds: 600),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: onTap,
-          hoverColor: AppColors.hoverRow,
-          focusColor: AppColors.focusOverlay,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            child: SizedBox(
-              width: double.infinity,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-              Text(
-                split.primary,
-                overflow: TextOverflow.ellipsis,
-                maxLines: 1,
-                style: const TextStyle(
-                  color: AppColors.textPrimary,
-                  fontSize: 22,
-                  fontWeight: FontWeight.w600,
-                  height: 1.15,
-                ),
-              ),
-              if (split.subtitle != null) ...[
-                const SizedBox(height: 4),
-                Text(
-                  split.subtitle!,
-                  overflow: TextOverflow.ellipsis,
-                  maxLines: 1,
-                  style: const TextStyle(
-                    color: AppColors.textSecondary,
-                    fontSize: 16,
-                    height: 1.15,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisAlignment: MainAxisAlignment.center,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Tooltip(
+          message: 'Jump to current track',
+          waitDuration: const Duration(milliseconds: 600),
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: onTap,
+              hoverColor: AppColors.hoverRow,
+              focusColor: AppColors.focusOverlay,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        split.primary,
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        style: const TextStyle(
+                          color: AppColors.textPrimary,
+                          fontSize: 22,
+                          fontWeight: FontWeight.w600,
+                          height: 1.15,
+                        ),
+                      ),
+                      if (split.subtitle != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          split.subtitle!,
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 1,
+                          style: const TextStyle(
+                            color: AppColors.textSecondary,
+                            fontSize: 16,
+                            height: 1.15,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 4),
+                      Text(
+                        t.displayArtist.isEmpty ? '—' : t.displayArtist,
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        style: const TextStyle(
+                          color: AppColors.textSecondary,
+                          fontSize: 14,
+                          height: 1.15,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _formatTrackMeta(t),
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        style: const TextStyle(
+                          color: AppColors.textTertiary,
+                          fontSize: 14,
+                          height: 1.15,
+                          fontFeatures: [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              ],
-              const SizedBox(height: 4),
-              Text(
-                t.displayArtist.isEmpty ? '—' : t.displayArtist,
-                overflow: TextOverflow.ellipsis,
-                maxLines: 1,
-                style: const TextStyle(
-                  color: AppColors.textSecondary,
-                  fontSize: 14,
-                  height: 1.15,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                _formatTrackMeta(t),
-                overflow: TextOverflow.ellipsis,
-                maxLines: 1,
-                style: const TextStyle(
-                  color: AppColors.textTertiary,
-                  fontSize: 14,
-                  height: 1.15,
-                  fontFeatures: [FontFeature.tabularFigures()],
-                ),
-              ),
-              _PeoplePivots(track: t, onTap: onPivotTap),
-                ],
               ),
             ),
           ),
         ),
-      ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: _PeoplePivots(track: t, onTap: onPivotTap),
+        ),
+      ],
     );
   }
 }
@@ -336,10 +346,9 @@ class _NowPlayingBlock extends StatelessWidget {
 /// filters down to that name's tracks instantly. Dropping the
 /// query restores the prior view; nothing is rebuilt or re-indexed.
 ///
-/// Kept lightweight: extraction is a regex over already-loaded
-/// strings (no I/O), the chips are simple Material+InkWell, taps
-/// don't bubble to the parent "jump to current track" InkWell
-/// because the chip's own InkWell consumes the gesture.
+/// Rendered as a sibling of the "jump to current track" InkWell, not
+/// nested inside it, so chip taps and now-playing taps stay distinct
+/// hit zones.
 class _PeoplePivots extends StatelessWidget {
   final Track track;
   final void Function(String) onTap;

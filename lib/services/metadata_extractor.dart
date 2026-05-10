@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:audio_metadata_reader/audio_metadata_reader.dart';
 import 'package:flutter/foundation.dart';
 
+import 'key_fallback.dart';
+
 class TrackMetadata {
   final String path;
   final String? title;
@@ -52,6 +54,13 @@ List<TrackMetadata> _extractInIsolate(List<String> paths) {
   var existCount = 0;
   var parseErrors = 0;
   final firstErrors = <String>[];
+  // Per-file slow-read tracking — if any single file's read takes
+  // longer than 1500ms we log it. On Dropbox CloudStorage these are
+  // almost always cloud-only files being materialised on demand.
+  // Knowing which files block lets us teach the user (or future
+  // logic) to defer them.
+  final slow = <String>[];
+  final overallSw = Stopwatch()..start();
   for (final path in paths) {
     final file = File(path);
     if (!file.existsSync()) {
@@ -59,8 +68,17 @@ List<TrackMetadata> _extractInIsolate(List<String> paths) {
       continue;
     }
     existCount++;
+    final sw = Stopwatch()..start();
     try {
-      final raw = readAllMetadata(file, getImage: true);
+      // `getImage: false` skips reading the embedded artwork bytes
+      // (we don't display picture data here — the playback deck
+      // uses a deterministic color seed). On large AIFF/FLAC files
+      // with multi-MB cover art this avoids forcing a full download
+      // through Dropbox FileProvider just to compute hasArtwork.
+      // We accept that `hasArtwork` will default to false during
+      // bulk extraction; a future on-demand pass can refresh it
+      // for the currently-playing track.
+      final raw = readAllMetadata(file, getImage: false);
       results.add(_mapToTrackMetadata(path, raw));
     } catch (e) {
       parseErrors++;
@@ -69,12 +87,19 @@ List<TrackMetadata> _extractInIsolate(List<String> paths) {
       }
       results.add(TrackMetadata.empty(path));
     }
+    if (sw.elapsedMilliseconds > 1500 && slow.length < 5) {
+      slow.add('${sw.elapsedMilliseconds}ms ${path.split('/').last}');
+    }
   }
   debugPrint(
-    '[meta isolate] processed ${paths.length} (existed=$existCount parseErrors=$parseErrors)',
+    '[meta isolate] processed ${paths.length} in ${overallSw.elapsedMilliseconds}ms '
+    '(existed=$existCount parseErrors=$parseErrors)',
   );
   for (final err in firstErrors) {
     debugPrint('[meta isolate] err: $err');
+  }
+  for (final s in slow) {
+    debugPrint('[meta isolate] slow: $s');
   }
   return results;
 }
@@ -126,6 +151,21 @@ TrackMetadata _mapToTrackMetadata(String path, Object raw) {
     genre = raw.genres.isNotEmpty ? raw.genres.first : null;
     duration = raw.duration;
     hasArtwork = raw.pictures.isNotEmpty;
+  }
+
+  // Audio_metadata_reader's RiffMetadata (AIFF/WAV) and
+  // VorbisMetadata (FLAC) intentionally don't expose
+  // `initialKey` even when the underlying ID3v2 / Vorbis-comment
+  // parser saw a TKEY / INITIALKEY value. Pull just the key out
+  // ourselves so the Key column populates for those formats.
+  // Skipped when the standard reader already yielded a key (most
+  // MP3s) — no extra file I/O on the common path.
+  if ((musicalKey == null || musicalKey.trim().isEmpty) &&
+      (raw is RiffMetadata || raw is VorbisMetadata)) {
+    final fallback = KeyFallback.read(path);
+    if (fallback != null && fallback.trim().isNotEmpty) {
+      musicalKey = fallback.trim();
+    }
   }
 
   return TrackMetadata(

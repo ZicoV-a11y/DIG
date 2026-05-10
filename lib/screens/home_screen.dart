@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../widgets/folder_sidebar.dart';
+import '../widgets/library_status_bar.dart';
 import '../widgets/library_toolbar.dart';
 import '../widgets/playback_bar.dart';
 import '../widgets/track_table.dart';
@@ -24,6 +25,7 @@ class _HomeScreenState extends State<HomeScreen> {
   late final FocusNode _bodyFocusNode;
   final ScrollController _tableScroll = ScrollController();
   final GlobalKey _tableAreaKey = GlobalKey();
+  final GlobalKey _railAreaKey = GlobalKey();
 
   @override
   void initState() {
@@ -34,16 +36,36 @@ class _HomeScreenState extends State<HomeScreen> {
     _searchFocusNode = FocusNode(debugLabel: 'search');
     _bodyFocusNode = FocusNode(debugLabel: 'body');
     HardwareKeyboard.instance.addHandler(_handleKeyEvent);
+    // Keep the search-field text in sync when the query is set
+    // from outside the toolbar (e.g. a Now Playing pivot click).
+    widget.controller.addListener(_syncSearchTextWithQuery);
   }
 
   @override
   void dispose() {
+    widget.controller.removeListener(_syncSearchTextWithQuery);
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     _searchTextController.dispose();
     _searchFocusNode.dispose();
     _bodyFocusNode.dispose();
     _tableScroll.dispose();
     super.dispose();
+  }
+
+  /// Mirror `controller.searchQuery` back into the toolbar's
+  /// `TextEditingController` whenever the controller changes the
+  /// query through a path other than the toolbar's own onChange
+  /// (e.g. tapping a Now Playing pivot). One-way sync from
+  /// controller → field; the field's onChange still drives the
+  /// other direction.
+  void _syncSearchTextWithQuery() {
+    final q = widget.controller.searchQuery;
+    if (_searchTextController.text != q) {
+      _searchTextController.value = TextEditingValue(
+        text: q,
+        selection: TextSelection.collapsed(offset: q.length),
+      );
+    }
   }
 
   /// Forward a scroll wheel event to the table's controller when the cursor
@@ -54,19 +76,26 @@ class _HomeScreenState extends State<HomeScreen> {
   void _handlePointerSignal(PointerSignalEvent event) {
     if (event is! PointerScrollEvent) return;
     if (!_tableScroll.hasClients) return;
-    final ctx = _tableAreaKey.currentContext;
-    if (ctx != null) {
-      final box = ctx.findRenderObject() as RenderBox?;
-      if (box != null) {
-        final origin = box.localToGlobal(Offset.zero);
-        final bounds = origin & box.size;
-        if (bounds.contains(event.position)) return; // native scroll wins
-      }
-    }
+    // Any pointer scroll over a region that has its own scroll
+    // (track table, utility rail) should be handled natively — we
+    // don't want to steal the wheel event and forward it to the
+    // table.
+    if (_pointerInside(event.position, _tableAreaKey)) return;
+    if (_pointerInside(event.position, _railAreaKey)) return;
     final pos = _tableScroll.position;
     final next = (pos.pixels + event.scrollDelta.dy)
         .clamp(pos.minScrollExtent, pos.maxScrollExtent);
     _tableScroll.jumpTo(next);
+  }
+
+  bool _pointerInside(Offset position, GlobalKey key) {
+    final ctx = key.currentContext;
+    if (ctx == null) return false;
+    final box = ctx.findRenderObject() as RenderBox?;
+    if (box == null) return false;
+    final origin = box.localToGlobal(Offset.zero);
+    final bounds = origin & box.size;
+    return bounds.contains(position);
   }
 
   void _focusSearch() {
@@ -85,13 +114,13 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _toggleFavoriteCurrent() {
-    final id = widget.controller.currentTrackId;
-    if (id != null) widget.controller.toggleFavorite(id);
+    final uid = widget.controller.currentTrackUid;
+    if (uid != null) widget.controller.toggleFavorite(uid);
   }
 
   void _toggleReviewedCurrent() {
-    final id = widget.controller.currentTrackId;
-    if (id != null) widget.controller.toggleReviewed(id);
+    final uid = widget.controller.currentTrackUid;
+    if (uid != null) widget.controller.toggleReviewed(uid);
   }
 
   bool _isFocusInTextInput() {
@@ -266,6 +295,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                             child: TrackTable(controller: c),
                                           ),
                                         ),
+                                        LibraryStatusBar(controller: c),
                                       ],
                                     ),
                                   ),
@@ -279,9 +309,12 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                   ),
                   const SizedBox(width: 4),
-                  ClipRRect(
-                    borderRadius: BorderRadius.zero,
-                    child: UtilityRail(controller: c),
+                  KeyedSubtree(
+                    key: _railAreaKey,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.zero,
+                      child: UtilityRail(controller: c),
+                    ),
                   ),
                 ],
               ),

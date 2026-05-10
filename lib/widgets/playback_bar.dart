@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/track.dart';
+import '../services/filename_parser.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import 'skip_button.dart';
@@ -25,15 +26,16 @@ class PlaybackBar extends StatelessWidget {
           return Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              const SizedBox(width: 28),
+              const SizedBox(width: 16),
               SizedBox(
                 width: 280,
                 child: _NowPlayingBlock(
                   track: track,
                   onTap: hasTrack ? controller.revealCurrent : null,
+                  onPivotTap: (name) => controller.setSearchQuery(name),
                 ),
               ),
-              const SizedBox(width: 24),
+              const SizedBox(width: 16),
               Expanded(
                 child: _TransportSubZone(
                 child: Column(
@@ -50,7 +52,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: 10),
                         SkipButton(
                           label: '-30',
                           onPressed: hasTrack
@@ -59,7 +61,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: 10),
                         SkipButton(
                           label: '-10',
                           onPressed: hasTrack
@@ -68,42 +70,25 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
-                        const SizedBox(width: 14),
-                        SkipButton(
-                          label: '-5',
-                          onPressed: hasTrack
-                              ? () => controller.skip(
-                                    const Duration(seconds: -5),
-                                  )
-                              : null,
-                        ),
-                        const SizedBox(width: 28),
+                        const SizedBox(width: 18),
                         _CircleIconButton(
                           tooltip: 'Previous',
                           icon: Icons.skip_previous_rounded,
                           onPressed: controller.previous,
                         ),
-                        const SizedBox(width: 10),
+                        const SizedBox(width: 6),
                         _PlayPauseButton(
                           isPlaying: controller.isPlaying,
+                          isLoading: controller.isLoadingTrack,
                           onPressed: controller.togglePlayPause,
                         ),
-                        const SizedBox(width: 10),
+                        const SizedBox(width: 6),
                         _CircleIconButton(
                           tooltip: 'Next',
                           icon: Icons.skip_next_rounded,
                           onPressed: controller.next,
                         ),
-                        const SizedBox(width: 28),
-                        SkipButton(
-                          label: '+5',
-                          onPressed: hasTrack
-                              ? () => controller.skip(
-                                    const Duration(seconds: 5),
-                                  )
-                              : null,
-                        ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: 18),
                         SkipButton(
                           label: '+10',
                           onPressed: hasTrack
@@ -112,7 +97,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: 10),
                         SkipButton(
                           label: '+30',
                           onPressed: hasTrack
@@ -121,7 +106,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: 10),
                         SkipButton(
                           label: '+1m',
                           onPressed: hasTrack
@@ -142,9 +127,9 @@ class PlaybackBar extends StatelessWidget {
                 ),
                 ),
               ),
-              const SizedBox(width: 24),
+              const SizedBox(width: 16),
               _DeckArtwork(track: track),
-              const SizedBox(width: 28),
+              const SizedBox(width: 16),
             ],
           );
         },
@@ -241,10 +226,12 @@ class _PositionRow extends StatelessWidget {
 class _NowPlayingBlock extends StatelessWidget {
   final Track? track;
   final VoidCallback? onTap;
+  final void Function(String) onPivotTap;
 
   const _NowPlayingBlock({
     required this.track,
     required this.onTap,
+    required this.onPivotTap,
   });
 
   @override
@@ -263,7 +250,7 @@ class _NowPlayingBlock extends StatelessWidget {
       );
     }
 
-    final split = _splitTitleAndMix(t.title);
+    final split = _splitTitleAndMix(t.displayTitle);
 
     return Tooltip(
       message: 'Jump to current track',
@@ -308,7 +295,7 @@ class _NowPlayingBlock extends StatelessWidget {
               ],
               const SizedBox(height: 4),
               Text(
-                t.artist.isEmpty ? '—' : t.artist,
+                t.displayArtist.isEmpty ? '—' : t.displayArtist,
                 overflow: TextOverflow.ellipsis,
                 maxLines: 1,
                 style: const TextStyle(
@@ -329,6 +316,7 @@ class _NowPlayingBlock extends StatelessWidget {
                   fontFeatures: [FontFeature.tabularFigures()],
                 ),
               ),
+              _PeoplePivots(track: t, onTap: onPivotTap),
                 ],
               ),
             ),
@@ -341,6 +329,78 @@ class _NowPlayingBlock extends StatelessWidget {
 
 /// 130 × 130 album artwork tile shown at the far right of the playback
 /// header. Renders a placeholder square when no track is current.
+/// Horizontal row of clickable pivots derived from people mentioned
+/// on the currently-playing track (artist, co-artists, remixer,
+/// featured). Tapping a pivot routes through `onTap(name)` —
+/// upstream handler sets the library search query, so the table
+/// filters down to that name's tracks instantly. Dropping the
+/// query restores the prior view; nothing is rebuilt or re-indexed.
+///
+/// Kept lightweight: extraction is a regex over already-loaded
+/// strings (no I/O), the chips are simple Material+InkWell, taps
+/// don't bubble to the parent "jump to current track" InkWell
+/// because the chip's own InkWell consumes the gesture.
+class _PeoplePivots extends StatelessWidget {
+  final Track track;
+  final void Function(String) onTap;
+
+  const _PeoplePivots({required this.track, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final pivots = extractPeoplePivots(
+      artist: track.displayArtist,
+      title: track.displayTitle,
+    );
+    if (pivots.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 4,
+        children: [
+          for (final name in pivots) _PivotChip(label: name, onTap: () => onTap(name)),
+        ],
+      ),
+    );
+  }
+}
+
+class _PivotChip extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+
+  const _PivotChip({required this.label, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.surfaceAlt,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.zero,
+        side: const BorderSide(color: AppColors.border),
+      ),
+      child: InkWell(
+        onTap: onTap,
+        hoverColor: AppColors.hoverRow,
+        focusColor: AppColors.focusOverlay,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: AppColors.textPrimary,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              height: 1.2,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _DeckArtwork extends StatelessWidget {
   final Track? track;
   const _DeckArtwork({required this.track});
@@ -360,7 +420,7 @@ class _DeckArtwork extends StatelessWidget {
     }
     return ClipRRect(
       borderRadius: BorderRadius.zero,
-      child: TrackArtwork(seed: t.title, size: 130),
+      child: TrackArtwork(seed: t.displayTitle, size: 130),
     );
   }
 }
@@ -424,7 +484,7 @@ class _CircleIconButton extends StatelessWidget {
           focusColor: AppColors.focusOverlay,
           child: SizedBox(
             width: 48,
-            height: 48,
+            height: 64,
             child: Icon(icon, size: 28, color: AppColors.textPrimary),
           ),
         ),
@@ -435,8 +495,13 @@ class _CircleIconButton extends StatelessWidget {
 
 class _PlayPauseButton extends StatelessWidget {
   final bool isPlaying;
+  final bool isLoading;
   final VoidCallback onPressed;
-  const _PlayPauseButton({required this.isPlaying, required this.onPressed});
+  const _PlayPauseButton({
+    required this.isPlaying,
+    required this.isLoading,
+    required this.onPressed,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -444,18 +509,33 @@ class _PlayPauseButton extends StatelessWidget {
       color: AppColors.accent,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
       child: InkWell(
-        onTap: onPressed,
-        customBorder: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+        // Disable taps while loading — the engine.setTrack is in
+        // flight and tapping again would just queue redundant work.
+        onTap: isLoading ? null : onPressed,
+        customBorder:
+            const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
         hoverColor: Colors.white.withValues(alpha: 0.10),
         focusColor: Colors.white.withValues(alpha: 0.18),
         child: SizedBox(
           width: 80,
           height: 80,
-          child: Icon(
-            isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-            color: Colors.white,
-            size: 32,
-          ),
+          child: isLoading
+              ? const Center(
+                  child: SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.5,
+                      valueColor:
+                          AlwaysStoppedAnimation<Color>(Colors.white),
+                    ),
+                  ),
+                )
+              : Icon(
+                  isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+                  color: Colors.white,
+                  size: 32,
+                ),
         ),
       ),
     );

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../models/track.dart';
@@ -17,19 +19,63 @@ class _TrackTableState extends State<TrackTable> {
   final ScrollController _scroll = ScrollController();
   final ScrollController _hScroll = ScrollController();
   String? _lastScrolledSelection;
+  // Viewport-driven enrichment debounce. We snapshot the visible
+  // row range only after scrolling settles for ~250ms, so a fast
+  // flick across thousands of rows enqueues only what stays on
+  // screen at the end. The 20-row look-ahead each side covers
+  // casual scrolling without ever amplifying into mass downloads.
+  Timer? _viewportDebounce;
+  static const _viewportLookahead = 20;
 
   @override
   void initState() {
     super.initState();
     widget.controller.revealTick.addListener(_onRevealRequested);
+    // Initial viewport snapshot once the table has laid out.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scheduleViewportReport();
+    });
   }
 
   @override
   void dispose() {
+    _viewportDebounce?.cancel();
     widget.controller.revealTick.removeListener(_onRevealRequested);
     _scroll.dispose();
     _hScroll.dispose();
     super.dispose();
+  }
+
+  /// Reset the debounce timer. Each scroll notification calls this;
+  /// the actual snapshot only fires once movement settles.
+  void _scheduleViewportReport() {
+    _viewportDebounce?.cancel();
+    _viewportDebounce =
+        Timer(const Duration(milliseconds: 250), _emitViewport);
+  }
+
+  /// Snapshot the currently-visible track range (plus look-ahead)
+  /// and report the paths to the controller. The controller filters
+  /// out paths already enriched or already in flight.
+  void _emitViewport() {
+    if (!mounted || !_scroll.hasClients) return;
+    final c = widget.controller;
+    final tracks = c.visibleTracks;
+    if (tracks.isEmpty) return;
+    final extent = c.showArtwork ? 56.0 : 44.0;
+    final pos = _scroll.position;
+    final firstIdx =
+        ((pos.pixels / extent).floor() - _viewportLookahead);
+    final lastIdx = (((pos.pixels + pos.viewportDimension) / extent)
+            .ceil() +
+        _viewportLookahead);
+    final lo = firstIdx.clamp(0, tracks.length - 1);
+    final hi = lastIdx.clamp(0, tracks.length - 1);
+    if (hi < lo) return;
+    final paths = <String>[
+      for (var i = lo; i <= hi; i++) tracks[i].path,
+    ];
+    c.reportViewportPaths(paths);
   }
 
   void _onRevealRequested() {
@@ -41,10 +87,10 @@ class _TrackTableState extends State<TrackTable> {
   void _centerOnCurrent() {
     if (!_scroll.hasClients) return;
     final c = widget.controller;
-    final id = c.currentTrackId;
-    if (id == null) return;
+    final uid = c.currentTrackUid;
+    if (uid == null) return;
     final tracks = c.visibleTracks;
-    final idx = tracks.indexWhere((t) => t.id == id);
+    final idx = tracks.indexWhere((t) => t.uid == uid);
     if (idx < 0) return;
     final extent = c.showArtwork ? 56.0 : 44.0;
     final view = _scroll.position.viewportDimension;
@@ -63,10 +109,10 @@ class _TrackTableState extends State<TrackTable> {
   void _ensureSelectedVisible() {
     if (!_scroll.hasClients) return;
     final c = widget.controller;
-    final id = c.selectedTrackId;
-    if (id == null || id == _lastScrolledSelection) return;
+    final uid = c.selectedTrackUid;
+    if (uid == null || uid == _lastScrolledSelection) return;
     final tracks = c.visibleTracks;
-    final idx = tracks.indexWhere((t) => t.id == id);
+    final idx = tracks.indexWhere((t) => t.uid == uid);
     if (idx < 0) return;
     final extent = c.showArtwork ? 56.0 : 44.0;
     final target = idx * extent;
@@ -78,7 +124,7 @@ class _TrackTableState extends State<TrackTable> {
     } else if (target + extent > current + view) {
       _scroll.jumpTo((target + extent - view).clamp(0.0, maxScroll));
     }
-    _lastScrolledSelection = id;
+    _lastScrolledSelection = uid;
   }
 
   @override
@@ -91,6 +137,10 @@ class _TrackTableState extends State<TrackTable> {
         final showArtwork = c.showArtwork;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           _ensureSelectedVisible();
+          // Re-snapshot the viewport whenever the visible-tracks
+          // identity may have changed (sort / search / source
+          // switch). Cheap — just resets the debounce.
+          _scheduleViewportReport();
         });
         return LayoutBuilder(
           builder: (ctx, constraints) {
@@ -140,7 +190,7 @@ class _TrackTableState extends State<TrackTable> {
                   const Divider(height: 1, color: AppColors.border),
                   Expanded(
                     child: tracks.isEmpty
-                        ? _EmptyState(hasFolders: c.folders.isNotEmpty)
+                        ? _EmptyState(hasFolders: c.sources.isNotEmpty)
                         : RawScrollbar(
                             controller: _scroll,
                             thumbVisibility: true,
@@ -151,19 +201,32 @@ class _TrackTableState extends State<TrackTable> {
                             mainAxisMargin: scrollbarMargin,
                             child: ScrollConfiguration(
                               behavior: noDefaultScrollbars,
-                              child: ListView.builder(
-                                controller: _scroll,
-                                itemExtent: showArtwork ? 56 : 44,
-                                itemCount: tracks.length,
-                                itemBuilder: (context, index) {
-                                  final t = tracks[index];
-                                  return _TrackRow(
-                                    key: ValueKey(t.id),
-                                    track: t,
-                                    controller: c,
-                                    showArtwork: showArtwork,
-                                  );
+                              // NotificationListener intercepts scroll
+                              // updates; we only RESET the debounce
+                              // here. The actual viewport snapshot
+                              // fires when scrolling settles, so a
+                              // fast flick across thousands of rows
+                              // enqueues only the rows the user
+                              // ends up looking at.
+                              child: NotificationListener<ScrollNotification>(
+                                onNotification: (n) {
+                                  _scheduleViewportReport();
+                                  return false;
                                 },
+                                child: ListView.builder(
+                                  controller: _scroll,
+                                  itemExtent: showArtwork ? 56 : 44,
+                                  itemCount: tracks.length,
+                                  itemBuilder: (context, index) {
+                                    final t = tracks[index];
+                                    return _TrackRow(
+                                      key: ValueKey(t.uid),
+                                      track: t,
+                                      controller: c,
+                                      showArtwork: showArtwork,
+                                    );
+                                  },
+                                ),
                               ),
                             ),
                           ),
@@ -437,10 +500,14 @@ double _columnWidth(String col, LibraryController c) {
       return c.colArtistWidth;
     case 'bpm':
       return c.colBpmWidth;
+    case 'key':
+      return c.colKeyWidth;
     case 'time':
       return c.colTimeWidth;
     case 'plays':
       return c.colPlaysWidth;
+    case 'lastPlayed':
+      return c.colLastPlayedWidth;
   }
   return 0;
 }
@@ -485,6 +552,13 @@ Widget _buildHeaderInner(String col, LibraryController c) {
         controller: c,
         align: TextAlign.center,
       );
+    case 'key':
+      return _HeaderCell(
+        label: 'KEY',
+        column: TrackSortColumn.key,
+        controller: c,
+        align: TextAlign.center,
+      );
     case 'time':
       return _HeaderCell(
         label: 'TIME',
@@ -499,6 +573,13 @@ Widget _buildHeaderInner(String col, LibraryController c) {
         controller: c,
         align: TextAlign.center,
       );
+    case 'lastPlayed':
+      return _HeaderCell(
+        label: 'LAST PLAYED',
+        column: TrackSortColumn.lastPlayed,
+        controller: c,
+        align: TextAlign.center,
+      );
   }
   return const SizedBox.shrink();
 }
@@ -508,6 +589,7 @@ Widget _buildRowInner(
   Track t,
   LibraryController c, {
   required bool isCurrent,
+  required bool isLoading,
   required bool showArtwork,
   required Color titleColor,
   required FontWeight titleWeight,
@@ -525,7 +607,7 @@ Widget _buildRowInner(
             color: t.favorite
                 ? AppColors.favorite
                 : AppColors.textSecondary,
-            onPressed: () => c.toggleFavorite(t.id),
+            onPressed: () => c.toggleFavorite(t.uid),
           ),
         ),
       );
@@ -553,6 +635,7 @@ Widget _buildRowInner(
           child: _TitleCell(
             track: t,
             isCurrent: isCurrent,
+            isLoading: isLoading,
             showArtwork: showArtwork,
             titleColor: titleColor,
             titleWeight: titleWeight,
@@ -565,11 +648,11 @@ Widget _buildRowInner(
         child: Align(
           alignment: Alignment.centerLeft,
           child: Text(
-            t.artist.isEmpty ? '—' : t.artist,
+            t.displayArtist.isEmpty ? '—' : t.displayArtist,
             overflow: TextOverflow.ellipsis,
             maxLines: 1,
             style: TextStyle(
-              color: t.artist.isEmpty
+              color: t.displayArtist.isEmpty
                   ? AppColors.textSecondary
                   : AppColors.textPrimary,
               fontSize: 12,
@@ -583,6 +666,19 @@ Widget _buildRowInner(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(child: Text(_formatBpm(t.bpm), style: _numStyle)),
       );
+    case 'key':
+      // displayKey hits a per-Track cache; the underlying parser
+      // is regex-on-basename and does no I/O, so this is cheap
+      // even at 60fps with ~50 visible rows.
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: Text(
+            t.displayKey.isEmpty ? '—' : t.displayKey,
+            style: t.displayKey.isEmpty ? _numStyleDim : _numStyle,
+          ),
+        ),
+      );
     case 'time':
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -594,6 +690,21 @@ Widget _buildRowInner(
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(child: Text('${t.playCount}', style: _numStyle)),
+      );
+    case 'lastPlayed':
+      // `_formatLastPlayed` returns a short, allocation-light
+      // string (one of `Today` / `Yesterday` / `3d ago` / `Apr 28`
+      // / `Never`). No DateTime arithmetic per-comparison sort —
+      // the sort comparator works on `lastPlayedAt` directly.
+      final at = t.lastPlayedAt;
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: Text(
+            _formatLastPlayed(at),
+            style: at == null ? _numStyleDim : _numStyle,
+          ),
+        ),
       );
   }
   return const SizedBox.shrink();
@@ -746,17 +857,20 @@ class _TrackRow extends StatelessWidget {
       ],
     );
     if (result == 'reveal') {
-      await controller.showTrackInFinder(track.id);
+      await controller.showTrackInstanceInFinder(track);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final isCurrent = controller.currentTrackId == track.id;
-    final isSelected = !isCurrent && controller.selectedTrackId == track.id;
-    final titleColor = isCurrent ? AppColors.accent : AppColors.textPrimary;
+    final isCurrent = controller.currentTrackUid == track.uid;
+    final isLoading = isCurrent && controller.isLoadingTrack;
+    final isSelected = !isCurrent && controller.selectedTrackUid == track.uid;
+    final titleColor = isCurrent
+        ? AppColors.accent
+        : (track.isAvailable ? AppColors.textPrimary : AppColors.textTertiary);
     final titleWeight = isCurrent ? FontWeight.w600 : FontWeight.w500;
-    final trailIndex = isCurrent ? null : controller.trailIndexOf(track.id);
+    final trailIndex = isCurrent ? null : controller.trailIndexOf(track.uid);
     Color rowColor;
     if (isCurrent) {
       rowColor = AppColors.selectedRow;
@@ -773,7 +887,7 @@ class _TrackRow extends StatelessWidget {
       child: Material(
       color: rowColor,
       child: InkWell(
-        onTap: () => controller.play(track.id),
+        onTap: () => controller.play(track.uid),
         hoverColor: AppColors.hoverRow,
         focusColor: AppColors.focusOverlay,
         child: Stack(
@@ -793,11 +907,19 @@ class _TrackRow extends StatelessWidget {
               child: Builder(
                 builder: (context) {
                   final order = controller.columnOrder;
-                  const animDuration = Duration(milliseconds: 220);
-                  const animCurve = Curves.easeOutCubic;
                   const dividerWidth = 6.0;
                   final rowHeight = showArtwork ? 56.0 : 44.0;
 
+                  // Rows use plain Positioned (no animation). The
+                  // header keeps `AnimatedPositioned` so the user
+                  // sees a smooth reorder during column drag — but
+                  // for the body, every visible row × 7 cells of
+                  // active AnimationController objects ticking
+                  // indefinitely was a sustained per-frame cost
+                  // even when nothing was being dragged. Snap
+                  // layout for body rows is dramatically cheaper
+                  // and visually indistinguishable when columns
+                  // aren't moving.
                   final children = <Widget>[];
                   var x = 0.0;
 
@@ -805,10 +927,7 @@ class _TrackRow extends StatelessWidget {
                     final col = order[i];
                     final w = _columnWidth(col, controller);
 
-                    children.add(AnimatedPositioned(
-                      key: ValueKey('row_$col'),
-                      duration: animDuration,
-                      curve: animCurve,
+                    children.add(Positioned(
                       left: x,
                       top: 0,
                       height: rowHeight,
@@ -818,6 +937,7 @@ class _TrackRow extends StatelessWidget {
                         track,
                         controller,
                         isCurrent: isCurrent,
+                        isLoading: isLoading,
                         showArtwork: showArtwork,
                         titleColor: titleColor,
                         titleWeight: titleWeight,
@@ -826,10 +946,7 @@ class _TrackRow extends StatelessWidget {
                     x += w;
 
                     if (i < order.length - 1) {
-                      children.add(AnimatedPositioned(
-                        key: ValueKey('row_gap_after_$col'),
-                        duration: animDuration,
-                        curve: animCurve,
+                      children.add(Positioned(
                         left: x,
                         top: 0,
                         height: rowHeight,
@@ -841,10 +958,7 @@ class _TrackRow extends StatelessWidget {
                   }
 
                   // Trailing divider mirrors the header's closing edge.
-                  children.add(AnimatedPositioned(
-                    key: const ValueKey('row_trailing'),
-                    duration: animDuration,
-                    curve: animCurve,
+                  children.add(Positioned(
                     left: x,
                     top: 0,
                     height: rowHeight,
@@ -873,6 +987,7 @@ class _TrackRow extends StatelessWidget {
 class _TitleCell extends StatelessWidget {
   final Track track;
   final bool isCurrent;
+  final bool isLoading;
   final bool showArtwork;
   final Color titleColor;
   final FontWeight titleWeight;
@@ -880,6 +995,7 @@ class _TitleCell extends StatelessWidget {
   const _TitleCell({
     required this.track,
     required this.isCurrent,
+    required this.isLoading,
     required this.showArtwork,
     required this.titleColor,
     required this.titleWeight,
@@ -893,18 +1009,74 @@ class _TitleCell extends StatelessWidget {
     // optional leader. Row tinting handles "currently playing"
     // visual indication; the EQ glyph would otherwise push title
     // text out of alignment with the header.
+    //
+    // Per-row loading indicator: when this is the row whose audio
+    // file the engine is currently materialising (e.g. Dropbox
+    // download), show a small spinner in the cell so the user can
+    // see *which* track triggered the wait — a single spinner on
+    // the central play button isn't enough during fast browsing.
+    final Widget? missingPrefix = isLoading
+        ? const Padding(
+            padding: EdgeInsets.only(right: 6),
+            child: SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(
+                strokeWidth: 1.5,
+                valueColor:
+                    AlwaysStoppedAnimation<Color>(AppColors.accent),
+              ),
+            ),
+          )
+        : track.isAvailable
+        ? null
+        : const Tooltip(
+            message: 'File not found at last scan',
+            waitDuration: Duration(milliseconds: 600),
+            child: Padding(
+              padding: EdgeInsets.only(right: 6),
+              child: Icon(
+                Icons.warning_amber_rounded,
+                size: 12,
+                color: AppColors.textTertiary,
+              ),
+            ),
+          );
+
+    final shownTitle = track.displayTitle;
     if (showArtwork) {
       return Row(
         children: [
           TrackArtwork(
-            seed: track.title,
+            seed: shownTitle,
             size: 36,
             highlight: isCurrent,
           ),
           const SizedBox(width: 10),
+          ?missingPrefix,
           Flexible(
             child: Text(
-              track.title,
+              shownTitle,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+              style: TextStyle(
+                color: titleColor,
+                fontSize: 13,
+                fontWeight: titleWeight,
+                height: 1.0,
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+    if (missingPrefix != null) {
+      return Row(
+        children: [
+          missingPrefix,
+          Flexible(
+            child: Text(
+              shownTitle,
               overflow: TextOverflow.ellipsis,
               maxLines: 1,
               style: TextStyle(
@@ -919,7 +1091,7 @@ class _TitleCell extends StatelessWidget {
       );
     }
     return Text(
-      track.title,
+      shownTitle,
       overflow: TextOverflow.ellipsis,
       maxLines: 1,
       style: TextStyle(
@@ -970,6 +1142,13 @@ const _numStyle = TextStyle(
   fontFeatures: [FontFeature.tabularFigures()],
 );
 
+const _numStyleDim = TextStyle(
+  color: AppColors.textTertiary,
+  fontSize: 12,
+  height: 1.0,
+  fontFeatures: [FontFeature.tabularFigures()],
+);
+
 String _formatDuration(Duration d) {
   if (d == Duration.zero) return '—';
   final m = d.inMinutes;
@@ -980,4 +1159,39 @@ String _formatDuration(Duration d) {
 String _formatBpm(double? bpm) {
   if (bpm == null || bpm <= 0) return '—';
   return bpm.round().toString();
+}
+
+const _monthsShort = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+/// Compact relative-time label for the Last Played column.
+/// Pure function over `(at, now)` — no allocations beyond the
+/// returned String, no DateTime arithmetic per-frame beyond a few
+/// integer subtractions. Cheap enough at 60fps × ~50 visible rows.
+String _formatLastPlayed(DateTime? at) {
+  if (at == null) return 'Never';
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final atDay = DateTime(at.year, at.month, at.day);
+  final days = today.difference(atDay).inDays;
+  if (days <= 0) return 'Today';
+  if (days == 1) return 'Yesterday';
+  if (days < 7) return '${days}d ago';
+  // Older than a week → drop to "Mon D" / "Mon D, YYYY" if not
+  // current calendar year.
+  final monthDay = '${_monthsShort[at.month - 1]} ${at.day}';
+  if (at.year == now.year) return monthDay;
+  return '$monthDay, ${at.year}';
 }

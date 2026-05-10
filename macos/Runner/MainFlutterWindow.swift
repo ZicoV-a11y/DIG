@@ -21,7 +21,7 @@ class MainFlutterWindow: NSWindow {
     // (the part Flutter renders into); minSize constrains the whole window.
     // Setting both prevents the user from dragging the window into a state
     // where the table/toolbar/playback bar lose structural integrity.
-    let minContent = NSSize(width: 1460, height: 600)
+    let minContent = NSSize(width: 1180, height: 600)
     self.contentMinSize = minContent
     self.minSize = NSSize(
       width: minContent.width,

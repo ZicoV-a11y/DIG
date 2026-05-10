@@ -2,6 +2,23 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+/// One file found during a scan. Both the directory walk AND the
+/// per-file `stat` happen inside the scanner isolate so the UI thread
+/// stays responsive on large libraries on slow / cloud-backed paths.
+class ScannedEntry {
+  final String path;
+  final String filename;
+  final int filesize;
+  final int modifiedAtMs;
+
+  const ScannedEntry({
+    required this.path,
+    required this.filename,
+    required this.filesize,
+    required this.modifiedAtMs,
+  });
+}
+
 class AudioScanner {
   static const audioExtensions = <String>{
     'mp3',
@@ -12,21 +29,59 @@ class AudioScanner {
     'aif',
   };
 
-  static Future<List<String>> scan(String rootPath) {
-    return compute(_scanInIsolate, rootPath);
+  /// Walk [rootPath] and return one [ScannedEntry] per audio file
+  /// (path + stat result). All disk I/O happens in a worker isolate
+  /// via `compute()`.
+  ///
+  /// [recursive] controls whether subdirectories are descended into.
+  /// `false` indexes only files directly inside [rootPath] — useful
+  /// for review/promo folders where deeper crawling is undesired.
+  static Future<List<ScannedEntry>> scan(
+    String rootPath, {
+    required bool recursive,
+  }) {
+    return compute(_scanInIsolate, _ScanRequest(rootPath, recursive));
   }
 }
 
+class _ScanRequest {
+  final String rootPath;
+  final bool recursive;
+  const _ScanRequest(this.rootPath, this.recursive);
+}
+
 @pragma('vm:entry-point')
-List<String> _scanInIsolate(String rootPath) {
-  final root = Directory(rootPath);
+List<ScannedEntry> _scanInIsolate(_ScanRequest req) {
+  final root = Directory(req.rootPath);
   if (!root.existsSync()) return const [];
-  final files = <String>[];
-  try {
-    for (final entity in root.listSync(
-      recursive: true,
-      followLinks: false,
-    )) {
+  final out = <ScannedEntry>[];
+
+  // We deliberately do NOT use `Directory.listSync(recursive: true)`.
+  // That call returns a single iterator backed by a depth-first walk;
+  // if any subdirectory raises a FileSystemException mid-iteration
+  // (a Dropbox/iCloud cloud-only file going through sync, a permission
+  // hiccup, a stale handle), the WHOLE iteration aborts and the rest
+  // of the tree is silently dropped. On a 9k-file library that means
+  // most files appear "missing" on the next scan.
+  //
+  // Manual per-directory walk: errors on one subtree don't stop the
+  // others.
+  final stack = <Directory>[root];
+  while (stack.isNotEmpty) {
+    final dir = stack.removeLast();
+    final List<FileSystemEntity> entries;
+    try {
+      entries = dir.listSync(followLinks: false);
+    } on FileSystemException {
+      continue; // best-effort: skip this subtree, keep going
+    } catch (_) {
+      continue;
+    }
+    for (final entity in entries) {
+      if (entity is Directory) {
+        if (req.recursive) stack.add(entity);
+        continue;
+      }
       if (entity is! File) continue;
       final p = entity.path;
       final sepIdx = p.lastIndexOf(Platform.pathSeparator);
@@ -35,14 +90,32 @@ List<String> _scanInIsolate(String rootPath) {
       final dotIdx = name.lastIndexOf('.');
       if (dotIdx <= 0 || dotIdx == name.length - 1) continue;
       final ext = name.substring(dotIdx + 1).toLowerCase();
-      if (AudioScanner.audioExtensions.contains(ext)) {
-        files.add(p);
+      if (!AudioScanner.audioExtensions.contains(ext)) continue;
+
+      // Stat each file here, in the isolate. Per-file stat on
+      // Dropbox paths can be slow; running it on the main isolate
+      // would freeze the UI for 9k+ files. Stat failures are
+      // tolerated — we still emit the entry with size=0/mtime=0
+      // so the path becomes part of the index (with degenerate
+      // hash inputs).
+      int size = 0;
+      int mtimeMs = 0;
+      try {
+        final st = entity.statSync();
+        size = st.size;
+        mtimeMs = st.modified.millisecondsSinceEpoch;
+      } catch (_) {
+        // best-effort
       }
+      out.add(ScannedEntry(
+        path: p,
+        filename: name,
+        filesize: size,
+        modifiedAtMs: mtimeMs,
+      ));
     }
-  } on FileSystemException {
-    // best-effort: ignore inaccessible subtrees and return what we have
   }
-  return files;
+  return out;
 }
 
 String filenameWithoutExtension(String path) {
@@ -50,4 +123,9 @@ String filenameWithoutExtension(String path) {
   final base = sep < 0 ? path : path.substring(sep + 1);
   final dot = base.lastIndexOf('.');
   return dot > 0 ? base.substring(0, dot) : base;
+}
+
+String basenameOfPath(String path) {
+  final sep = path.lastIndexOf(Platform.pathSeparator);
+  return sep < 0 ? path : path.substring(sep + 1);
 }

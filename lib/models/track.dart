@@ -1,7 +1,37 @@
-class Track {
-  final String id;
-  final String folderPath;
+import '../services/filename_parser.dart';
 
+/// A unified view over `indexed_files` (location + metadata) and
+/// `tracks` (intelligence). The split is a database concern; consumers
+/// (controller, widgets) treat a Track as one object.
+///
+/// Two identifiers matter:
+/// - [uid]: this file revision's content hash (basename + filesize +
+///   duration + mtime). Used as the `tracks.uid` PK once intelligence
+///   is materialised. Stable across path moves but changes if the file
+///   is re-tagged (mtime changes).
+/// - [intelUid]: which `tracks` row this file is linked to. Most often
+///   equal to [uid], but for duplicates it points at a sibling whose
+///   uid was promoted first. `null` until the first meaningful
+///   interaction.
+///
+/// [path] is filesystem location, never identity. Hand it to the audio
+/// engine; never use it for equality.
+class Track {
+  // From indexed_files (file identity + location):
+  final String uid;
+  final String fingerprint;
+  String? intelUid;
+
+  final String path;
+  final String filename;
+  int filesize;
+  int modifiedAt;
+
+  final String sourceId;
+  bool isAvailable;
+  int lastSeenAt;
+
+  // Displayable metadata (lightweight index — populated by extractor):
   String title;
   String artist;
   String album;
@@ -9,28 +39,117 @@ class Track {
   String musicalKey;
   double? bpm;
   Duration duration;
-  bool favorite;
-  Duration cumulativeListened;
-  int playCount;
   bool hasArtwork;
   DateTime? metadataReadAt;
 
+  // Intelligence fields (default values when no `tracks` row exists):
+  bool favorite;
+  int playCount;
+  Duration cumulativeListened;
+  DateTime? lastPlayedAt;
+
   Track({
-    required this.id,
+    required this.uid,
+    required this.fingerprint,
+    this.intelUid,
+    required this.path,
+    required this.filename,
+    required this.sourceId,
+    this.filesize = 0,
+    this.modifiedAt = 0,
+    this.isAvailable = true,
+    this.lastSeenAt = 0,
     required this.title,
-    required this.artist,
-    required this.folderPath,
-    required this.duration,
+    this.artist = '',
     this.album = '',
     this.genre = '',
     this.musicalKey = '',
     this.bpm,
-    this.favorite = false,
-    this.cumulativeListened = Duration.zero,
-    this.playCount = 0,
+    this.duration = Duration.zero,
     this.hasArtwork = false,
     this.metadataReadAt,
+    this.favorite = false,
+    this.playCount = 0,
+    this.cumulativeListened = Duration.zero,
+    this.lastPlayedAt,
   });
 
+  /// `true` once the user has meaningfully interacted with this track
+  /// (a `tracks` row exists). Useful for diagnostics; the rest of the
+  /// app treats default intelligence values as identical to "no row".
+  bool get hasIntelligence => intelUid != null;
+
   bool get reviewed => cumulativeListened.inSeconds >= 3;
+
+  // ─── Display-layer metadata fallback ────────────────────────────
+  //
+  // When canonical [artist] is empty (ID3/Vorbis tags missing or not
+  // yet extracted), parse the filename heuristically so the UI can
+  // sort and render a meaningful artist/title pair immediately.
+  //
+  // Strict rules — see [parseDjFilename]:
+  //   1. Embedded metadata always wins. If [artist] is non-empty,
+  //      both display values come from canonical fields verbatim.
+  //   2. Filename parsing is **only** for display + sorting. It is
+  //      never persisted into `tracks`/`indexed_files`, never written
+  //      back, never treated as authoritative. When metadata
+  //      extraction later succeeds, these getters silently switch
+  //      back to canonical values.
+  //   3. If the filename can't be parsed, fall through to the raw
+  //      basename / canonical title.
+  //
+  // Cached because `visibleTracks` sorts on these values per build.
+
+  ParsedFilename? _parsedFilenameCache;
+  String? _parsedFilenameCacheKey;
+  ParsedFilename get _parsedFilename {
+    if (_parsedFilenameCacheKey != filename) {
+      _parsedFilenameCacheKey = filename;
+      _parsedFilenameCache = parseDjFilename(filename);
+    }
+    return _parsedFilenameCache ?? ParsedFilename.empty;
+  }
+
+  /// Best-effort artist for UI display.
+  /// Canonical [artist] when present; otherwise the filename-parsed
+  /// artist; otherwise empty.
+  String get displayArtist {
+    if (artist.isNotEmpty) return artist;
+    return _parsedFilename.artist ?? '';
+  }
+
+  /// Best-effort title for UI display.
+  /// Canonical [title] when canonical [artist] is also present
+  /// (= "we have real metadata"); otherwise the filename-parsed
+  /// title; otherwise the canonical title (which may itself be the
+  /// raw basename if no metadata was ever set).
+  String get displayTitle {
+    if (artist.isNotEmpty) return title;
+    return _parsedFilename.title ?? title;
+  }
+
+  // Cached filename-key parse — same justification as
+  // [_parsedFilename]: avoid running the regex per sort comparison
+  // or per row build at 60fps.
+  String? _parsedKeyCache;
+  String? _parsedKeyCacheKey;
+  String? get _parsedKey {
+    if (_parsedKeyCacheKey != filename) {
+      _parsedKeyCacheKey = filename;
+      _parsedKeyCache = parseDjKey(filename);
+    }
+    return _parsedKeyCache;
+  }
+
+  /// Best-effort musical key for display. Priority:
+  ///   1. canonical [musicalKey] (from ID3 / Vorbis tags)
+  ///   2. trailing-bracket / trailing-token key in the filename
+  ///   3. empty string (caller renders `—`)
+  ///
+  /// Like [displayArtist] / [displayTitle], purely a read-side
+  /// fallback — never written to the DB, never overrides ID3.
+  String get displayKey {
+    if (musicalKey.isNotEmpty) return musicalKey;
+    return _parsedKey ?? '';
+  }
 }

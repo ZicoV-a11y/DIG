@@ -1,18 +1,32 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
+
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart' show ProcessingState;
+import 'package:uuid/uuid.dart';
 
+import '../models/intelligence_record.dart';
+import '../models/source.dart';
 import '../models/track.dart';
-import '../models/watched_folder.dart';
 import '../services/audio_scanner.dart';
+import '../services/intelligence_export.dart';
 import '../services/library_repository.dart';
 import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
 
-enum TrackSortColumn { favorite, reviewed, title, artist, bpm, duration, plays }
+enum TrackSortColumn {
+  favorite,
+  reviewed,
+  title,
+  artist,
+  bpm,
+  key,
+  duration,
+  plays,
+  lastPlayed,
+}
 
 enum PlaybackMode { sequential, shuffle, shuffleUnreviewed }
 
@@ -32,18 +46,46 @@ extension PlaybackModeView on PlaybackMode {
 class LibraryController extends ChangeNotifier {
   final PlaybackEngine engine;
   final LibraryRepository repo;
+  final Uuid _uuid = const Uuid();
 
   static const _recentBufferCapacity = 8;
   static const _trailVisibleCount = 5;
-  static const _metadataBatchSize = 100;
+  // Bigger batches when files are local — fewer `compute()`
+  // spawn round-trips per file, more files per isolate. The
+  // earlier 25 was sized for slow Dropbox cloud-only reads where
+  // a single hung file would block 24 others; now that the
+  // library is local, the per-file cost is small enough that
+  // batching 50 cuts the scheduling overhead roughly in half.
+  static const _metadataBatchSize = 50;
 
-  final List<WatchedFolder> _folders = [];
+  final List<Source> _sources = [];
   final List<Track> _tracks = [];
-  final List<String> _recentReviewedIds = [];
-  final List<String> _metadataQueue = [];
+  // O(1) lookups keyed by uid / path. Kept consistent with [_tracks]
+  // by [_replaceTracks] / [_removeTracksWhere]. Without these,
+  // `_trackByUid` / `_trackByPath` would do linear scans over ~12k
+  // entries on every row click, every metadata batch, every
+  // currentTrack getter — which adds up fast in the play/scan path.
+  final Map<String, Track> _tracksByUid = {};
+  final Map<String, Track> _tracksByPath = {};
+  final List<String> _recentReviewedUids = [];
+  // Viewport-driven enrichment queue. Per the reactive-first
+  // architecture, scan completion and hydrate do NOT auto-populate
+  // this queue — only intent-driven entry points do
+  // (`reportViewportPaths`, `enrichOnDemand`). Untouched files
+  // remain at filename-only display indefinitely; the
+  // filename-parsing fallback covers them. The companion Set keeps
+  // dedup O(1) so fast-scrolling viewport reports don't pile up
+  // duplicate work.
+  final List<String> _enrichmentQueue = [];
+  final Set<String> _inEnrichmentQueue = {};
   bool _metadataProcessing = false;
+  // Progress counters for the global status bar. Reset each time
+  // the queue fully drains. `_metadataTotalThisRun` grows when more
+  // paths are enqueued mid-processing.
+  int _metadataDoneThisRun = 0;
+  int _metadataTotalThisRun = 0;
 
-  String? _selectedFolderPath;
+  String? _selectedSourceId;
   String _searchQuery = '';
   bool _unreviewedOnly = false;
   bool _showArtwork = false;
@@ -51,11 +93,24 @@ class LibraryController extends ChangeNotifier {
   TrackSortColumn _sortColumn = TrackSortColumn.title;
   bool _sortAscending = true;
 
-  String? _currentTrackId;
-  String? _selectedTrackId;
+  String? _currentTrackUid;
+  // Path of the file the engine is actually playing. Held alongside
+  // `_currentTrackUid` because a track-intelligence object can have
+  // multiple physical instances behind one uid (true byte-identical
+  // clones share a uid). Show-in-Finder uses this to reveal the exact
+  // file being played, not just any sibling — see also the resolver
+  // in `_revealInFinderWithFallback`.
+  String? _currentTrackPath;
+  String? _selectedTrackUid;
   PlaybackMode _playbackMode = PlaybackMode.sequential;
   final Random _rng = Random();
   bool _isPlaying = false;
+  // True from the moment `play(uid)` calls `engine.setTrack(...)`
+  // until that future resolves (or throws). Used by the playback
+  // bar to swap the play icon for a spinner while a Dropbox-backed
+  // file is materialising — without this, the user sees nothing
+  // happen for several seconds on cloud-only files.
+  bool _isLoadingTrack = false;
   Duration _lastTickPosition = Duration.zero;
   Duration _sessionListened = Duration.zero;
   bool _sessionPlayCounted = false;
@@ -70,25 +125,28 @@ class LibraryController extends ChangeNotifier {
 
   final MediaKeysBridge _media = MediaKeysBridge();
 
-  // Utility columns: locked widths, content-fitted (label + glyph + small
-  // horizontal padding). Not resizable, not loaded from persistence.
+  // Utility columns: locked widths.
   double _colFavWidth = 32;
   double _colRevWidth = 38;
   double _colBpmWidth = 38;
+  double _colKeyWidth = 50;
   double _colTimeWidth = 50;
   double _colPlaysWidth = 52;
-  // Text columns: absolute stored widths, persisted. Each has its own
-  // right-edge resize handle. Dragging only changes that column's width;
-  // neighbours get pushed (and horizontal scroll engages if the row
-  // exceeds the viewport).
+  double _colLastPlayedWidth = 90;
+  // Text columns: persisted absolute widths.
   double _colTitleWidth = 350;
   double _colArtistWidth = 240;
 
-  // Column order. All seven ids must be present exactly once; user can
-  // reorder via long-press-drag on any header cell. Persisted as a
-  // comma-separated string in app_settings under `column_order`.
   static const List<String> _defaultColumnOrder = [
-    'fav', 'rev', 'title', 'artist', 'bpm', 'time', 'plays',
+    'fav',
+    'rev',
+    'title',
+    'artist',
+    'bpm',
+    'key',
+    'time',
+    'plays',
+    'lastPlayed',
   ];
   List<String> _columnOrder = List.of(_defaultColumnOrder);
   final ValueNotifier<Duration> _positionNotifier = ValueNotifier(
@@ -100,6 +158,45 @@ class LibraryController extends ChangeNotifier {
   List<Track>? _visibleCache;
   int _visibleCacheVersion = -1;
   int? _lockedCurrentIndex;
+
+  // Cached per-source counts. Sidebar build calls
+  // `sourceTrackCount(sourceId)` once per tile; without this cache
+  // each call walked all ~12k tracks (and for sub-views, also
+  // string-prefixed every path). Now we recompute the whole map
+  // once per `_libraryVersion` change and answer subsequent calls
+  // in O(1).
+  Map<String, int>? _sourceCountCache;
+  int _sourceCountCacheVersion = -1;
+
+  // Cached library-wide tallies for the always-on status bar:
+  // enriched (any metadata extracted), available (file present on
+  // last scan), missing (rows surviving the last scan as
+  // `is_available=0`). Recomputed on `_libraryVersion` change.
+  int? _enrichedCountCache;
+  int? _missingCountCache;
+  int _libraryStatsVersion = -1;
+
+  // Set while a metadata wave is in flight: a representative
+  // filename from the current batch. Surfaced in the status bar so
+  // the user can see exactly what file is being processed instead
+  // of just an opaque counter.
+  String? _currentEnrichmentLabel;
+
+  // Files whose tag-parser failed (audio_metadata_reader threw, or
+  // returned no parseable header). We remember them at session
+  // scope so a fast viewport scroll over the same region doesn't
+  // re-enqueue them on every scroll-end, which would otherwise
+  // pile the queue forever and exaggerate "Enriching" totals.
+  final Set<String> _failedEnrichmentPaths = {};
+
+  // Throttle notifyListeners() during phase-2 metadata enrichment.
+  // Without this, each 100-file batch triggered a full UI rebuild +
+  // visible-cache invalidation + 12k-element re-sort. With ~25
+  // batches per large folder, that's ~25 sorts of the entire
+  // library back-to-back. We coalesce to at most one notification
+  // every 500ms so the UI stays responsive while the queue drains.
+  Timer? _throttledNotifyTimer;
+  DateTime _lastThrottledNotifyAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   StreamSubscription<Duration>? _positionSub;
   StreamSubscription<bool>? _playingSub;
@@ -142,18 +239,17 @@ class LibraryController extends ChangeNotifier {
       _media.clearNowPlaying();
       return;
     }
+    final shownTitle = track.displayTitle;
+    final shownArtist = track.displayArtist;
     _media.updateNowPlaying(
-      title: track.title.isEmpty ? null : track.title,
-      artist: track.artist.isEmpty ? null : track.artist,
+      title: shownTitle.isEmpty ? null : shownTitle,
+      artist: shownArtist.isEmpty ? null : shownArtist,
       durationSeconds: track.duration.inMilliseconds / 1000.0,
       positionSeconds: _positionNotifier.value.inMilliseconds / 1000.0,
       isPlaying: _isPlaying,
     );
   }
 
-  // Throttle Now-Playing position updates so the system center doesn't get
-  // hammered every 16 ms — once a second is plenty for the lock-screen
-  // / Touch Bar / Control Center scrubber.
   DateTime _lastNowPlayingPushAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   Future<void> hydrate() async {
@@ -177,138 +273,378 @@ class LibraryController extends ChangeNotifier {
         sidebarMaxWidth,
       ).toDouble();
     }
-    // Utility column widths are locked — defaults always used, never
-    // restored from SQLite. TITLE / ARTIST are user-resizable; load
-    // their stored absolute widths.
     _colTitleWidth =
         double.tryParse(settings['col_title_width'] ?? '') ?? _colTitleWidth;
     _colArtistWidth =
         double.tryParse(settings['col_artist_width'] ?? '') ?? _colArtistWidth;
     final orderStr = settings['column_order'];
     if (orderStr != null && orderStr.isNotEmpty) {
-      final parsed = orderStr.split(',').map((s) => s.trim()).toList();
-      // Validate: must contain all seven default ids exactly once.
-      if (parsed.length == _defaultColumnOrder.length &&
-          parsed.toSet().length == _defaultColumnOrder.length &&
-          parsed.toSet().containsAll(_defaultColumnOrder)) {
+      final parsed = orderStr
+          .split(',')
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
+      final defaults = _defaultColumnOrder.toSet();
+      final stored = parsed.toSet();
+      if (stored.containsAll(defaults) && parsed.length == stored.length) {
+        // Stored order is exhaustive (covers every default + has no
+        // duplicates) — adopt as-is. Allows users to keep custom
+        // orderings across releases that add columns.
         _columnOrder = parsed;
+      } else if (defaults.containsAll(stored)) {
+        // Stored order is a subset of current defaults (e.g. it was
+        // saved before we added `key` / `lastPlayed`). Keep the
+        // user's relative order for known columns and append any
+        // newly-introduced columns at the end so they're at least
+        // visible.
+        final tail = _defaultColumnOrder
+            .where((c) => !parsed.contains(c))
+            .toList();
+        _columnOrder = [...parsed, ...tail];
       }
     }
+    final srcOrderStr = settings['source_order'];
+    if (srcOrderStr != null && srcOrderStr.isNotEmpty) {
+      _sourceOrder = srcOrderStr
+          .split(',')
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
+    }
 
-    final folders = await repo.loadFolders();
+    final sources = await repo.loadSources();
     final tracks = await repo.loadTracks();
-    _folders
+    _sources
       ..clear()
-      ..addAll(folders);
-    _tracks
-      ..clear()
-      ..addAll(tracks);
+      ..addAll(sources);
+    _replaceTracks(tracks);
     _markLibraryDirty();
     notifyListeners();
 
-    final unread = tracks
-        .where((t) => t.metadataReadAt == null)
-        .map((t) => t.id)
-        .toList();
+    final unenriched =
+        tracks.where((t) => t.metadataReadAt == null).length;
     debugPrint(
-      '[meta] hydrate loaded ${tracks.length} tracks (${unread.length} need metadata)',
+      '[meta] hydrate loaded ${tracks.length} tracks '
+      '($unenriched without metadata — viewport will enrich on demand)',
     );
-    _enqueueMetadata(unread);
+    // NO auto-enqueue. Untouched rows stay at filename-only until
+    // the user scrolls/selects/plays them.
   }
 
-  void _enqueueMetadata(Iterable<String> paths) {
-    final list = paths.toList(growable: false);
-    if (list.isEmpty) {
-      debugPrint('[meta] enqueue called with 0 paths — skipping');
-      return;
+  /// The track table calls this with the paths currently on screen
+  /// (plus a small lookahead) once scrolling settles. We push any
+  /// path that lacks metadata and isn't already queued onto the
+  /// enrichment queue. No-op if everything visible is already
+  /// enriched or already in flight.
+  void reportViewportPaths(Iterable<String> paths) {
+    _enqueueIfNeeded(paths);
+  }
+
+  /// Single-path enrichment hook used by interaction code paths
+  /// (`play`, `selectTrack`). Independent of the viewport — ensures
+  /// the row the user is currently engaging with gets metadata.
+  void enrichOnDemand(String path) {
+    _enqueueIfNeeded([path]);
+  }
+
+  /// User-triggered: enrich every un-enriched track owned by
+  /// [sourceId] (or contained by a sub-view's `pathPrefix`).
+  /// Bypasses the viewport gate intentionally — this is the
+  /// explicit opt-in to a long-running pass.
+  void enrichSource(String sourceId) {
+    final s = _sourceById(sourceId);
+    if (s == null) return;
+    final paths = <String>[];
+    if (s.isSubView) {
+      for (final t in _tracks) {
+        if (t.sourceId == s.parentSourceId &&
+            t.path.startsWith(s.pathPrefix!) &&
+            t.metadataReadAt == null) {
+          paths.add(t.path);
+        }
+      }
+    } else {
+      for (final t in _tracks) {
+        if (t.sourceId == sourceId && t.metadataReadAt == null) {
+          paths.add(t.path);
+        }
+      }
     }
+    debugPrint('[meta] enrichSource(${s.displayName}) → ${paths.length} paths');
+    _enqueueIfNeeded(paths);
+  }
+
+  /// User-triggered: enrich every un-enriched track in the
+  /// library, regardless of source. The "show me flying numbers"
+  /// command.
+  void enrichAll() {
+    final paths = [
+      for (final t in _tracks)
+        if (t.metadataReadAt == null) t.path,
+    ];
+    debugPrint('[meta] enrichAll → ${paths.length} paths');
+    _enqueueIfNeeded(paths);
+  }
+
+  void _enqueueIfNeeded(Iterable<String> paths) {
+    final fresh = <String>[];
+    for (final p in paths) {
+      if (_inEnrichmentQueue.contains(p)) continue;
+      if (_failedEnrichmentPaths.contains(p)) continue;
+      final t = _tracksByPath[p];
+      if (t == null) continue;
+      if (t.metadataReadAt != null) continue;
+      _inEnrichmentQueue.add(p);
+      fresh.add(p);
+    }
+    if (fresh.isEmpty) return;
+    _enrichmentQueue.addAll(fresh);
+    _metadataTotalThisRun += fresh.length;
     debugPrint(
-      '[meta] enqueue +${list.length} (queue=${_metadataQueue.length + list.length}, processing=$_metadataProcessing)',
+      '[meta] queued +${fresh.length} '
+      '(queue=${_enrichmentQueue.length}, processing=$_metadataProcessing)',
     );
-    _metadataQueue.addAll(list);
     if (!_metadataProcessing) {
       _processMetadataQueue();
+    } else {
+      _notifyThrottled();
     }
   }
 
   Future<void> _processMetadataQueue() async {
     if (_metadataProcessing) return;
     _metadataProcessing = true;
-    debugPrint('[meta] processor starting (queue=${_metadataQueue.length})');
+    notifyListeners();
+    debugPrint('[meta] processor starting (queue=${_enrichmentQueue.length})');
     try {
-      while (_metadataQueue.isNotEmpty) {
-        final batch = _metadataQueue
-            .take(_metadataBatchSize)
-            .toList(growable: false);
-        _metadataQueue.removeRange(0, batch.length);
+      // Process small files first. On Dropbox cloud-only libraries
+      // a 50MB AIFF can take 7s to materialise but a 6MB MP3
+      // returns in well under 1s — sorting size-asc means the user
+      // sees thousands of fast files populate immediately while
+      // the slow stragglers come in the background.
+      _enrichmentQueue.sort((a, b) {
+        final sa = _tracksByPath[a]?.filesize ?? 0;
+        final sb = _tracksByPath[b]?.filesize ?? 0;
+        return sa.compareTo(sb);
+      });
 
-        final stopwatch = Stopwatch()..start();
+      // Run several batches in parallel. Each `compute()` call
+      // spawns its own isolate — the OS pipelines the per-file
+      // syscalls across them. Concurrency was 4 (tuned for
+      // throttled Dropbox FileProvider downloads); on local
+      // files it can go higher because the bottleneck shifts
+      // from network → disk + isolate scheduling. 8 fully
+      // saturates a modern Mac's perf cores without exhausting
+      // memory (8 isolates × ~50 files of buffered tag-header
+      // bytes is still tiny). Throughput typically scales near
+      // linear up to core count.
+      const concurrency = 8;
+
+      while (_enrichmentQueue.isNotEmpty) {
+        final waveBatches = <List<String>>[];
+        for (var i = 0;
+            i < concurrency && _enrichmentQueue.isNotEmpty;
+            i++) {
+          final batch = _enrichmentQueue
+              .take(_metadataBatchSize)
+              .toList(growable: false);
+          _enrichmentQueue.removeRange(0, batch.length);
+          // These paths are leaving the queue. Drop them from the
+          // dedup set so a future viewport report can re-enqueue
+          // them if metadata extraction failed and didn't stamp
+          // `metadata_read_at`.
+          for (final p in batch) {
+            _inEnrichmentQueue.remove(p);
+          }
+          waveBatches.add(batch);
+        }
+        final waveSw = Stopwatch()..start();
+        final waveTotal =
+            waveBatches.fold<int>(0, (s, b) => s + b.length);
         debugPrint(
-          '[meta] batch start (${batch.length} files, queue remaining=${_metadataQueue.length})',
+          '[meta] wave start (${waveBatches.length} batches × '
+          '$_metadataBatchSize, total=$waveTotal, '
+          'queue remaining=${_enrichmentQueue.length})',
         );
 
-        List<TrackMetadata> results;
-        try {
-          results = await MetadataExtractor.extractBatch(batch);
-        } catch (e, st) {
-          debugPrint('[meta] batch FAILED in isolate: $e');
-          debugPrint('$st');
-          continue;
-        }
-
-        var withTitle = 0;
-        var withArtist = 0;
-        var withBpm = 0;
-        var withDuration = 0;
-        var failures = 0;
-        for (final m in results) {
-          if (!m.readSucceeded) failures++;
-          if (m.title != null) withTitle++;
-          if (m.artist != null) withArtist++;
-          if (m.bpm != null) withBpm++;
-          if (m.duration != null && m.duration! > Duration.zero) withDuration++;
-          final t = _trackById(m.path);
-          if (t == null) continue;
-          _applyMetadata(t, m);
-        }
-        debugPrint(
-          '[meta] batch done in ${stopwatch.elapsedMilliseconds}ms: '
-          'extracted=${results.length} fail=$failures '
-          'titles=$withTitle artists=$withArtist bpm=$withBpm duration=$withDuration',
+        // Run all batches in parallel — but apply each batch's
+        // results AS IT COMPLETES instead of waiting for the whole
+        // wave. This is what makes the counter "fly": with 8
+        // batches in flight and `Future.wait`, the user sees ZERO
+        // progress for the entire wave duration and then a single
+        // 400-track jump. With per-batch handling, each batch's
+        // ~50 rows surface immediately on its completion, and the
+        // `currentEnrichmentLabel` rotates through actual files
+        // being processed.
+        final sep = Platform.pathSeparator;
+        await Future.wait(
+          waveBatches.map((batch) async {
+            final List<TrackMetadata> results;
+            try {
+              results = await MetadataExtractor.extractBatch(batch);
+            } catch (e) {
+              debugPrint('[meta] batch FAILED: $e');
+              return;
+            }
+            // Surface a representative filename from this batch
+            // for the status bar — rotates as batches finish.
+            if (results.isNotEmpty) {
+              final p = results.first.path;
+              final i = p.lastIndexOf(sep);
+              _currentEnrichmentLabel = i < 0 ? p : p.substring(i + 1);
+            }
+            for (final m in results) {
+              final t = _trackByPath(m.path);
+              if (t == null) continue;
+              _applyMetadata(t, m);
+            }
+            try {
+              await repo.updateMetadataBatch(results);
+            } catch (e) {
+              debugPrint('[meta] DB update FAILED: $e');
+            }
+            _metadataDoneThisRun += results.length;
+            _markLibraryDirty();
+            // Notify per batch so the counter and label update
+            // every ~50 rows instead of every ~400.
+            notifyListeners();
+          }),
         );
-
-        try {
-          await repo.updateMetadataBatch(results);
-          debugPrint('[meta] DB updated for ${results.length} rows');
-        } catch (e) {
-          debugPrint('[meta] DB update FAILED: $e');
-        }
-
-        _markLibraryDirty();
-        notifyListeners();
+        debugPrint(
+          '[meta] wave done in ${waveSw.elapsedMilliseconds}ms '
+          '($waveTotal in flight)',
+        );
       }
     } finally {
       _metadataProcessing = false;
+      _metadataDoneThisRun = 0;
+      _metadataTotalThisRun = 0;
+      _currentEnrichmentLabel = null;
+      _inEnrichmentQueue.clear();
+      notifyListeners();
       debugPrint('[meta] processor idle');
     }
   }
 
   void _applyMetadata(Track t, TrackMetadata m) {
-    if (m.title != null) t.title = m.title!;
-    if (m.artist != null) t.artist = m.artist!;
-    if (m.album != null) t.album = m.album!;
-    if (m.genre != null) t.genre = m.genre!;
-    if (m.musicalKey != null) t.musicalKey = m.musicalKey!;
-    if (m.bpm != null) t.bpm = m.bpm;
-    if (m.duration != null && m.duration! > Duration.zero) {
-      t.duration = m.duration!;
+    if (m.readSucceeded) {
+      if (m.title != null) t.title = m.title!;
+      if (m.artist != null) t.artist = m.artist!;
+      if (m.album != null) t.album = m.album!;
+      if (m.genre != null) t.genre = m.genre!;
+      if (m.musicalKey != null) t.musicalKey = m.musicalKey!;
+      if (m.bpm != null) t.bpm = m.bpm;
+      if (m.duration != null && m.duration! > Duration.zero) {
+        t.duration = m.duration!;
+      }
+      t.hasArtwork = m.hasArtwork;
+    } else {
+      // Tag parser failed (audio_metadata_reader can't decode this
+      // particular format / file revision). Track the path so we
+      // don't keep re-enqueueing it from every viewport snapshot.
+      _failedEnrichmentPaths.add(t.path);
     }
-    t.hasArtwork = m.hasArtwork;
+    // Stamp regardless of success: "we have processed this row".
+    // The filename-parsing display fallback still covers it; the
+    // user just doesn't see flying-zero stuck-counter behaviour
+    // when their library has lots of unparseable formats. Failed
+    // rows can be re-attempted by removing+re-adding the source
+    // (or via a future "Retry failed" action).
     t.metadataReadAt = DateTime.now();
   }
 
-  List<WatchedFolder> get folders => List.unmodifiable(_folders);
-  String? get selectedFolderPath => _selectedFolderPath;
+  // ---------------------------------------------------------------------------
+  // Public read-only state
+  // ---------------------------------------------------------------------------
+
+  /// Persisted display order of top-level source IDs (sub-views are
+  /// always rendered immediately under their parent and don't have
+  /// their own slot in this list). Loaded from `app_settings` at
+  /// hydrate, mutated by [moveSource], persisted as a comma-joined
+  /// string under the `source_order` key.
+  List<String> _sourceOrder = [];
+
+  /// Compare-key helper: position in `_sourceOrder` if present;
+  /// otherwise sources after all explicitly-ordered ones, ranked by
+  /// their natural DB `createdAt`. Used by both `sources` getter
+  /// and reorder logic so the two stay consistent.
+  int _orderKey(Source s) {
+    final idx = _sourceOrder.indexOf(s.id);
+    if (idx >= 0) return idx;
+    return _sourceOrder.length + s.createdAt;
+  }
+
+  List<Source> get sources {
+    if (_sources.isEmpty) return const [];
+    // Order top-level by `_sourceOrder`. Then for each top-level,
+    // append its sub-views — also ordered by `_sourceOrder` so the
+    // user can rearrange `B`, `C`, `D` independently.
+    final topLevel = _sources.where((s) => !s.isSubView).toList()
+      ..sort((a, b) => _orderKey(a).compareTo(_orderKey(b)));
+    final ordered = <Source>[];
+    for (final s in topLevel) {
+      ordered.add(s);
+      final subs = _sources
+          .where((c) => c.parentSourceId == s.id)
+          .toList()
+        ..sort((a, b) => _orderKey(a).compareTo(_orderKey(b)));
+      ordered.addAll(subs);
+    }
+    // Defensive: any sub-view whose parent vanished (shouldn't
+    // happen with FK cascade, but cheap to handle).
+    final byId = {for (final s in _sources) s.id};
+    for (final s in _sources) {
+      if (s.isSubView && !byId.contains(s.parentSourceId)) {
+        ordered.add(s);
+      }
+    }
+    return List.unmodifiable(ordered);
+  }
+
+  Source? _sourceLookup(String id) {
+    for (final s in _sources) {
+      if (s.id == id) return s;
+    }
+    return null;
+  }
+
+  /// Insert [draggedId] immediately before [targetId] in the saved
+  /// source order. Same-tier only — refuses if dragged and target
+  /// have different parents (top-level + sub-view, or sub-views of
+  /// different parents). The `_sourceOrder` list is one flat
+  /// sequence shared by both tiers; the `sources` getter splits it
+  /// per-tier when rendering, so this handles both cases.
+  Future<void> moveSourceBefore(
+    String draggedId,
+    String targetId,
+  ) async {
+    if (draggedId == targetId) return;
+    final dragged = _sourceLookup(draggedId);
+    final target = _sourceLookup(targetId);
+    if (dragged == null || target == null) return;
+    if (dragged.parentSourceId != target.parentSourceId) return;
+
+    // Materialise a flat order list with every source ID present
+    // (anything missing from `_sourceOrder` gets appended in
+    // createdAt order so we don't lose track of new sources).
+    final ordered = [..._sourceOrder];
+    final present = ordered.toSet();
+    final byCreated = _sources.toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    for (final s in byCreated) {
+      if (!present.contains(s.id)) ordered.add(s.id);
+    }
+
+    ordered.remove(draggedId);
+    final targetIdx = ordered.indexOf(targetId);
+    if (targetIdx < 0) return;
+    ordered.insert(targetIdx, draggedId);
+
+    _sourceOrder = ordered;
+    notifyListeners();
+    await repo.setSetting('source_order', _sourceOrder.join(','));
+  }
+  String? get selectedSourceId => _selectedSourceId;
   String get searchQuery => _searchQuery;
   bool get unreviewedOnly => _unreviewedOnly;
   bool get showArtwork => _showArtwork;
@@ -316,11 +652,43 @@ class LibraryController extends ChangeNotifier {
   TrackSortColumn get sortColumn => _sortColumn;
   bool get sortAscending => _sortAscending;
 
-  String? get currentTrackId => _currentTrackId;
-  String? get selectedTrackId => _selectedTrackId;
+  String? get currentTrackUid => _currentTrackUid;
+  String? get currentTrackPath => _currentTrackPath;
+  String? get selectedTrackUid => _selectedTrackUid;
   PlaybackMode get playbackMode => _playbackMode;
   bool get isPlaying => _isPlaying;
+  bool get isLoadingTrack => _isLoadingTrack;
+  bool get isMetadataProcessing => _metadataProcessing;
+  int get metadataProgressDone => _metadataDoneThisRun;
+  int get metadataProgressTotal => _metadataTotalThisRun;
+  String? get currentEnrichmentLabel => _currentEnrichmentLabel;
   Duration get currentPosition => _positionNotifier.value;
+
+  /// Library-wide enriched tally (`metadataReadAt != null`).
+  /// Cached at `_libraryVersion` granularity.
+  int get enrichedCount {
+    _ensureLibraryStats();
+    return _enrichedCountCache ?? 0;
+  }
+
+  /// Library-wide missing tally (`isAvailable == false`).
+  int get missingCount {
+    _ensureLibraryStats();
+    return _missingCountCache ?? 0;
+  }
+
+  void _ensureLibraryStats() {
+    if (_libraryStatsVersion == _libraryVersion) return;
+    var enriched = 0;
+    var missing = 0;
+    for (final t in _tracks) {
+      if (t.metadataReadAt != null) enriched++;
+      if (!t.isAvailable) missing++;
+    }
+    _enrichedCountCache = enriched;
+    _missingCountCache = missing;
+    _libraryStatsVersion = _libraryVersion;
+  }
   ValueListenable<Duration> get positionListenable => _positionNotifier;
   ValueListenable<int> get revealTick => _revealTick;
 
@@ -331,19 +699,19 @@ class LibraryController extends ChangeNotifier {
   double get colFavWidth => _colFavWidth;
   double get colRevWidth => _colRevWidth;
   double get colBpmWidth => _colBpmWidth;
+  double get colKeyWidth => _colKeyWidth;
   double get colTimeWidth => _colTimeWidth;
   double get colPlaysWidth => _colPlaysWidth;
+  double get colLastPlayedWidth => _colLastPlayedWidth;
   double get colTitleWidth => _colTitleWidth;
   double get colArtistWidth => _colArtistWidth;
 
-  /// Read-only view of the current column order. Indexes 0..6 in the
-  /// canonical seven-column set.
   List<String> get columnOrder => List.unmodifiable(_columnOrder);
 
-  /// Move [column] so it ends up at [targetIndex] in the order list.
-  /// `targetIndex` is the slot index *before any removal* — values up to
-  /// `columnOrder.length` mean "drop after the last column". Notifies
-  /// once and persists the new order to SQLite (single write).
+  // ---------------------------------------------------------------------------
+  // Settings + UI prefs
+  // ---------------------------------------------------------------------------
+
   Future<void> moveColumn(String column, int targetIndex) async {
     final from = _columnOrder.indexOf(column);
     if (from < 0) return;
@@ -367,9 +735,6 @@ class LibraryController extends ChangeNotifier {
 
   double get volume => _volume;
 
-  /// Update playback volume. During an active slider drag the caller passes
-  /// `commit: false` per frame — engine + listenable update, no SQLite
-  /// write. On drag end, `commit: true` flushes the value once.
   Future<void> setVolume(double v, {bool commit = false}) async {
     final clamped = v.clamp(0.0, 1.0).toDouble();
     if (clamped == _volume) {
@@ -391,11 +756,6 @@ class LibraryController extends ChangeNotifier {
     await repo.setSetting('sidebar_visible', _sidebarVisible ? '1' : '0');
   }
 
-  /// Update the sidebar width during/after a drag. The width is clamped to
-  /// `[sidebarMinWidth, sidebarMaxWidth]` — dragging past either bound
-  /// stops at the bound (no auto-collapse). Hide is only via the toggle
-  /// button or `⌘\`. `commit: false` is used per drag-update frame (no
-  /// SQLite write); `commit: true` flushes the final width on drag end.
   Future<void> setSidebarWidth(double w, {bool commit = false}) async {
     final clamped = w.clamp(sidebarMinWidth, sidebarMaxWidth).toDouble();
     if (clamped == _sidebarWidth) {
@@ -417,10 +777,6 @@ class LibraryController extends ChangeNotifier {
     await repo.setSetting('play_threshold_seconds', s.toString());
   }
 
-  /// Update [column]'s stored width. During an active drag the caller
-  /// passes `commit: false` per frame so we only update the in-memory
-  /// value and notify; SQLite writes are deferred to a single
-  /// `commit: true` call on drag end. This keeps drag at 60 fps.
   Future<void> setColumnWidth(
     String column,
     double width, {
@@ -440,6 +796,10 @@ class LibraryController extends ChangeNotifier {
         clamped = width.clamp(36.0, 120.0);
         _colBpmWidth = clamped;
         break;
+      case 'key':
+        clamped = width.clamp(36.0, 120.0);
+        _colKeyWidth = clamped;
+        break;
       case 'time':
         clamped = width.clamp(40.0, 120.0);
         _colTimeWidth = clamped;
@@ -447,6 +807,10 @@ class LibraryController extends ChangeNotifier {
       case 'plays':
         clamped = width.clamp(36.0, 120.0);
         _colPlaysWidth = clamped;
+        break;
+      case 'lastPlayed':
+        clamped = width.clamp(70.0, 160.0);
+        _colLastPlayedWidth = clamped;
         break;
       case 'title':
         clamped = width.clamp(120.0, 1500.0);
@@ -465,51 +829,101 @@ class LibraryController extends ChangeNotifier {
     }
   }
 
-  int folderTrackCount(String folderPath) {
-    var count = 0;
-    for (final t in _tracks) {
-      if (t.folderPath == folderPath) count++;
+  // ---------------------------------------------------------------------------
+  // Track lookups
+  // ---------------------------------------------------------------------------
+
+  int sourceTrackCount(String sourceId) {
+    if (_sourceCountCache == null ||
+        _sourceCountCacheVersion != _libraryVersion) {
+      _sourceCountCache = _computeAllSourceCounts();
+      _sourceCountCacheVersion = _libraryVersion;
     }
-    return count;
+    return _sourceCountCache![sourceId] ?? 0;
+  }
+
+  /// Walk the in-memory tracks once and bucket per source. Sub-views
+  /// (filtered lenses) get their own count from a path-prefix match
+  /// against the parent's tracks. Called once per library-version
+  /// change; subsequent reads are O(1).
+  Map<String, int> _computeAllSourceCounts() {
+    final counts = <String, int>{};
+    final subViews = [for (final s in _sources) if (s.isSubView) s];
+    for (final t in _tracks) {
+      counts[t.sourceId] = (counts[t.sourceId] ?? 0) + 1;
+      for (final sv in subViews) {
+        if (sv.parentSourceId == t.sourceId &&
+            t.path.startsWith(sv.pathPrefix!)) {
+          counts[sv.id] = (counts[sv.id] ?? 0) + 1;
+        }
+      }
+    }
+    return counts;
   }
 
   Track? get currentTrack {
-    if (_currentTrackId == null) return null;
-    for (final t in _tracks) {
-      if (t.id == _currentTrackId) return t;
-    }
-    return null;
+    final uid = _currentTrackUid;
+    if (uid == null) return null;
+    return _tracksByUid[uid];
   }
 
-  Track? _trackById(String id) {
-    for (final t in _tracks) {
-      if (t.id == id) return t;
+  Track? _trackByUid(String uid) => _tracksByUid[uid];
+
+  Track? _trackByPath(String path) => _tracksByPath[path];
+
+  /// Replace the in-memory track list and rebuild the lookup maps.
+  /// Call sites: hydrate, scan reload, import.
+  void _replaceTracks(List<Track> tracks) {
+    _tracks
+      ..clear()
+      ..addAll(tracks);
+    _tracksByUid.clear();
+    _tracksByPath.clear();
+    for (final t in tracks) {
+      _tracksByUid[t.uid] = t;
+      _tracksByPath[t.path] = t;
     }
-    return null;
+  }
+
+  /// Remove tracks where [test] returns true, keeping the maps in
+  /// sync. Used by `removeSource` for top-level sources.
+  void _removeTracksWhere(bool Function(Track) test) {
+    _tracks.removeWhere((t) {
+      if (test(t)) {
+        _tracksByUid.remove(t.uid);
+        _tracksByPath.remove(t.path);
+        return true;
+      }
+      return false;
+    });
   }
 
   List<Track> get recentReviewedTracks => [
-    for (final id in _recentReviewedIds)
-      if (_trackById(id) != null) _trackById(id)!,
+    for (final uid in _recentReviewedUids)
+      if (_trackByUid(uid) != null) _trackByUid(uid)!,
   ];
 
-  void _pushRecentReviewed(String trackId) {
-    _recentReviewedIds.remove(trackId);
-    _recentReviewedIds.insert(0, trackId);
-    if (_recentReviewedIds.length > _recentBufferCapacity) {
-      _recentReviewedIds.removeLast();
+  void _pushRecentReviewed(String uid) {
+    _recentReviewedUids.remove(uid);
+    _recentReviewedUids.insert(0, uid);
+    if (_recentReviewedUids.length > _recentBufferCapacity) {
+      _recentReviewedUids.removeLast();
     }
   }
 
-  int? trailIndexOf(String trackId) {
-    final upper = _recentReviewedIds.length < _trailVisibleCount
-        ? _recentReviewedIds.length
+  int? trailIndexOf(String uid) {
+    final upper = _recentReviewedUids.length < _trailVisibleCount
+        ? _recentReviewedUids.length
         : _trailVisibleCount;
     for (var i = 0; i < upper; i++) {
-      if (_recentReviewedIds[i] == trackId) return i;
+      if (_recentReviewedUids[i] == uid) return i;
     }
     return null;
   }
+
+  // ---------------------------------------------------------------------------
+  // Visible-tracks pipeline
+  // ---------------------------------------------------------------------------
 
   List<Track> get visibleTracks {
     if (_visibleCache != null && _visibleCacheVersion == _libraryVersion) {
@@ -518,26 +932,36 @@ class LibraryController extends ChangeNotifier {
 
     Iterable<Track> list = _tracks;
 
-    if (_selectedFolderPath != null) {
-      list = list.where((t) => t.folderPath == _selectedFolderPath);
+    if (_selectedSourceId != null) {
+      final selected = _sourceById(_selectedSourceId!);
+      if (selected != null && selected.isSubView) {
+        list = list.where((t) =>
+            t.sourceId == selected.parentSourceId &&
+            t.path.startsWith(selected.pathPrefix!));
+      } else {
+        list = list.where((t) => t.sourceId == _selectedSourceId);
+      }
     }
     if (_unreviewedOnly) {
-      final exemptIds = <String>{};
-      if (_currentTrackId != null) exemptIds.add(_currentTrackId!);
-      final upper = _recentReviewedIds.length < _trailVisibleCount
-          ? _recentReviewedIds.length
+      final exemptUids = <String>{};
+      if (_currentTrackUid != null) exemptUids.add(_currentTrackUid!);
+      final upper = _recentReviewedUids.length < _trailVisibleCount
+          ? _recentReviewedUids.length
           : _trailVisibleCount;
       for (var i = 0; i < upper; i++) {
-        exemptIds.add(_recentReviewedIds[i]);
+        exemptUids.add(_recentReviewedUids[i]);
       }
-      list = list.where((t) => !t.reviewed || exemptIds.contains(t.id));
+      list = list.where((t) => !t.reviewed || exemptUids.contains(t.uid));
     }
     if (_searchQuery.isNotEmpty) {
       final q = _searchQuery.toLowerCase();
+      // Search hits the display fields too so users can find tracks
+      // by filename-derived artist while ID3 extraction is still in
+      // flight.
       list = list.where(
         (t) =>
-            t.title.toLowerCase().contains(q) ||
-            t.artist.toLowerCase().contains(q),
+            t.displayTitle.toLowerCase().contains(q) ||
+            t.displayArtist.toLowerCase().contains(q),
       );
     }
 
@@ -550,11 +974,16 @@ class LibraryController extends ChangeNotifier {
         case TrackSortColumn.reviewed:
           return dir * ((a.reviewed ? 1 : 0) - (b.reviewed ? 1 : 0));
         case TrackSortColumn.title:
+          // Sort uses the display value so newly-scanned files
+          // (no ID3 yet) order naturally by their filename-derived
+          // title rather than collapsing to a single bucket.
           return dir *
-              a.title.toLowerCase().compareTo(b.title.toLowerCase());
+              a.displayTitle
+                  .toLowerCase()
+                  .compareTo(b.displayTitle.toLowerCase());
         case TrackSortColumn.artist:
-          final aa = a.artist.toLowerCase();
-          final ba = b.artist.toLowerCase();
+          final aa = a.displayArtist.toLowerCase();
+          final ba = b.displayArtist.toLowerCase();
           if (aa.isEmpty && ba.isEmpty) return 0;
           if (aa.isEmpty) return 1;
           if (ba.isEmpty) return -1;
@@ -566,15 +995,35 @@ class LibraryController extends ChangeNotifier {
           if (ab == null) return 1;
           if (bb == null) return -1;
           return dir * ab.compareTo(bb);
+        case TrackSortColumn.key:
+          // Empty keys always sort to the bottom regardless of
+          // direction so unknown rows don't crowd the top.
+          final ak = a.displayKey.toLowerCase();
+          final bk = b.displayKey.toLowerCase();
+          if (ak.isEmpty && bk.isEmpty) return 0;
+          if (ak.isEmpty) return 1;
+          if (bk.isEmpty) return -1;
+          return dir * ak.compareTo(bk);
         case TrackSortColumn.duration:
           return dir * a.duration.compareTo(b.duration);
         case TrackSortColumn.plays:
           return dir * a.playCount.compareTo(b.playCount);
+        case TrackSortColumn.lastPlayed:
+          // Never-played rows sort to the bottom in both directions
+          // (consistent with key/artist's empty-bucket handling) so
+          // the user always sees their actually-played history near
+          // the top when sorting by recency.
+          final la = a.lastPlayedAt;
+          final lb = b.lastPlayedAt;
+          if (la == null && lb == null) return 0;
+          if (la == null) return 1;
+          if (lb == null) return -1;
+          return dir * la.compareTo(lb);
       }
     });
 
-    if (_currentTrackId != null) {
-      final naturalIdx = result.indexWhere((t) => t.id == _currentTrackId);
+    if (_currentTrackUid != null) {
+      final naturalIdx = result.indexWhere((t) => t.uid == _currentTrackUid);
       if (naturalIdx >= 0) {
         if (_lockedCurrentIndex == null) {
           _lockedCurrentIndex = naturalIdx;
@@ -594,62 +1043,288 @@ class LibraryController extends ChangeNotifier {
   void _markLibraryDirty() {
     _libraryVersion++;
     _visibleCache = null;
+    // Source-count cache uses the same version key; invalidation
+    // happens lazily on the next `sourceTrackCount` call.
+  }
+
+  /// Coalesced notifier used by long-running enrichment loops
+  /// (metadata extraction, future reconciliation). Guarantees at
+  /// most one rebuild per ~500ms while still firing eventually
+  /// after the last update.
+  void _notifyThrottled() {
+    final now = DateTime.now();
+    final since = now.difference(_lastThrottledNotifyAt).inMilliseconds;
+    if (since >= 500) {
+      _lastThrottledNotifyAt = now;
+      _throttledNotifyTimer?.cancel();
+      _throttledNotifyTimer = null;
+      notifyListeners();
+      return;
+    }
+    if (_throttledNotifyTimer?.isActive == true) return;
+    _throttledNotifyTimer = Timer(
+      Duration(milliseconds: 500 - since),
+      () {
+        _lastThrottledNotifyAt = DateTime.now();
+        _throttledNotifyTimer = null;
+        notifyListeners();
+      },
+    );
   }
 
   void _invalidateLock() {
     _lockedCurrentIndex = null;
   }
 
-  Future<void> addWatchedFolder(String path) async {
-    if (_folders.any((f) => f.path == path)) return;
+  // ---------------------------------------------------------------------------
+  // Sources — add / rescan / remove
+  // ---------------------------------------------------------------------------
 
+  /// Find the top-level scanning source whose `folder_path` contains
+  /// [pickedPath] as a strict descendant. Returns `null` if [pickedPath]
+  /// equals an existing source path or isn't nested under any.
+  ///
+  /// Sub-views are skipped — only scanning sources can become parents
+  /// (nested-of-nested collapses to "sub-view of the top-level
+  /// scanning ancestor").
+  Source? findContainingSource(String pickedPath) {
+    final sep = Platform.pathSeparator;
+    for (final s in _sources) {
+      if (s.isSubView) continue;
+      if (pickedPath == s.folderPath) return null; // exact match
+      final prefix = s.folderPath.endsWith(sep)
+          ? s.folderPath
+          : s.folderPath + sep;
+      if (pickedPath.startsWith(prefix)) return s;
+    }
+    return null;
+  }
+
+  Source? _sourceById(String id) {
+    for (final s in _sources) {
+      if (s.id == id) return s;
+    }
+    return null;
+  }
+
+  /// Add a new watched source.
+  ///
+  /// If [folderPath] is nested inside an existing top-level source,
+  /// this short-circuits to a virtual sub-view (no scan, no
+  /// `indexed_files` writes, no source-ownership transfer). Otherwise
+  /// it's a fresh top-level scanning source: performs the initial
+  /// scan with the requested [scanMode] and indexes discovered files
+  /// into `indexed_files`. Workflow intelligence is **not** materialised
+  /// during scan — that happens lazily on user interaction.
+  Future<void> addSource(
+    String folderPath,
+    ScanMode scanMode, {
+    String? displayName,
+  }) async {
+    debugPrint('[addSource] path=$folderPath mode=$scanMode');
+    if (_sources.any((s) => s.folderPath == folderPath)) {
+      final existing = _sources.firstWhere((s) => s.folderPath == folderPath);
+      debugPrint(
+        '[addSource] exact match → ${existing.isSubView ? "subview, return" : "rescan"}',
+      );
+      if (existing.isSubView) return; // sub-views never scan
+      await rescanSource(existing.id);
+      return;
+    }
+
+    final containing = findContainingSource(folderPath);
+    debugPrint(
+      '[addSource] containing=${containing?.displayName ?? "<none>"}',
+    );
+    if (containing != null) {
+      await _addSubView(folderPath, parent: containing, displayName: displayName);
+      return;
+    }
+
+    final source = Source(
+      id: _uuid.v4(),
+      displayName: displayName ?? _displayNameFor(folderPath),
+      folderPath: folderPath,
+      scanMode: scanMode,
+      enabled: true,
+      lastScanAt: null,
+      trackCount: 0,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+
+    await repo.insertSource(source);
+    _sources.add(source);
+    notifyListeners();
+
+    await _scanIntoSource(source);
+  }
+
+  /// Insert a sub-view source row. Sub-views never scan, never own
+  /// `indexed_files` rows, never participate in availability —
+  /// they're virtual filtered lenses over the parent's tracks
+  /// keyed by exact path-prefix.
+  Future<void> _addSubView(
+    String folderPath, {
+    required Source parent,
+    String? displayName,
+  }) async {
+    final sep = Platform.pathSeparator;
+    final prefix = folderPath.endsWith(sep) ? folderPath : folderPath + sep;
+    final source = Source(
+      id: _uuid.v4(),
+      displayName: displayName ?? _displayNameFor(folderPath),
+      folderPath: folderPath,
+      scanMode: ScanMode.recursive, // unused for sub-views
+      enabled: true,
+      lastScanAt: null,
+      trackCount: 0,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+      parentSourceId: parent.id,
+      pathPrefix: prefix,
+    );
+    // Don't swallow insert errors — earlier silent-failure variant
+    // produced the "toast says added, sidebar shows nothing" bug
+    // because the snackbar was fired regardless of DB outcome.
+    // Letting the exception propagate lets the sidebar surface the
+    // real error to the user.
+    await repo.insertSource(source);
+    debugPrint(
+      '[_addSubView] inserted id=${source.id} parent=${parent.id} prefix=$prefix',
+    );
+    _sources.add(source);
+    _markLibraryDirty();
+    notifyListeners();
+  }
+
+  /// Re-scan an existing source. Existing rows for this source whose
+  /// files are still present are preserved (intelligence intact); rows
+  /// not seen this scan are flagged unavailable, never deleted.
+  Future<void> rescanSource(String sourceId) async {
+    final idx = _sources.indexWhere((s) => s.id == sourceId);
+    if (idx < 0) return;
+    await _scanIntoSource(_sources[idx]);
+  }
+
+  Future<void> _scanIntoSource(Source source) async {
     _isScanning = true;
     notifyListeners();
     try {
-      final filePaths = await AudioScanner.scan(path);
-      final folder = WatchedFolder(
-        path: path,
-        displayName: _displayNameFor(path),
+      final scanStart = Stopwatch()..start();
+      // Disk walk + per-file stat now happen inside the scanner
+      // isolate; the UI thread stays responsive even on huge cloud
+      // libraries.
+      final entries = await AudioScanner.scan(
+        source.folderPath,
+        recursive: source.scanMode == ScanMode.recursive,
       );
-      await repo.insertFolder(folder);
-      _folders.add(folder);
+      debugPrint(
+        '[scan] walked ${entries.length} files in '
+        '${scanStart.elapsedMilliseconds}ms',
+      );
 
-      final existingIds = <String>{for (final t in _tracks) t.id};
-      final newTracks = <Track>[];
-      for (final filePath in filePaths) {
-        if (existingIds.contains(filePath)) continue;
-        existingIds.add(filePath);
-        final t = Track(
-          id: filePath,
-          title: filenameWithoutExtension(filePath),
-          artist: '',
-          folderPath: path,
-          duration: Duration.zero,
-        );
-        newTracks.add(t);
-        _tracks.add(t);
+      // Build the batch payload. Carry forward already-known durations
+      // so the fingerprint stays stable when we re-upsert files we've
+      // already seen.
+      final knownPaths = <String>{};
+      final batch = <({
+        String path,
+        String filename,
+        int filesize,
+        int modifiedAtMs,
+        String fallbackTitle,
+        int durationMs
+      })>[];
+      for (final e in entries) {
+        final existing = _trackByPath(e.path);
+        if (existing != null) knownPaths.add(e.path);
+        batch.add((
+          path: e.path,
+          filename: e.filename,
+          filesize: e.filesize,
+          modifiedAtMs: e.modifiedAtMs,
+          fallbackTitle: filenameWithoutExtension(e.path),
+          durationMs: existing?.duration.inMilliseconds ?? 0,
+        ));
       }
-      await repo.insertTracksBatch(newTracks);
+
+      final upsertStart = Stopwatch()..start();
+      final inserted = await repo.upsertIndexedFilesBatch(
+        sourceId: source.id,
+        files: batch,
+      );
+      debugPrint(
+        '[scan] upsert batch: ${batch.length} files '
+        '($inserted new) in ${upsertStart.elapsedMilliseconds}ms',
+      );
+
+      await repo.markUnseenAvailability(
+        source.id,
+        {for (final e in entries) e.path},
+      );
+
+      // Re-link any new indexed_files row to its existing tracks
+      // row by fingerprint. This is what makes "remove → re-add"
+      // preserve favorites / play counts visibly: without this,
+      // the table would show 0/false until each row was clicked.
+      final reconnected =
+          await repo.reconnectIntelligenceBySource(source.id);
+      debugPrint('[scan] reconnected $reconnected rows to existing intelligence');
+
+      // Reload tracks — rebuild the in-memory list so intel_uid
+      // changes (fingerprint migration on re-tag) propagate and
+      // newly-discovered rows become visible.
+      final allTracks = await repo.loadTracks();
+      _replaceTracks(allTracks);
+
+      final count = await repo.countIndexedFiles(source.id);
+      final now = DateTime.now().millisecondsSinceEpoch;
+      await repo.updateSourceMeta(
+        source.id,
+        lastScanAt: now,
+        trackCount: count,
+      );
+      final i = _sources.indexWhere((s) => s.id == source.id);
+      if (i >= 0) {
+        _sources[i] = _sources[i].copyWith(
+          lastScanAt: now,
+          trackCount: count,
+        );
+      }
+
       _invalidateLock();
       _markLibraryDirty();
-      _enqueueMetadata(newTracks.map((t) => t.id));
+
+      // Reactive-first architecture: NO auto-enqueue here. New rows
+      // appear in the table immediately at filename-only display;
+      // they enrich on demand when the user scrolls them into view,
+      // selects them, or plays them. Avoids the post-scan
+      // multi-minute Dropbox materialisation storm we used to
+      // trigger by enriching the whole library every scan.
+    } catch (e, st) {
+      debugPrint('[scan] FAILED: $e');
+      debugPrint('$st');
     } finally {
       _isScanning = false;
       notifyListeners();
     }
   }
 
-  Future<void> removeWatchedFolder(String path) async {
-    await repo.deleteFolder(path);
-    _folders.removeWhere((f) => f.path == path);
-    _tracks.removeWhere((t) => t.folderPath == path);
-    final remainingIds = <String>{for (final t in _tracks) t.id};
-    _recentReviewedIds.removeWhere((id) => !remainingIds.contains(id));
-    if (_selectedFolderPath == path) _selectedFolderPath = null;
-    if (_currentTrackId != null &&
-        !_tracks.any((t) => t.id == _currentTrackId)) {
+  /// Remove the source. The FK cascade drops `indexed_files` rows under
+  /// it; `tracks` rows are intentionally untouched (guardrail 5 — user
+  /// work survives source removal). Re-adding the same folder will
+  /// reconnect intelligence by fingerprint.
+  Future<void> removeSource(String sourceId) async {
+    await repo.deleteSource(sourceId);
+    _sources.removeWhere((s) => s.id == sourceId);
+    _removeTracksWhere((t) => t.sourceId == sourceId);
+    final remainingUids = <String>{for (final t in _tracks) t.uid};
+    _recentReviewedUids.removeWhere((uid) => !remainingUids.contains(uid));
+    if (_selectedSourceId == sourceId) _selectedSourceId = null;
+    if (_currentTrackUid != null &&
+        !_tracks.any((t) => t.uid == _currentTrackUid)) {
       await engine.stop();
-      _currentTrackId = null;
+      _currentTrackUid = null;
+      _currentTrackPath = null;
       _isPlaying = false;
       _positionNotifier.value = Duration.zero;
       _sessionListened = Duration.zero;
@@ -660,8 +1335,12 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void selectFolder(String? path) {
-    _selectedFolderPath = path;
+  // ---------------------------------------------------------------------------
+  // Filter / selection
+  // ---------------------------------------------------------------------------
+
+  void selectSource(String? sourceId) {
+    _selectedSourceId = sourceId;
     _invalidateLock();
     _markLibraryDirty();
     notifyListeners();
@@ -698,25 +1377,68 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void toggleFavorite(String trackId) {
-    final t = _tracks.firstWhere((t) => t.id == trackId);
+  // ---------------------------------------------------------------------------
+  // Intelligence-mutating actions (lazy promotion).
+  // Each user-driven write goes: in-memory mutation → promote → persist.
+  // ---------------------------------------------------------------------------
+
+  Future<void> _ensurePromoted(Track t) async {
+    if (t.intelUid != null) return;
+    final intelUid = await repo.promoteToIntelligence(t.path);
+    if (intelUid == null) return;
+    t.intelUid = intelUid;
+    // If we just reconnected to an existing tracks row (ghost
+    // intelligence from a prior session — e.g. user removed +
+    // re-added the source), pull its favorite / playCount /
+    // cumulativeMs / lastPlayedAt back into the in-memory Track.
+    // Without this, the row would show defaults until a full
+    // reload. Cheap: one indexed lookup by uid.
+    final intel = await repo.fetchIntelligence(intelUid);
+    if (intel != null) {
+      t.favorite = intel.favorite;
+      t.playCount = intel.playCount;
+      t.cumulativeListened = Duration(milliseconds: intel.cumulativeMs);
+      if (intel.lastPlayedAt != null) {
+        t.lastPlayedAt =
+            DateTime.fromMillisecondsSinceEpoch(intel.lastPlayedAt!);
+      }
+      _markLibraryDirty();
+    }
+  }
+
+  Future<void> toggleFavorite(String uid) async {
+    final t = _trackByUid(uid);
+    if (t == null) return;
     t.favorite = !t.favorite;
     _markLibraryDirty();
     notifyListeners();
-    repo.updateTrackState(t);
+    await _ensurePromoted(t);
+    if (t.intelUid != null) {
+      await repo.updateIntelligence(
+        intelUid: t.intelUid!,
+        favorite: t.favorite,
+      );
+    }
   }
 
-  void toggleReviewed(String trackId) {
-    final t = _tracks.firstWhere((t) => t.id == trackId);
+  Future<void> toggleReviewed(String uid) async {
+    final t = _trackByUid(uid);
+    if (t == null) return;
     if (t.reviewed) {
       t.cumulativeListened = Duration.zero;
     } else {
       t.cumulativeListened = const Duration(seconds: 3);
-      _pushRecentReviewed(trackId);
+      _pushRecentReviewed(uid);
     }
     _markLibraryDirty();
     notifyListeners();
-    repo.updateTrackState(t);
+    await _ensurePromoted(t);
+    if (t.intelUid != null) {
+      await repo.updateIntelligence(
+        intelUid: t.intelUid!,
+        cumulativeMs: t.cumulativeListened.inMilliseconds,
+      );
+    }
   }
 
   void cyclePlaybackMode() {
@@ -725,26 +1447,33 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
-  void selectTrack(String? trackId) {
-    if (_selectedTrackId == trackId) return;
-    _selectedTrackId = trackId;
+  void selectTrack(String? uid) {
+    if (_selectedTrackUid == uid) return;
+    _selectedTrackUid = uid;
+    if (uid != null) {
+      // Pre-warm metadata for the row the cursor is on, even if it's
+      // outside the viewport (keyboard arrow navigation past the
+      // last rendered row, etc.).
+      final t = _tracksByUid[uid];
+      if (t != null) enrichOnDemand(t.path);
+    }
     notifyListeners();
   }
 
   void selectNextVisible() {
     final list = visibleTracks;
     if (list.isEmpty) return;
-    final cursor = _selectedTrackId ?? _currentTrackId;
+    final cursor = _selectedTrackUid ?? _currentTrackUid;
     if (cursor == null) {
-      _selectedTrackId = list.first.id;
+      _selectedTrackUid = list.first.uid;
     } else {
-      final idx = list.indexWhere((t) => t.id == cursor);
+      final idx = list.indexWhere((t) => t.uid == cursor);
       if (idx < 0) {
-        _selectedTrackId = list.first.id;
+        _selectedTrackUid = list.first.uid;
       } else if (idx < list.length - 1) {
-        _selectedTrackId = list[idx + 1].id;
+        _selectedTrackUid = list[idx + 1].uid;
       } else {
-        _selectedTrackId = list.last.id;
+        _selectedTrackUid = list.last.uid;
       }
     }
     notifyListeners();
@@ -753,83 +1482,195 @@ class LibraryController extends ChangeNotifier {
   void selectPreviousVisible() {
     final list = visibleTracks;
     if (list.isEmpty) return;
-    final cursor = _selectedTrackId ?? _currentTrackId;
+    final cursor = _selectedTrackUid ?? _currentTrackUid;
     if (cursor == null) {
-      _selectedTrackId = list.first.id;
+      _selectedTrackUid = list.first.uid;
     } else {
-      final idx = list.indexWhere((t) => t.id == cursor);
+      final idx = list.indexWhere((t) => t.uid == cursor);
       if (idx <= 0) {
-        _selectedTrackId = list.first.id;
+        _selectedTrackUid = list.first.uid;
       } else {
-        _selectedTrackId = list[idx - 1].id;
+        _selectedTrackUid = list[idx - 1].uid;
       }
     }
     notifyListeners();
   }
 
   Future<void> playSelected() async {
-    final id = _selectedTrackId;
-    if (id == null) return;
-    await play(id, reveal: true);
+    final uid = _selectedTrackUid;
+    if (uid == null) return;
+    await play(uid, reveal: true);
   }
 
   void revealCurrent() {
-    if (_currentTrackId == null) return;
-    if (_selectedTrackId != _currentTrackId) {
-      _selectedTrackId = _currentTrackId;
+    if (_currentTrackUid == null) return;
+    if (_selectedTrackUid != _currentTrackUid) {
+      _selectedTrackUid = _currentTrackUid;
       notifyListeners();
     }
     _revealTick.value = _revealTick.value + 1;
   }
 
-  Future<void> showTrackInFinder(String trackId) async {
+  /// Reveal a specific track instance in Finder. Used by row-level
+  /// actions (right-click → Show in Finder).
+  ///
+  /// **Currently-playing instance wins**: if a track is playing and
+  /// shares this row's intelligence (same `intelUid`), reveal the
+  /// playing file instead — duplicate rows of the playing track all
+  /// reveal the file on the engine. Otherwise the row's own path is
+  /// the preferred target, with a fallback to other available
+  /// siblings if that file is missing.
+  Future<void> showTrackInstanceInFinder(Track t) async {
+    if (_currentTrackUid != null &&
+        _currentTrackPath != null &&
+        t.intelUid != null &&
+        currentTrack?.intelUid == t.intelUid) {
+      await showCurrentTrackInFinder();
+      return;
+    }
+    await _revealInFinderWithFallback(
+      preferredPath: t.path,
+      intelUid: t.intelUid,
+    );
+  }
+
+  /// Reveal the file the engine is currently playing in Finder. Used
+  /// by the utility-rail button. No-op if nothing is playing.
+  Future<void> showCurrentTrackInFinder() async {
+    final path = _currentTrackPath;
+    if (path == null) return;
+    await _revealInFinderWithFallback(
+      preferredPath: path,
+      intelUid: currentTrack?.intelUid,
+    );
+  }
+
+  /// Resolver: open [preferredPath] if present and available; else
+  /// fall back to the most-recently-seen available sibling (any
+  /// `Track` whose `intelUid` matches and whose file is on disk).
+  /// Never randomly picks — `last_seen_at` orders deterministically;
+  /// if there's no usable instance, no-op + debugPrint.
+  Future<void> _revealInFinderWithFallback({
+    required String preferredPath,
+    required String? intelUid,
+  }) async {
     if (!Platform.isMacOS) return;
+    final preferred = _trackByPath(preferredPath);
+    if (preferred != null && preferred.isAvailable) {
+      await _runFinderReveal(preferred.path);
+      return;
+    }
+    if (intelUid != null) {
+      Track? best;
+      for (final t in _tracks) {
+        if (t.intelUid != intelUid) continue;
+        if (!t.isAvailable) continue;
+        if (t.path == preferredPath) continue;
+        if (best == null || t.lastSeenAt > best.lastSeenAt) best = t;
+      }
+      if (best != null) {
+        await _runFinderReveal(best.path);
+        return;
+      }
+    }
+    debugPrint(
+      '[finder] no available instance to reveal '
+      '(preferred=$preferredPath, intelUid=$intelUid)',
+    );
+  }
+
+  Future<void> _runFinderReveal(String path) async {
     try {
-      await Process.run('open', ['-R', trackId]);
+      await Process.run('open', ['-R', path]);
     } catch (_) {
-      // file may have moved or sandbox restricted; best-effort
+      // best-effort
     }
   }
 
   Future<void> goBack() async {
-    if (_recentReviewedIds.isNotEmpty &&
-        _recentReviewedIds[0] != _currentTrackId) {
-      await play(_recentReviewedIds[0], reveal: true);
+    if (_recentReviewedUids.isNotEmpty &&
+        _recentReviewedUids[0] != _currentTrackUid) {
+      await play(_recentReviewedUids[0], reveal: true);
     } else {
       await previous();
     }
   }
 
-  Future<void> play(String trackId, {bool reveal = false}) async {
-    final track = _tracks.firstWhere(
-      (t) => t.id == trackId,
-      orElse: () => throw StateError('Track not found: $trackId'),
-    );
-    final isNewTrack = _currentTrackId != trackId;
+  Future<void> play(String uid, {bool reveal = false}) async {
+    // Per-step millisecond timing of the play path. Each `tick` call
+    // logs the cumulative + delta against the last tick. Goal: the
+    // segment from `entry` → `engine.setTrack returned` should be
+    // <50 ms on local files; anything longer surfaces a real
+    // bottleneck (sort, DB writes, listener storms, etc.).
+    final sw = Stopwatch()..start();
+    var lastMs = 0;
+    void tick(String label) {
+      final now = sw.elapsedMilliseconds;
+      debugPrint('[play t+${now}ms +${now - lastMs}ms] $label');
+      lastMs = now;
+    }
+
+    tick('entry uid=$uid');
+    final track = _trackByUid(uid);
+    tick('lookup → ${track == null ? "null" : "ok"}');
+    if (track == null) {
+      debugPrint('[play] unknown uid: $uid');
+      return;
+    }
+    if (!track.isAvailable) {
+      debugPrint('[play] file unavailable: ${track.path}');
+      return;
+    }
+    final isNewTrack = _currentTrackUid != uid;
     if (isNewTrack) {
       await _flushCurrentTrack();
+      tick('_flushCurrentTrack');
       final visible = visibleTracks;
-      final displayedIdx = visible.indexWhere((t) => t.id == trackId);
-      _currentTrackId = trackId;
-      _selectedTrackId = trackId;
+      tick('visibleTracks (${visible.length} rows, sort cost included)');
+      final displayedIdx = visible.indexWhere((t) => t.uid == uid);
+      tick('indexWhere');
+      _currentTrackUid = uid;
+      _selectedTrackUid = uid;
       _lockedCurrentIndex = displayedIdx >= 0 ? displayedIdx : null;
       _positionNotifier.value = Duration.zero;
       _lastTickPosition = Duration.zero;
       _sessionListened = Duration.zero;
       _sessionPlayCounted = false;
+      _isLoadingTrack = true;
       _markLibraryDirty();
       notifyListeners();
+      tick('notifyListeners (loading state)');
       try {
-        await engine.setTrack(track.id);
+        await engine.setTrack(track.path);
       } catch (e) {
-        _currentTrackId = null;
+        debugPrint('[play] engine.setTrack failed: $e');
+        _currentTrackUid = null;
+        _currentTrackPath = null;
+        _isLoadingTrack = false;
         notifyListeners();
         return;
       }
-      repo.markPlayed(trackId);
+      tick('engine.setTrack returned');
+      _isLoadingTrack = false;
+      _currentTrackPath = track.path;
+      enrichOnDemand(track.path);
+      tick('enrichOnDemand queued');
+
+      await _ensurePromoted(track);
+      tick('_ensurePromoted (DB)');
+      if (track.intelUid != null) {
+        track.lastPlayedAt = DateTime.now();
+        await repo.updateIntelligence(
+          intelUid: track.intelUid!,
+          lastPlayedAt: track.lastPlayedAt!.millisecondsSinceEpoch,
+        );
+        tick('updateIntelligence (lastPlayedAt)');
+      }
       _pushNowPlaying();
+      tick('_pushNowPlaying');
     }
     await engine.play();
+    tick('engine.play() — first audio frame requested');
     if (reveal) {
       _revealTick.value = _revealTick.value + 1;
     }
@@ -837,13 +1678,19 @@ class LibraryController extends ChangeNotifier {
 
   Future<void> _flushCurrentTrack() async {
     final t = currentTrack;
-    if (t != null) await repo.updateTrackState(t);
+    if (t == null) return;
+    if (t.intelUid == null) return;
+    await repo.updateIntelligence(
+      intelUid: t.intelUid!,
+      cumulativeMs: t.cumulativeListened.inMilliseconds,
+      playCount: t.playCount,
+    );
   }
 
   Future<void> togglePlayPause() async {
-    if (_currentTrackId == null) {
+    if (_currentTrackUid == null) {
       final list = visibleTracks;
-      if (list.isNotEmpty) await play(list.first.id);
+      if (list.isNotEmpty) await play(list.first.uid);
       return;
     }
     if (engine.isPlaying) {
@@ -855,38 +1702,38 @@ class LibraryController extends ChangeNotifier {
 
   Future<void> next() async {
     final list = visibleTracks;
-    if (list.isEmpty || _currentTrackId == null) return;
+    if (list.isEmpty || _currentTrackUid == null) return;
 
     if (_playbackMode == PlaybackMode.shuffleUnreviewed) {
       final pool = list
-          .where((t) => !t.reviewed && t.id != _currentTrackId)
+          .where((t) => !t.reviewed && t.uid != _currentTrackUid)
           .toList();
       if (pool.isEmpty) return;
-      await play(pool[_rng.nextInt(pool.length)].id, reveal: true);
+      await play(pool[_rng.nextInt(pool.length)].uid, reveal: true);
       return;
     }
 
     if (_playbackMode == PlaybackMode.shuffle && list.length > 1) {
-      String pickId;
+      String pickUid;
       do {
-        pickId = list[_rng.nextInt(list.length)].id;
-      } while (pickId == _currentTrackId);
-      await play(pickId, reveal: true);
+        pickUid = list[_rng.nextInt(list.length)].uid;
+      } while (pickUid == _currentTrackUid);
+      await play(pickUid, reveal: true);
       return;
     }
 
-    final idx = list.indexWhere((t) => t.id == _currentTrackId);
+    final idx = list.indexWhere((t) => t.uid == _currentTrackUid);
     if (idx >= 0 && idx < list.length - 1) {
-      await play(list[idx + 1].id, reveal: true);
+      await play(list[idx + 1].uid, reveal: true);
     }
   }
 
   Future<void> previous() async {
     final list = visibleTracks;
-    if (list.isEmpty || _currentTrackId == null) return;
-    final idx = list.indexWhere((t) => t.id == _currentTrackId);
+    if (list.isEmpty || _currentTrackUid == null) return;
+    final idx = list.indexWhere((t) => t.uid == _currentTrackUid);
     if (idx > 0) {
-      await play(list[idx - 1].id, reveal: true);
+      await play(list[idx - 1].uid, reveal: true);
     }
   }
 
@@ -933,10 +1780,17 @@ class LibraryController extends ChangeNotifier {
             _sessionPlayCounted = true;
             track.playCount += 1;
           }
-          _pushRecentReviewed(track.id);
+          _pushRecentReviewed(track.uid);
           _markLibraryDirty();
           notifyListeners();
-          repo.updateTrackState(track);
+          // Persist to intelligence row (already promoted at play start).
+          if (track.intelUid != null) {
+            repo.updateIntelligence(
+              intelUid: track.intelUid!,
+              cumulativeMs: track.cumulativeListened.inMilliseconds,
+              playCount: track.playCount,
+            );
+          }
         }
       }
     }
@@ -974,7 +1828,9 @@ class LibraryController extends ChangeNotifier {
       track.duration = d;
       _markLibraryDirty();
       notifyListeners();
-      repo.updateTrackState(track);
+      // Duration is part of the lightweight index, not intelligence —
+      // metadata extractor will eventually persist it via
+      // updateMetadataBatch. We don't write to `tracks` from here.
     }
   }
 
@@ -984,6 +1840,65 @@ class LibraryController extends ChangeNotifier {
       _sessionPlayCounted = false;
       next();
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Intelligence export / import (cross-machine portability).
+  // ---------------------------------------------------------------------------
+
+  /// Snapshot intelligence rows to a JSON file.
+  ///
+  /// If [toPath] is `null`, writes to the default location:
+  /// `~/Documents/Music Tracker/intelligence-{yyyyMMdd-HHmm}.json`.
+  /// Returns the written file (caller can show the path in a toast).
+  Future<File> exportIntelligence({String? toPath}) async {
+    final records = await repo.exportIntelligenceRecords();
+    final filePath = toPath ??
+        '${(await IntelligenceExportFile.defaultExportDirectory()).path}/'
+            '${IntelligenceExportFile.defaultFilename()}';
+    final file = await IntelligenceExportFile.writeTo(
+      filePath: filePath,
+      records: records,
+    );
+    debugPrint(
+      '[export] wrote ${records.length} intelligence records to '
+      '${file.path}',
+    );
+    return file;
+  }
+
+  /// Read an intelligence file and preview the merge plan WITHOUT
+  /// applying it. Used by the import-confirm dialog so the user sees
+  /// the breakdown before committing.
+  ///
+  /// Throws [FormatException] if the file isn't a valid intelligence
+  /// export. The returned `records` is what
+  /// [applyIntelligenceImport] should be called with on confirm.
+  Future<({List<IntelligenceRecord> records, List<String> parseErrors})>
+      previewIntelligenceImport(File file) async {
+    final errors = <String>[];
+    final records = await IntelligenceExportFile.readFrom(file, errors: errors);
+    return (records: records, parseErrors: errors);
+  }
+
+  /// Apply an already-parsed import. Reloads tracks afterwards so
+  /// merged state appears in the UI without restarting the app.
+  Future<ImportSummary> applyIntelligenceImport(
+    List<IntelligenceRecord> records,
+  ) async {
+    final summary = await repo.importIntelligenceRecords(records);
+    final allTracks = await repo.loadTracks();
+    _replaceTracks(allTracks);
+    _markLibraryDirty();
+    notifyListeners();
+    debugPrint(
+      '[import] read=${summary.recordsRead} '
+      'mergedByUid=${summary.mergedByUid} '
+      'mergedByFp=${summary.mergedByFingerprint} '
+      'ghost=${summary.insertedAsGhost} '
+      'errors=${summary.skippedErrors.length}',
+    );
+    return summary;
   }
 
   @override

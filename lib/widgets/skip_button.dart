@@ -23,7 +23,7 @@ class SkipButton extends StatelessWidget {
         hoverColor: AppColors.hoverRow,
         focusColor: AppColors.focusOverlay,
         child: Container(
-          constraints: const BoxConstraints(minWidth: 56, minHeight: 56),
+          constraints: const BoxConstraints(minWidth: 48, minHeight: 64),
           alignment: Alignment.center,
           child: Text(
             label,

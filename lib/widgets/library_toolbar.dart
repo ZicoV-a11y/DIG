@@ -178,7 +178,7 @@ class _RecentReviewedButton extends StatelessWidget {
       itemBuilder: (context) => [
         for (final t in tracks)
           PopupMenuItem<String>(
-            value: t.id,
+            value: t.uid,
             height: 32,
             child: Row(
               children: [
@@ -190,7 +190,7 @@ class _RecentReviewedButton extends StatelessWidget {
                 const SizedBox(width: 8),
                 Flexible(
                   child: Text(
-                    t.title,
+                    t.displayTitle,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                       color: AppColors.textPrimary,
@@ -198,11 +198,11 @@ class _RecentReviewedButton extends StatelessWidget {
                     ),
                   ),
                 ),
-                if (t.artist.isNotEmpty) ...[
+                if (t.displayArtist.isNotEmpty) ...[
                   const SizedBox(width: 8),
                   Flexible(
                     child: Text(
-                      t.artist,
+                      t.displayArtist,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                         color: AppColors.textSecondary,

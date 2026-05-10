@@ -1,7 +1,12 @@
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
+import '../services/intelligence_export.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
+import 'import_confirm_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
 /// Stacked modules (top → bottom): Volume, Play Threshold, Favorite,
@@ -12,26 +17,46 @@ class UtilityRail extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // The rail's stacked modules can overflow vertically when the
+    // window is short. Wrap in a SingleChildScrollView so the whole
+    // rail scrolls as a unit — never affecting the deck or workspace
+    // layout. Hide the platform scrollbar; the rail is narrow and the
+    // scroll is by drag/wheel, not by clicking a thumb.
     return Container(
       width: 100,
       color: AppColors.surface,
       child: ListenableBuilder(
         listenable: controller,
         builder: (ctx, _) {
-          return Column(
-            children: [
-              const SizedBox(height: 12),
-              _VolumeModule(controller: controller),
-              const _RailDivider(),
-              _ThresholdModule(controller: controller),
-              const _RailDivider(),
-              _FavoriteModule(controller: controller),
-              const _RailDivider(),
-              _ModeModule(controller: controller),
-              const _RailDivider(),
-              _ShowInFinderModule(controller: controller),
-              const SizedBox(height: 12),
-            ],
+          return ScrollConfiguration(
+            behavior: ScrollConfiguration.of(ctx).copyWith(scrollbars: false),
+            child: SingleChildScrollView(
+              // Bouncing physics gives the macOS-native elastic feel
+              // when overscrolling top/bottom. Combined with letting
+              // the wheel event reach the rail (HomeScreen excludes
+              // this region from its table-forwarding handler), the
+              // rail now scrolls smoothly via trackpad/wheel.
+              physics: const BouncingScrollPhysics(
+                parent: AlwaysScrollableScrollPhysics(),
+              ),
+              child: Column(
+                children: [
+                  const SizedBox(height: 12),
+                  _VolumeModule(controller: controller),
+                  const _RailDivider(),
+                  _ThresholdModule(controller: controller),
+                  const _RailDivider(),
+                  _FavoriteModule(controller: controller),
+                  const _RailDivider(),
+                  _ModeModule(controller: controller),
+                  const _RailDivider(),
+                  _ShowInFinderModule(controller: controller),
+                  const _RailDivider(),
+                  _DataModule(controller: controller),
+                  const SizedBox(height: 12),
+                ],
+              ),
+            ),
           );
         },
       ),
@@ -198,7 +223,7 @@ class _FavoriteModule extends StatelessWidget {
           : (isFav ? 'Unfavorite' : 'Favorite'),
       onPressed: track == null
           ? null
-          : () => controller.toggleFavorite(track.id),
+          : () => controller.toggleFavorite(track.uid),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -272,11 +297,12 @@ class _ShowInFinderModule extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final id = controller.currentTrackId;
-    final enabled = id != null;
+    final hasCurrent = controller.currentTrackPath != null;
     return _RailButton(
-      tooltip: enabled ? 'Show in Finder' : 'Show in Finder (no track)',
-      onPressed: enabled ? () => controller.showTrackInFinder(id) : null,
+      tooltip: hasCurrent
+          ? 'Show in Finder'
+          : 'Show in Finder (no track)',
+      onPressed: hasCurrent ? controller.showCurrentTrackInFinder : null,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -285,12 +311,225 @@ class _ShowInFinderModule extends StatelessWidget {
           Icon(
             Icons.open_in_new_rounded,
             size: 22,
-            color: enabled
+            color: hasCurrent
                 ? AppColors.textSecondary
                 : AppColors.textTertiary,
           ),
         ],
       ),
+    );
+  }
+}
+
+// ---------- DATA (Export / Import) ----------
+
+class _DataModule extends StatelessWidget {
+  final LibraryController controller;
+  const _DataModule({required this.controller});
+
+  /// Quick local save: overwrites the canonical snapshot at
+  /// `~/Documents/Music Tracker/intelligence.json`. Always the same
+  /// filename, so repeated saves don't pile up timestamped clones —
+  /// you have exactly one current-state file you can hand off,
+  /// version-control, or restore from. The timestamped variant is
+  /// still available via the picker-based EXPORT button below.
+  Future<void> _runSave(BuildContext context) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    try {
+      final dir = await IntelligenceExportFile.defaultExportDirectory();
+      final path =
+          '${dir.path}/${IntelligenceExportFile.canonicalFilename}';
+      final file = await controller.exportIntelligence(toPath: path);
+      messenger?.showSnackBar(
+        SnackBar(
+          content: Text('Saved → ${file.path}'),
+          duration: const Duration(seconds: 5),
+          action: SnackBarAction(
+            label: 'Show',
+            onPressed: () {
+              try {
+                Process.run('open', ['-R', file.path]);
+              } catch (_) {/* best-effort */}
+            },
+          ),
+        ),
+      );
+    } catch (e) {
+      messenger?.showSnackBar(
+        SnackBar(content: Text('Save failed: $e')),
+      );
+    }
+  }
+
+  /// Picker-based export — useful when the user wants to write to a
+  /// specific drive or folder (e.g. handing the file to another
+  /// machine on a USB stick).
+  Future<void> _runExport(BuildContext context) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final defaultDir =
+        await IntelligenceExportFile.defaultExportDirectory();
+    final defaultName = IntelligenceExportFile.defaultFilename();
+    final chosen = await FilePicker.saveFile(
+      dialogTitle: 'Export intelligence',
+      fileName: defaultName,
+      initialDirectory: defaultDir.path,
+      type: FileType.custom,
+      allowedExtensions: const ['json'],
+    );
+    if (chosen == null) return;
+    final path = chosen.endsWith('.json') ? chosen : '$chosen.json';
+    try {
+      final file = await controller.exportIntelligence(toPath: path);
+      messenger?.showSnackBar(
+        SnackBar(
+          content: Text('Exported intelligence → ${file.path}'),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      messenger?.showSnackBar(
+        SnackBar(content: Text('Export failed: $e')),
+      );
+    }
+  }
+
+  Future<void> _runImport(BuildContext context) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final result = await FilePicker.pickFiles(
+      dialogTitle: 'Import intelligence',
+      type: FileType.custom,
+      allowedExtensions: const ['json'],
+    );
+    final picked = result?.files.singleOrNull?.path;
+    if (picked == null) return;
+    final file = File(picked);
+
+    try {
+      final preview = await controller.previewIntelligenceImport(file);
+      if (!context.mounted) return;
+      final confirmed = await ImportConfirmDialog.show(
+        context,
+        filename: file.uri.pathSegments.isNotEmpty
+            ? file.uri.pathSegments.last
+            : picked,
+        recordCount: preview.records.length,
+        parseErrors: preview.parseErrors.length,
+      );
+      if (confirmed != true) return;
+      final summary =
+          await controller.applyIntelligenceImport(preview.records);
+      messenger?.showSnackBar(
+        SnackBar(
+          content: Text(
+            'Imported ${summary.recordsRead} records '
+            '(merged ${summary.mergedByUid + summary.mergedByFingerprint}, '
+            'new ${summary.insertedAsGhost}'
+            '${summary.skippedErrors.isNotEmpty ? ", errors ${summary.skippedErrors.length}" : ""})',
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } on FormatException catch (e) {
+      messenger?.showSnackBar(
+        SnackBar(content: Text('Import failed: ${e.message}')),
+      );
+    } catch (e) {
+      messenger?.showSnackBar(
+        SnackBar(content: Text('Import failed: $e')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const _SectionLabel('DATA'),
+        const SizedBox(height: 4),
+        _RailButton(
+          tooltip:
+              'Quick local save → ~/Documents/Music Tracker/',
+          onPressed: () => _runSave(context),
+          child: const Padding(
+            padding: EdgeInsets.symmetric(vertical: 2),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.save_outlined,
+                  size: 20,
+                  color: AppColors.textSecondary,
+                ),
+                SizedBox(height: 2),
+                Text(
+                  'SAVE',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                    color: AppColors.textPrimary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        _RailButton(
+          tooltip: 'Export to a chosen location',
+          onPressed: () => _runExport(context),
+          child: const Padding(
+            padding: EdgeInsets.symmetric(vertical: 2),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.file_upload_outlined,
+                  size: 20,
+                  color: AppColors.textSecondary,
+                ),
+                SizedBox(height: 2),
+                Text(
+                  'EXPORT',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                    color: AppColors.textPrimary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        _RailButton(
+          tooltip: 'Import intelligence from a JSON file',
+          onPressed: () => _runImport(context),
+          child: const Padding(
+            padding: EdgeInsets.symmetric(vertical: 2),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.file_download_outlined,
+                  size: 20,
+                  color: AppColors.textSecondary,
+                ),
+                SizedBox(height: 2),
+                Text(
+                  'IMPORT',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                    color: AppColors.textPrimary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

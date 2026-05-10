@@ -223,9 +223,13 @@ class AppDatabase {
   static Future<void> _migrateV5toV6(Database db) async {
     debugPrint('[db] starting v5 → v6 migration (add tracks.fingerprint)');
     final stopwatch = Stopwatch()..start();
-    await db.execute(
-      "ALTER TABLE tracks ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''",
-    );
+    final columns = await db.rawQuery('PRAGMA table_info(tracks)');
+    final hasFingerprint = columns.any((c) => c['name'] == 'fingerprint');
+    if (!hasFingerprint) {
+      await db.execute(
+        "ALTER TABLE tracks ADD COLUMN fingerprint TEXT NOT NULL DEFAULT ''",
+      );
+    }
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_tracks_fingerprint '
       'ON tracks(fingerprint)',

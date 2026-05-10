@@ -775,6 +775,12 @@ class LibraryController extends ChangeNotifier {
   ValueListenable<int> get revealTick => _revealTick;
 
   int get totalTrackCount => _tracks.length;
+
+  /// Whole-library view in insertion order. Read-only — callers
+  /// must not mutate. Use this for cross-library pickers (e.g., the
+  /// manual link-target dialog) that need to see tracks regardless
+  /// of source / search filters.
+  List<Track> get allTracks => List.unmodifiable(_tracks);
   int get libraryVersion => _libraryVersion;
 
   int get playThresholdSeconds => _playThresholdSeconds;
@@ -1641,6 +1647,58 @@ class LibraryController extends ChangeNotifier {
       }
     }
     return canonical;
+  }
+
+  /// Manually pair [origin] with [target] so they bucket together
+  /// regardless of whether the strict 4-field matcher would have
+  /// matched them. Both rows receive the same `identityOverride`
+  /// value (a fresh UUID), and their intelligence is consolidated
+  /// onto a single canonical `tracks` row.
+  ///
+  /// If [origin] is already part of a bucket (manual or computed),
+  /// the override propagates to every variant in that bucket so the
+  /// pairing extends transitively — pairing a fifth file to a song
+  /// that already has four variants keeps them all together.
+  Future<void> linkTracks(Track origin, Track target) async {
+    if (origin.uid == target.uid) return;
+    final originBucket = variantsFor(origin);
+    final targetBucket = variantsFor(target);
+    final unique = <String, Track>{
+      for (final t in originBucket) t.uid: t,
+      for (final t in targetBucket) t.uid: t,
+    };
+    final allTracks = unique.values.toList();
+    if (allTracks.length < 2) return;
+
+    // Pick the override: if any of the involved tracks already had
+    // a manual override, reuse it (extending the existing manual
+    // bucket); otherwise mint a fresh UUID.
+    String? override;
+    for (final t in allTracks) {
+      final ov = t.identityOverride;
+      if (ov != null && ov.isNotEmpty) {
+        override = ov;
+        break;
+      }
+    }
+    override ??= _uuid.v4();
+
+    // Apply in-memory immediately so the table redraws.
+    for (final t in allTracks) {
+      t.identityOverride = override;
+    }
+    _markLibraryDirty();
+    notifyListeners();
+
+    // Persist + consolidate intel so the pair shares one canonical
+    // `tracks` row (slice 3 mechanism).
+    await repo.setIdentityOverride(
+      allTracks.map((t) => t.path).toList(),
+      value: override,
+    );
+    await _writeBucketIntelligence(origin, (_) async {});
+    _markLibraryDirty();
+    notifyListeners();
   }
 
   Future<void> toggleFavorite(String uid) async {

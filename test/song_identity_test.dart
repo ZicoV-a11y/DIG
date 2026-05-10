@@ -9,10 +9,12 @@ Track _t({
   Duration duration = const Duration(minutes: 4),
   String? uid,
   String? path,
+  String? identityOverride,
 }) {
   return Track(
     uid: uid ?? 'uid-$filename',
     fingerprint: 'fp-$filename',
+    identityOverride: identityOverride,
     path: path ?? '/library/$filename',
     filename: filename,
     sourceId: 'src1',
@@ -188,6 +190,103 @@ void main() {
       // `.hidden` → no extension stripped; both compare as `.hidden`.
       final a = _t(filename: '.hidden', title: 'T', artist: 'A');
       final b = _t(filename: '.hidden', title: 'T', artist: 'A');
+      expect(sameSongIdentity(a, b), isTrue);
+    });
+  });
+
+  group('identityOverride (manual link)', () {
+    test('two tracks with the same override match regardless of fields', () {
+      // Otherwise these would never match — different basenames,
+      // titles, artists, and durations.
+      final a = _t(
+        filename: 'a.mp3',
+        title: 'Different Title',
+        artist: 'Different Artist',
+        duration: const Duration(seconds: 100),
+        identityOverride: 'manual-uuid',
+      );
+      final b = _t(
+        filename: 'b.aiff',
+        title: 'Other Title',
+        artist: 'Other Artist',
+        duration: const Duration(seconds: 200),
+        identityOverride: 'manual-uuid',
+      );
+      expect(sameSongIdentity(a, b), isTrue);
+    });
+
+    test('different overrides do not match (even with matching fields)', () {
+      // Two tracks that the auto-matcher would pair, each with a
+      // DIFFERENT manual override, stay distinct. The override is
+      // also an "explicit isolation" signal — same key = together,
+      // different keys = apart.
+      final a = _t(
+        filename: 'song.mp3',
+        title: 'Song',
+        artist: 'Artist',
+        identityOverride: 'group-x',
+      );
+      final b = _t(
+        filename: 'song.aiff',
+        title: 'Song',
+        artist: 'Artist',
+        identityOverride: 'group-y',
+      );
+      expect(sameSongIdentity(a, b), isFalse);
+    });
+
+    test('one override + one no-override do not match', () {
+      // Asymmetric: a track that opted into a manual bucket
+      // doesn't accidentally also match an unrelated track that
+      // happens to share the auto-matcher fields.
+      final a = _t(
+        filename: 'song.mp3',
+        title: 'Song',
+        artist: 'Artist',
+        identityOverride: 'group-x',
+      );
+      final b = _t(
+        filename: 'song.aiff',
+        title: 'Song',
+        artist: 'Artist',
+      );
+      expect(sameSongIdentity(a, b), isFalse);
+    });
+
+    test('groupBySongIdentity collapses overridden tracks together', () {
+      final a = _t(
+        filename: 'one.mp3',
+        title: 'A',
+        artist: 'X',
+        identityOverride: 'shared',
+      );
+      final b = _t(
+        filename: 'two.aiff',
+        title: 'B',
+        artist: 'Y',
+        identityOverride: 'shared',
+      );
+      final c = _t(filename: 'three.mp3', title: 'C', artist: 'Z');
+      final result = groupBySongIdentity([a, b, c]);
+      expect(result, hasLength(2));
+      expect(result[0], [a, b]);
+      expect(result[1], [c]);
+    });
+
+    test('empty-string override is treated as no override', () {
+      // Defensive — a writer might store '' instead of null.
+      final a = _t(
+        filename: 'song.mp3',
+        title: 'Song',
+        artist: 'Artist',
+        identityOverride: '',
+      );
+      final b = _t(
+        filename: 'song.aiff',
+        title: 'Song',
+        artist: 'Artist',
+      );
+      // Both fall back to computed identity, which DOES match.
       expect(sameSongIdentity(a, b), isTrue);
     });
   });

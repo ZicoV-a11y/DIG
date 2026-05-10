@@ -503,6 +503,29 @@ class LibraryRepository {
     });
   }
 
+  /// Set (or clear) the manual identity override for a set of file
+  /// paths. When [value] is non-null, the listed rows will bucket
+  /// together under [value] regardless of whether the strict 4-field
+  /// matcher would have paired them. When [value] is null, the
+  /// override is removed and the rows fall back to computed identity.
+  ///
+  /// Caller is responsible for refreshing in-memory Tracks (or
+  /// calling `loadTracks` to rebuild). This method only writes the
+  /// column.
+  Future<void> setIdentityOverride(
+    List<String> paths, {
+    required String? value,
+  }) async {
+    if (paths.isEmpty) return;
+    final placeholders = List.filled(paths.length, '?').join(',');
+    await _db.update(
+      'indexed_files',
+      {'identity_override': value},
+      where: 'path IN ($placeholders)',
+      whereArgs: paths,
+    );
+  }
+
   /// Force every `indexed_files` row whose path is in [paths] (the
   /// song-identity bucket: same basename-no-ext + title + artist +
   /// duration-in-seconds) to share a single canonical `tracks` row.
@@ -927,6 +950,7 @@ Track _trackFromJoinedRow(Map<String, Object?> r) {
     uid: r['uid'] as String,
     fingerprint: r['fingerprint'] as String,
     intelUid: r['intel_uid'] as String?,
+    identityOverride: r['identity_override'] as String?,
     path: r['path'] as String,
     filename: r['filename'] as String,
     sourceId: r['source_id'] as String,

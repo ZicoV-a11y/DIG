@@ -16,7 +16,7 @@ class AppDatabase {
   // v7 adds `sources.parent_source_id` + `sources.path_prefix` so a
   // folder picked inside an already-watched source becomes a virtual
   // "sub-view" instead of a duplicate scanning source.
-  static const _schemaVersion = 7;
+  static const _schemaVersion = 8;
 
   late final Database _db;
 
@@ -120,6 +120,7 @@ class AppDatabase {
         fingerprint TEXT NOT NULL,
         uid TEXT NOT NULL,
         intel_uid TEXT,
+        identity_override TEXT,
         is_available INTEGER NOT NULL DEFAULT 1,
         last_seen_at INTEGER NOT NULL,
         title TEXT NOT NULL,
@@ -194,6 +195,32 @@ class AppDatabase {
     if (oldVersion < 7) {
       await _migrateV6toV7(db);
     }
+    if (oldVersion < 8) {
+      await _migrateV7toV8(db);
+    }
+  }
+
+  /// Add `indexed_files.identity_override` — a nullable user-set
+  /// string that overrides the computed song-identity key. Lets the
+  /// user manually pair two files the strict 4-field matcher missed
+  /// (renamed-between-encodes, tag drift, etc). Idempotent so a
+  /// retry after an interrupted migration is safe.
+  static Future<void> _migrateV7toV8(Database db) async {
+    debugPrint(
+      '[db] starting v7 → v8 migration (indexed_files.identity_override)',
+    );
+    final stopwatch = Stopwatch()..start();
+    final columns = await db.rawQuery('PRAGMA table_info(indexed_files)');
+    final hasOverride =
+        columns.any((c) => c['name'] == 'identity_override');
+    if (!hasOverride) {
+      await db.execute(
+        'ALTER TABLE indexed_files ADD COLUMN identity_override TEXT',
+      );
+    }
+    debugPrint(
+      '[db] v7 → v8 done in ${stopwatch.elapsedMilliseconds}ms.',
+    );
   }
 
   /// Add sub-view columns to `sources`. Purely additive; existing

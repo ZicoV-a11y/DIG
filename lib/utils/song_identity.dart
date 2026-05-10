@@ -44,6 +44,15 @@ import '../models/track.dart';
 /// match on.
 bool sameSongIdentity(Track a, Track b) {
   if (identical(a, b)) return true;
+  // Manual override wins over the strict 4-field rule. Two tracks
+  // with the same non-empty override pair regardless of fields; if
+  // only one has an override they're intentionally distinct.
+  final ao = a.identityOverride;
+  final bo = b.identityOverride;
+  final aHasOverride = ao != null && ao.isNotEmpty;
+  final bHasOverride = bo != null && bo.isNotEmpty;
+  if (aHasOverride && bHasOverride) return ao == bo;
+  if (aHasOverride != bHasOverride) return false;
   if (a.title.isEmpty || a.artist.isEmpty) return false;
   if (b.title.isEmpty || b.artist.isEmpty) return false;
   if (a.duration.inSeconds != b.duration.inSeconds) return false;
@@ -93,7 +102,15 @@ List<List<Track>> groupBySongIdentity(Iterable<Track> tracks) {
 /// Exposed so callers can drive collapse / expansion state (which
 /// song-identities are "expanded" in the table) by string key rather
 /// than by holding Track references.
+///
+/// **Manual override**: when [Track.identityOverride] is set, it
+/// short-circuits the computed key. Two files with the same override
+/// value bucket together regardless of whether the strict 4-field
+/// rule would have paired them. Set by the right-click
+/// "Link with another song" action; cleared via repository write.
 String? songIdentityKey(Track t) {
+  final override = t.identityOverride;
+  if (override != null && override.isNotEmpty) return override;
   if (t.title.isEmpty || t.artist.isEmpty) return null;
   // U+001F (Unit Separator) — never appears in filesystem basenames
   // or ID3 strings on any platform we target, so it can't collide

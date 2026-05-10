@@ -32,6 +32,13 @@ class Track {
 
   String? intelUid;
 
+  /// User-set manual override for song identity. When non-null,
+  /// `songIdentityKey` short-circuits and returns this value instead
+  /// of the computed 4-field key. Lets two files the strict matcher
+  /// missed (e.g., renamed-between-encodes or tag drift) be paired
+  /// manually via the right-click "Link with another song" action.
+  String? identityOverride;
+
   final String path;
   final String filename;
   int filesize;
@@ -62,6 +69,7 @@ class Track {
     required this.uid,
     required this.fingerprint,
     this.intelUid,
+    this.identityOverride,
     required this.path,
     required this.filename,
     required this.sourceId,

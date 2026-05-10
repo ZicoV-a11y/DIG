@@ -6,6 +6,7 @@ import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
+import 'link_track_dialog.dart';
 import 'track_artwork.dart';
 
 class TrackTable extends StatefulWidget {
@@ -888,6 +889,8 @@ class _TrackRow extends StatelessWidget {
         items.add(_revealMenuItem(value: 'reveal:$i', label: label));
       }
     }
+    items.add(const PopupMenuDivider(height: 1));
+    items.add(_linkMenuItem());
 
     final result = await showMenu<String>(
       context: context,
@@ -912,7 +915,37 @@ class _TrackRow extends StatelessWidget {
       if (idx >= 0 && idx < variants.length) {
         await controller.revealVariantInFinder(variants[idx]);
       }
+    } else if (result == 'link' && context.mounted) {
+      final target = await showLinkTrackDialog(
+        context: context,
+        controller: controller,
+        origin: track,
+      );
+      if (target != null) {
+        await controller.linkTracks(track, target);
+      }
     }
+  }
+
+  PopupMenuItem<String> _linkMenuItem() {
+    return const PopupMenuItem<String>(
+      value: 'link',
+      height: 32,
+      child: Row(
+        children: [
+          Icon(
+            Icons.link_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          SizedBox(width: 8),
+          Text(
+            'Link with another song…',
+            style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
+          ),
+        ],
+      ),
+    );
   }
 
   PopupMenuItem<String> _revealMenuItem({

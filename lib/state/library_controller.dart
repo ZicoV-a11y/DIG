@@ -171,16 +171,16 @@ class LibraryController extends ChangeNotifier {
   // Variant-collapse state. When `_groupVariants` is true, the
   // visible-tracks pipeline collapses each song-identity bucket
   // into a single primary row (lowest-quality format wins — MP3 >
-  // FLAC > WAV > AIFF). `_expandedSongIdentities` carries the set
-  // of identity keys whose siblings are currently surfaced as
-  // indented sub-rows. Both invalidate `_visibleCache` when they
-  // change, so the pipeline re-runs.
+  // FLAC > WAV > AIFF). The siblings never appear as their own
+  // table rows; the user gets at them via the right-click "Show in
+  // Finder" submenu (one item per variant) and via aggregated
+  // cell values on the primary row.
   bool _groupVariants = true;
-  final Set<String> _expandedSongIdentities = <String>{};
   // Side-table built each pipeline run: lookup from primary's uid
   // → the bucket's AggregatedTrackView so the table can render
   // aggregated cells (sum plays, blank-on-disagreement BPM/key,
-  // FORMAT label) without re-grouping on every row build.
+  // FORMAT label) and the context-menu can enumerate variants
+  // without re-grouping on every row build.
   Map<String, AggregatedTrackView> _bucketsByPrimaryUid =
       const <String, AggregatedTrackView>{};
 
@@ -747,35 +747,17 @@ class LibraryController extends ChangeNotifier {
       _bucketsByPrimaryUid[primary.uid];
 
   /// `true` when [primary] is the displayed primary of a multi-
-  /// variant bucket — i.e., the row has siblings that can be
-  /// surfaced by toggling expansion.
+  /// variant bucket — used by the right-click handler to decide
+  /// whether to surface a per-format "Show in Finder" submenu.
   bool primaryHasSiblings(Track primary) {
     final view = _bucketsByPrimaryUid[primary.uid];
     return view != null && view.hasSiblings;
-  }
-
-  bool isSongExpanded(String identityKey) =>
-      _expandedSongIdentities.contains(identityKey);
-
-  void toggleSongExpansion(String identityKey) {
-    if (!_expandedSongIdentities.remove(identityKey)) {
-      _expandedSongIdentities.add(identityKey);
-    }
-    // Pipeline output changes (siblings appear/disappear in the
-    // flat list) but the underlying library hasn't, so invalidate
-    // the cache directly without bumping _libraryVersion.
-    _visibleCache = null;
-    notifyListeners();
   }
 
   Future<void> setGroupVariants(bool value) async {
     if (_groupVariants == value) return;
     _groupVariants = value;
     _visibleCache = null;
-    // Expansion state only makes sense while grouping is on. When
-    // the user turns grouping off, clear it so re-enabling starts
-    // from a clean "everything collapsed" state.
-    if (!value) _expandedSongIdentities.clear();
     notifyListeners();
     await repo.setSetting('group_variants', value ? '1' : '0');
   }
@@ -1141,8 +1123,11 @@ class LibraryController extends ChangeNotifier {
 
     if (_groupVariants) {
       // Collapse each song-identity bucket to a single primary row
-      // (lowest-quality format first). `groupBySongIdentity` is
-      // first-seen-stable, so a bucket's position in the visible
+      // (lowest-quality format first). Siblings never appear as
+      // their own rows — the user reaches them via the right-click
+      // "Show in Finder" submenu, which enumerates the bucket's
+      // variants from `_bucketsByPrimaryUid`. `groupBySongIdentity`
+      // is first-seen-stable, so a bucket's position in the visible
       // list is set by whichever variant sorted highest. Within
       // each bucket, `orderBucketByPlaybackPreference` puts the
       // primary at index 0 regardless of sort.
@@ -1154,17 +1139,6 @@ class LibraryController extends ChangeNotifier {
         final primary = ordered.first;
         flat.add(primary);
         views[primary.uid] = AggregatedTrackView(ordered);
-        // When the user has expanded this bucket, emit the
-        // siblings right after the primary so they read as
-        // indented sub-rows in the table.
-        final key = songIdentityKey(primary);
-        if (key != null &&
-            ordered.length > 1 &&
-            _expandedSongIdentities.contains(key)) {
-          for (var i = 1; i < ordered.length; i++) {
-            flat.add(ordered[i]);
-          }
-        }
       }
       _bucketsByPrimaryUid = views;
       result = flat;
@@ -1657,6 +1631,22 @@ class LibraryController extends ChangeNotifier {
   /// reveal the file on the engine. Otherwise the row's own path is
   /// the preferred target, with a fallback to other available
   /// siblings if that file is missing.
+  /// Reveal a specific variant in Finder without the
+  /// currently-playing override or the sibling fallback. Used by
+  /// the multi-variant right-click submenu: when the user explicitly
+  /// picks "Show MP3 in Finder" or "Show AIFF in Finder", honor
+  /// exactly that pick — don't silently substitute the playing file
+  /// or another sibling. If the picked variant is missing on disk,
+  /// no-op (debug-printed).
+  Future<void> revealVariantInFinder(Track t) async {
+    if (!Platform.isMacOS) return;
+    if (!t.isAvailable) {
+      debugPrint('[finder] requested variant is unavailable: ${t.path}');
+      return;
+    }
+    await _runFinderReveal(t.path);
+  }
+
   Future<void> showTrackInstanceInFinder(Track t) async {
     if (_currentTrackUid != null &&
         _currentTrackPath != null &&

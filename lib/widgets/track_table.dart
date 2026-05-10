@@ -6,7 +6,6 @@ import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
-import '../utils/song_identity.dart';
 import 'track_artwork.dart';
 
 class TrackTable extends StatefulWidget {
@@ -605,13 +604,11 @@ Widget _buildRowInner(
   required Color titleColor,
   required FontWeight titleWeight,
 }) {
-  // When grouping by song identity is on, primaries render
-  // aggregated values across their bucket; siblings render their
-  // own per-file values like a non-grouped row. `aggView` is non-
-  // null only for primaries — siblings and ungrouped rows fall
+  // When grouping by song identity is on, primary rows render
+  // aggregated values across their bucket. `aggView` is non-null
+  // only for primaries — single-variant or ungrouped rows fall
   // through to the underlying Track fields.
   final aggView = c.aggregatedViewForPrimary(t);
-  final isBucketPrimary = aggView != null;
   final favorite = aggView?.favorite ?? t.favorite;
   final reviewed = aggView?.reviewed ?? t.reviewed;
 
@@ -712,23 +709,11 @@ Widget _buildRowInner(
         ),
       );
     case 'format':
-      // Primary row with siblings: the cell shows the aggregated
-      // format set (`MP3 · AIFF`) and is the expand/collapse
-      // affordance for the bucket. Single-variant rows and
-      // expanded sibling rows show just their own format label.
-      if (isBucketPrimary && aggView.hasSiblings) {
-        final identityKey = songIdentityKey(t);
-        final expanded =
-            identityKey != null && c.isSongExpanded(identityKey);
-        return _FormatExpandCell(
-          label: aggView.formatLabel,
-          variantCount: aggView.variantCount,
-          expanded: expanded,
-          onTap: identityKey == null
-              ? null
-              : () => c.toggleSongExpansion(identityKey),
-        );
-      }
+      // Plain text in all cases: aggregated `MP3 · AIFF` when the
+      // row is a multi-variant primary, single format label
+      // otherwise. The user reaches the individual variants via
+      // the right-click "Show in Finder" submenu — no inline
+      // expand/collapse here.
       final fmt = aggView?.formatLabel ?? fileFormatLabel(t.filename);
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -736,6 +721,8 @@ Widget _buildRowInner(
           child: Text(
             fmt.isEmpty ? '—' : fmt,
             style: fmt.isEmpty ? _numStyleDim : _numStyle,
+            overflow: TextOverflow.ellipsis,
+            maxLines: 1,
           ),
         ),
       );
@@ -877,6 +864,31 @@ class _TrackRow extends StatelessWidget {
   Future<void> _showContextMenu(BuildContext context, Offset position) async {
     final overlayState = Overlay.of(context);
     final overlayBox = overlayState.context.findRenderObject() as RenderBox;
+
+    // Multi-variant rows surface a per-format reveal item ("Show MP3
+    // in Finder", "Show AIFF in Finder", …) so the user picks
+    // exactly which file to open. Single-variant rows keep the old
+    // flat "Show in Finder" item with its currently-playing
+    // override + fallback semantics.
+    final aggView = controller.aggregatedViewForPrimary(track);
+    final variants = (aggView != null && aggView.hasSiblings)
+        ? aggView.variants
+        : const <Track>[];
+
+    final items = <PopupMenuEntry<String>>[];
+    if (variants.isEmpty) {
+      items.add(_revealMenuItem(value: 'reveal', label: 'Show in Finder'));
+    } else {
+      for (var i = 0; i < variants.length; i++) {
+        final v = variants[i];
+        final format = fileFormatLabel(v.filename);
+        final label = format.isEmpty
+            ? 'Show variant ${i + 1} in Finder'
+            : 'Show $format in Finder';
+        items.add(_revealMenuItem(value: 'reveal:$i', label: label));
+      }
+    }
+
     final result = await showMenu<String>(
       context: context,
       position: RelativeRect.fromRect(
@@ -889,52 +901,61 @@ class _TrackRow extends StatelessWidget {
         borderRadius: BorderRadius.zero,
         side: const BorderSide(color: AppColors.border),
       ),
-      items: const [
-        PopupMenuItem<String>(
-          value: 'reveal',
-          height: 32,
-          child: Row(
-            children: [
-              Icon(
-                Icons.folder_open_rounded,
-                size: 14,
-                color: AppColors.textSecondary,
-              ),
-              SizedBox(width: 8),
-              Text(
-                'Show in Finder',
-                style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
-              ),
-            ],
-          ),
-        ),
-      ],
+      items: items,
     );
+
+    if (result == null) return;
     if (result == 'reveal') {
       await controller.showTrackInstanceInFinder(track);
+    } else if (result.startsWith('reveal:')) {
+      final idx = int.parse(result.substring('reveal:'.length));
+      if (idx >= 0 && idx < variants.length) {
+        await controller.revealVariantInFinder(variants[idx]);
+      }
     }
+  }
+
+  PopupMenuItem<String> _revealMenuItem({
+    required String value,
+    required String label,
+  }) {
+    return PopupMenuItem<String>(
+      value: value,
+      height: 32,
+      child: Row(
+        children: [
+          const Icon(
+            Icons.folder_open_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          const SizedBox(width: 8),
+          Text(
+            label,
+            style:
+                const TextStyle(color: AppColors.textPrimary, fontSize: 12),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // Surface "currently playing" on a collapsed bucket's primary if
-    // any variant in its bucket is the current track. When the
-    // bucket is expanded, the actual playing variant has its own
-    // row and the primary stays unhighlighted (the existing strict
-    // uid match handles that path). When grouping is off, this
+    // Surface "currently playing" on a bucket's primary if any
+    // variant in its bucket is the current track — siblings never
+    // appear as their own rows, so the primary has to own the
+    // highlight on behalf of the whole bucket. When grouping is
+    // off, `aggregatedViewForPrimary` returns null and this
     // reduces to a plain uid match.
     final currentUid = controller.currentTrackUid;
     bool isCurrent = currentUid != null && currentUid == track.uid;
     if (!isCurrent && currentUid != null) {
       final aggView = controller.aggregatedViewForPrimary(track);
-      if (aggView != null && aggView.hasSiblings) {
-        final identityKey = songIdentityKey(track);
-        final collapsed =
-            identityKey == null || !controller.isSongExpanded(identityKey);
-        if (collapsed &&
-            aggView.variants.any((v) => v.uid == currentUid)) {
-          isCurrent = true;
-        }
+      if (aggView != null &&
+          aggView.hasSiblings &&
+          aggView.variants.any((v) => v.uid == currentUid)) {
+        isCurrent = true;
       }
     }
     final isLoading = isCurrent && controller.isLoadingTrack;
@@ -1172,68 +1193,6 @@ class _TitleCell extends StatelessWidget {
         fontSize: 13,
         fontWeight: titleWeight,
         height: 1.0,
-      ),
-    );
-  }
-}
-
-/// FORMAT cell for a bucket primary that has siblings. Renders the
-/// aggregated format label with a leading chevron and toggles bucket
-/// expansion on tap. Single-variant primaries and expanded sibling
-/// rows render as plain text — this widget is only used when the
-/// bucket is collapsable / expandable.
-class _FormatExpandCell extends StatelessWidget {
-  final String label;
-  final int variantCount;
-  final bool expanded;
-  final VoidCallback? onTap;
-
-  const _FormatExpandCell({
-    required this.label,
-    required this.variantCount,
-    required this.expanded,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: expanded
-          ? 'Collapse $variantCount variants'
-          : 'Show $variantCount variants',
-      waitDuration: const Duration(milliseconds: 600),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: onTap,
-          hoverColor: AppColors.hoverRow,
-          focusColor: AppColors.focusOverlay,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  expanded
-                      ? Icons.keyboard_arrow_down_rounded
-                      : Icons.keyboard_arrow_right_rounded,
-                  size: 14,
-                  color: AppColors.textSecondary,
-                ),
-                const SizedBox(width: 2),
-                Flexible(
-                  child: Text(
-                    label,
-                    style: _numStyle,
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
       ),
     );
   }

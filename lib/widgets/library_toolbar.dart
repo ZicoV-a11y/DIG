@@ -42,40 +42,76 @@ class LibraryToolbar extends StatelessWidget {
           Expanded(
             child: SizedBox(
               height: 32,
-              child: TextField(
-                controller: searchTextController,
-                focusNode: searchFocusNode,
-                onChanged: controller.setSearchQuery,
-                onTapOutside: (_) => searchFocusNode.unfocus(),
-                style: const TextStyle(fontSize: 13),
-                decoration: InputDecoration(
-                  hintText: 'Search title or artist…',
-                  hintStyle: const TextStyle(
-                    color: AppColors.textSecondary,
-                    fontSize: 13,
-                  ),
-                  prefixIcon: const Icon(Icons.search, size: 14),
-                  prefixIconConstraints: const BoxConstraints(
-                    minWidth: 32,
-                    minHeight: 32,
-                  ),
-                  isDense: true,
-                  filled: true,
-                  fillColor: AppColors.surface,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 6),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.zero,
-                    borderSide: const BorderSide(color: AppColors.border),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.zero,
-                    borderSide: const BorderSide(color: AppColors.border),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.zero,
-                    borderSide: const BorderSide(color: AppColors.accent),
-                  ),
-                ),
+              child: ValueListenableBuilder<TextEditingValue>(
+                // Listening to the TextEditingController itself (which
+                // is a ValueNotifier<TextEditingValue>) keeps the clear
+                // button's visibility in lockstep with the field text
+                // without needing the parent toolbar to be Stateful or
+                // re-rebuilding on every controller notification.
+                valueListenable: searchTextController,
+                builder: (ctx, value, _) {
+                  final hasText = value.text.isNotEmpty;
+                  return TextField(
+                    controller: searchTextController,
+                    focusNode: searchFocusNode,
+                    onChanged: controller.setSearchQuery,
+                    onTapOutside: (_) => searchFocusNode.unfocus(),
+                    style: const TextStyle(fontSize: 13),
+                    decoration: InputDecoration(
+                      hintText: 'Search title or artist…',
+                      hintStyle: const TextStyle(
+                        color: AppColors.textSecondary,
+                        fontSize: 13,
+                      ),
+                      prefixIcon: hasText
+                          ? Tooltip(
+                              message: 'Clear search (Esc)',
+                              waitDuration:
+                                  const Duration(milliseconds: 600),
+                              child: InkWell(
+                                onTap: () {
+                                  searchTextController.clear();
+                                  controller.setSearchQuery('');
+                                },
+                                child: const Icon(
+                                  Icons.close_rounded,
+                                  size: 14,
+                                  color: AppColors.textSecondary,
+                                ),
+                              ),
+                            )
+                          : const Icon(Icons.search, size: 14),
+                      prefixIconConstraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      suffixIconConstraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      isDense: true,
+                      filled: true,
+                      fillColor: AppColors.surface,
+                      contentPadding:
+                          const EdgeInsets.symmetric(vertical: 6),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.zero,
+                        borderSide:
+                            const BorderSide(color: AppColors.border),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.zero,
+                        borderSide:
+                            const BorderSide(color: AppColors.border),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.zero,
+                        borderSide:
+                            const BorderSide(color: AppColors.accent),
+                      ),
+                    ),
+                  );
+                },
               ),
             ),
           ),

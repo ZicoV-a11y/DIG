@@ -23,12 +23,19 @@ import '../models/track.dart';
 /// strict 4-field rule.
 ///
 /// All four conditions must hold (case-sensitive, no whitespace
-/// normalization, no unicode folding, exact text and exact duration):
+/// normalization, no unicode folding):
 ///
 ///   - basename without extension
 ///   - canonical title (from ID3 / Vorbis, via `Track.title`)
 ///   - canonical artist (from ID3 / Vorbis, via `Track.artist`)
-///   - duration in milliseconds
+///   - duration rounded to whole seconds (`Duration.inSeconds`)
+///
+/// Title / artist / filename are matched character-for-character.
+/// Duration uses truncated-to-seconds equality so that codec rounding
+/// between MP3 and AIFF (different frame / sample alignments routinely
+/// report durations a few hundred ms apart) doesn't block obvious
+/// variant matches. Real radio-edit / extended-mix pairs differ by
+/// many seconds and still fail the rule.
 ///
 /// Tracks with empty canonical title or artist never match anything,
 /// even each other — without metadata there's no song identity to
@@ -37,7 +44,7 @@ bool sameSongIdentity(Track a, Track b) {
   if (identical(a, b)) return true;
   if (a.title.isEmpty || a.artist.isEmpty) return false;
   if (b.title.isEmpty || b.artist.isEmpty) return false;
-  if (a.duration != b.duration) return false;
+  if (a.duration.inSeconds != b.duration.inSeconds) return false;
   if (a.title != b.title) return false;
   if (a.artist != b.artist) return false;
   return _basenameNoExt(a.filename) == _basenameNoExt(b.filename);
@@ -93,7 +100,7 @@ String? songIdentityKey(Track t) {
   return '${_basenameNoExt(t.filename)}$sep'
       '${t.title}$sep'
       '${t.artist}$sep'
-      '${t.duration.inMilliseconds}';
+      '${t.duration.inSeconds}';
 }
 
 String _basenameNoExt(String filename) {

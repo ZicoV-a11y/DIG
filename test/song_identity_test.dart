@@ -63,18 +63,40 @@ void main() {
       expect(sameSongIdentity(a, b), isFalse);
     });
 
-    test('duration mismatch by 1ms does not match (exact)', () {
+    test('sub-second duration deltas still match (codec rounding)', () {
+      // MP3 vs AIFF decoders report durations that differ by tens or
+      // hundreds of ms for the same master because MP3 frame counts
+      // and PCM sample counts don't align cleanly. The rule uses
+      // truncated-to-seconds equality so these collapse.
+      final mp3 = _t(
+        filename: 'x.mp3',
+        title: 'T',
+        artist: 'A',
+        duration: const Duration(milliseconds: 482234),
+      );
+      final aiff = _t(
+        filename: 'x.aiff',
+        title: 'T',
+        artist: 'A',
+        duration: const Duration(milliseconds: 482890),
+      );
+      expect(sameSongIdentity(mp3, aiff), isTrue);
+    });
+
+    test('whole-second duration delta does NOT match', () {
+      // Radio-edit / extended-mix pairs differ by many seconds and
+      // still correctly fail the rule.
       final a = _t(
         filename: 'x.mp3',
         title: 'T',
         artist: 'A',
-        duration: const Duration(milliseconds: 482000),
+        duration: const Duration(milliseconds: 482999),
       );
       final b = _t(
         filename: 'x.aiff',
         title: 'T',
         artist: 'A',
-        duration: const Duration(milliseconds: 482001),
+        duration: const Duration(milliseconds: 483001),
       );
       expect(sameSongIdentity(a, b), isFalse);
     });

@@ -1700,12 +1700,15 @@ class LibraryController extends ChangeNotifier {
     final t = _trackByUid(uid);
     if (t == null) return;
     final bucket = variantsFor(t);
-    // The user sees the AGGREGATE on the row, so toggling flips
-    // from whatever the aggregate shows — not from any individual
-    // variant's flag.
-    final currentFavorite =
-        AggregatedTrackView(bucket).favorite;
-    final next = !currentFavorite;
+    // Flip against the value shown on the row the user actually
+    // clicked — not the bucket aggregate. With grouping ON every
+    // variant in the bucket has the same favorite (consolidation
+    // mirrors them) so the two are equivalent. With grouping OFF
+    // they can diverge if the user pre-favorited one variant
+    // before slice 3 shipped: clicking the as-yet-unfavorited
+    // sibling expects to turn the star ON, not OFF, and toggling
+    // against the aggregate would silently un-favorite.
+    final next = !t.favorite;
 
     // Optimistic in-memory flip on every bucket variant so the UI
     // updates instantly. _writeBucketIntelligence below will
@@ -1727,8 +1730,11 @@ class LibraryController extends ChangeNotifier {
     final t = _trackByUid(uid);
     if (t == null) return;
     final bucket = variantsFor(t);
-    final view = AggregatedTrackView(bucket);
-    final reviewed = view.reviewed;
+    // Same reasoning as toggleFavorite: flip against the clicked
+    // row's reviewed state, not the bucket aggregate. Pre-slice-3
+    // per-variant divergence would otherwise cause the click to
+    // un-review when the user intended to review.
+    final reviewed = t.reviewed;
     final nextCumulativeMs = reviewed ? 0 : 3000;
 
     // Optimistic in-memory update across the bucket.

@@ -16,6 +16,7 @@ import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
 import '../utils/aggregated_track_view.dart';
+import '../utils/file_format.dart';
 import '../utils/key_normalizer.dart';
 import '../utils/song_identity.dart';
 
@@ -96,6 +97,10 @@ class LibraryController extends ChangeNotifier {
   bool _isScanning = false;
   TrackSortColumn _sortColumn = TrackSortColumn.title;
   bool _sortAscending = true;
+  // Index into `formatSortLeads` — which format leads the FORMAT
+  // column's sort order. Cycles 0..N on each header click while
+  // FORMAT is the active sort column. Other columns ignore it.
+  int _sortFormatMode = 0;
 
   String? _currentTrackUid;
   // Path of the file the engine is actually playing. Held alongside
@@ -1146,15 +1151,17 @@ class LibraryController extends ChangeNotifier {
         case TrackSortColumn.duration:
           return dir * a.duration.compareTo(b.duration);
         case TrackSortColumn.format:
-          // Sort by the aggregated label so `MP3 · AIFF` buckets sort
-          // together rather than being scattered by their primary's
-          // single-format string.
-          final af = va.formatLabel;
-          final bf = vb.formatLabel;
-          if (af.isEmpty && bf.isEmpty) return 0;
-          if (af.isEmpty) return 1;
-          if (bf.isEmpty) return -1;
-          return dir * af.compareTo(bf);
+          // Each click on the FORMAT header rotates which format
+          // leads. The bucket's sort key is the best (lowest) rank
+          // any of its formats achieves under the current rotation.
+          // Direction toggle doesn't apply to FORMAT — the click
+          // advances the lead instead of flipping asc/desc.
+          final ar = _formatBucketRank(va);
+          final br = _formatBucketRank(vb);
+          if (ar == _unknownFormatRank && br == _unknownFormatRank) return 0;
+          if (ar == _unknownFormatRank) return 1;
+          if (br == _unknownFormatRank) return -1;
+          return ar.compareTo(br);
         case TrackSortColumn.plays:
           return dir * va.playCount.compareTo(vb.playCount);
         case TrackSortColumn.lastPlayed:
@@ -1242,6 +1249,36 @@ class LibraryController extends ChangeNotifier {
     final t = rows.removeAt(naturalIdx);
     final insertAt = _lockedCurrentIndex!.clamp(0, rows.length);
     rows.insert(insertAt, t);
+  }
+
+  /// Sentinel rank for a bucket that contains no format in
+  /// `formatSortLeads`. Such buckets sort to the very end of the
+  /// FORMAT-column ordering regardless of the current lead.
+  static const int _unknownFormatRank = 1 << 20;
+
+  /// Rank a bucket under the current FORMAT-column sort rotation.
+  /// Returns the lowest position any of its formats occupies in the
+  /// rotated priority list — so a bucket containing the current
+  /// leading format always sorts to position 0, and the next-best
+  /// format wins among the remainder. Unknown-format buckets
+  /// (`fileFormatLabel` returned empty or a non-leads value) return
+  /// [_unknownFormatRank].
+  int _formatBucketRank(AggregatedTrackView view) {
+    const leadCount = 4; // matches formatSortLeads.length
+    // Build the rotated priority order: starting at the current
+    // mode, wrapping around the list. mode 0 = [MP3, FLAC, WAV, AIFF],
+    // mode 1 = [FLAC, WAV, AIFF, MP3], etc.
+    int best = _unknownFormatRank;
+    for (final t in view.variants) {
+      final f = fileFormatLabel(t.filename);
+      if (f.isEmpty) continue;
+      final origIdx = formatSortLeads.indexOf(f);
+      if (origIdx < 0) continue;
+      final rotatedIdx =
+          (origIdx - _sortFormatMode + leadCount) % leadCount;
+      if (rotatedIdx < best) best = rotatedIdx;
+    }
+    return best;
   }
 
   void _markLibraryDirty() {
@@ -1569,12 +1606,43 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Ordered list of which format leads the FORMAT-column sort.
+  /// Each click on the FORMAT header advances through this list,
+  /// wrapping at the end. The matcher / display still prefers the
+  /// `aggregated_track_view._formatPreferenceOrder` for playback;
+  /// this is purely a sort-visualization knob.
+  static const List<String> formatSortLeads = [
+    'MP3',
+    'FLAC',
+    'WAV',
+    'AIFF',
+  ];
+
+  int get sortFormatMode => _sortFormatMode;
+
+  /// The format that leads the current FORMAT-column sort, e.g.
+  /// `'MP3'`. Buckets containing this format sort to the top;
+  /// remaining buckets fall through to the rest of [formatSortLeads]
+  /// in order. Only meaningful when the FORMAT column is the active
+  /// sort.
+  String get sortFormatLead => formatSortLeads[_sortFormatMode];
+
   void setSort(TrackSortColumn column) {
     if (_sortColumn == column) {
-      _sortAscending = !_sortAscending;
+      // FORMAT cycles through `formatSortLeads` instead of the
+      // usual asc/desc flip — each click promotes the next format
+      // to the top of the sort.
+      if (column == TrackSortColumn.format) {
+        _sortFormatMode = (_sortFormatMode + 1) % formatSortLeads.length;
+      } else {
+        _sortAscending = !_sortAscending;
+      }
     } else {
       _sortColumn = column;
       _sortAscending = true;
+      if (column == TrackSortColumn.format) {
+        _sortFormatMode = 0;
+      }
     }
     _invalidateLock();
     _markLibraryDirty();

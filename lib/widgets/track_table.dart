@@ -445,6 +445,13 @@ class _HeaderCell extends StatelessWidget {
         : align == TextAlign.center
             ? MainAxisAlignment.center
             : MainAxisAlignment.start;
+    // FORMAT cycles through priority leads instead of asc/desc, so
+    // its header shows the leading format (e.g., "FORMAT · MP3")
+    // when active so the user can see which lead is current.
+    final isFormatColumn = column == TrackSortColumn.format;
+    final displayLabel = (isFormatColumn && isSorted)
+        ? '$label · ${controller.sortFormatLead}'
+        : label;
 
     return InkWell(
         onTap: () => controller.setSort(column),
@@ -457,7 +464,7 @@ class _HeaderCell extends StatelessWidget {
             children: [
               Flexible(
                 child: Text(
-                  label,
+                  displayLabel,
                   overflow: TextOverflow.ellipsis,
                   textAlign: align,
                   style: const TextStyle(
@@ -468,7 +475,7 @@ class _HeaderCell extends StatelessWidget {
                   ),
                 ),
               ),
-              if (isSorted) ...[
+              if (isSorted && !isFormatColumn) ...[
                 const SizedBox(width: 2),
                 Icon(
                   ascending

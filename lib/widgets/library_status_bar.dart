@@ -216,25 +216,74 @@ class _LibraryTally extends StatelessWidget {
     final unreviewed = controller.unreviewedSongCount;
     return Row(
       children: [
-        _TallyChunk(label: 'files', value: total),
+        _TallyChunk(
+          label: 'files',
+          value: total,
+          tooltip:
+              'Total file rows in the library — every MP3, AIFF, '
+              'WAV, etc. counted separately.',
+        ),
         const SizedBox(width: 12),
-        _TallyChunk(label: 'songs', value: songs),
+        _TallyChunk(
+          label: 'songs',
+          value: songs,
+          tooltip:
+              'Distinct song identities. Files with identical '
+              'filename (minus extension), artist, title, and '
+              'duration count as one song regardless of format.',
+        ),
         // Files − songs. Only worth surfacing when the user
         // actually has duplicates / format variants in the library.
         if (variants > 0) ...[
           const SizedBox(width: 12),
-          _TallyChunk(label: 'variants', value: variants),
+          _TallyChunk(
+            label: 'variants',
+            value: variants,
+            tooltip:
+                'Files − songs. How many duplicate or alternate-'
+                'format files (MP3 + AIFF, etc.) you hold beyond '
+                'one canonical file per song.',
+          ),
         ],
         const SizedBox(width: 12),
-        _TallyChunk(label: 'enriched', value: enriched),
+        _TallyChunk(
+          label: 'enriched',
+          value: enriched,
+          tooltip:
+              'Files whose ID3 / Vorbis metadata has been read. '
+              'Pending files show filename-derived artist / title '
+              'until they enrich.',
+        ),
         if (missing > 0) ...[
           const SizedBox(width: 12),
-          _TallyChunk(label: 'missing', value: missing, warning: true),
+          _TallyChunk(
+            label: 'missing',
+            value: missing,
+            warning: true,
+            tooltip:
+                'Files that were on disk during a previous scan '
+                'but were not found on the last scan. Intelligence '
+                '(favorite, plays, reviews) is preserved.',
+          ),
         ],
         const SizedBox(width: 12),
-        _TallyChunk(label: 'reviewed', value: reviewed),
+        _TallyChunk(
+          label: 'reviewed',
+          value: reviewed,
+          tooltip:
+              'Songs you have listened to past the review threshold '
+              '(currently 3 seconds cumulative). Counted at the song '
+              'level — any variant crossing the threshold counts the '
+              'whole song.',
+        ),
         const SizedBox(width: 12),
-        _TallyChunk(label: 'unreviewed', value: unreviewed),
+        _TallyChunk(
+          label: 'unreviewed',
+          value: unreviewed,
+          tooltip:
+              'Songs you have not yet listened to past the review '
+              'threshold. Equals songs − reviewed.',
+        ),
       ],
     );
   }
@@ -244,15 +293,17 @@ class _TallyChunk extends StatelessWidget {
   final String label;
   final int value;
   final bool warning;
+  final String? tooltip;
   const _TallyChunk({
     required this.label,
     required this.value,
     this.warning = false,
+    this.tooltip,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Row(
+    final row = Row(
       children: [
         Text(
           '$value',
@@ -273,6 +324,12 @@ class _TallyChunk extends StatelessWidget {
           ),
         ),
       ],
+    );
+    if (tooltip == null) return row;
+    return Tooltip(
+      message: tooltip!,
+      waitDuration: const Duration(milliseconds: 400),
+      child: row,
     );
   }
 }

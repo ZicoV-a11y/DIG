@@ -15,6 +15,7 @@ import '../services/library_repository.dart';
 import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
+import '../utils/file_format.dart';
 import '../utils/key_normalizer.dart';
 
 enum TrackSortColumn {
@@ -25,6 +26,7 @@ enum TrackSortColumn {
   bpm,
   key,
   duration,
+  format,
   plays,
   lastPlayed,
 }
@@ -132,6 +134,7 @@ class LibraryController extends ChangeNotifier {
   double _colBpmWidth = 38;
   double _colKeyWidth = 50;
   double _colTimeWidth = 50;
+  double _colFormatWidth = 56;
   double _colPlaysWidth = 52;
   double _colLastPlayedWidth = 90;
   // Text columns: persisted absolute widths.
@@ -146,6 +149,7 @@ class LibraryController extends ChangeNotifier {
     'bpm',
     'key',
     'time',
+    'format',
     'plays',
     'lastPlayed',
   ];
@@ -278,6 +282,8 @@ class LibraryController extends ChangeNotifier {
         double.tryParse(settings['col_title_width'] ?? '') ?? _colTitleWidth;
     _colArtistWidth =
         double.tryParse(settings['col_artist_width'] ?? '') ?? _colArtistWidth;
+    _colFormatWidth =
+        double.tryParse(settings['col_format_width'] ?? '') ?? _colFormatWidth;
     final orderStr = settings['column_order'];
     if (orderStr != null && orderStr.isNotEmpty) {
       final parsed = orderStr
@@ -702,6 +708,7 @@ class LibraryController extends ChangeNotifier {
   double get colBpmWidth => _colBpmWidth;
   double get colKeyWidth => _colKeyWidth;
   double get colTimeWidth => _colTimeWidth;
+  double get colFormatWidth => _colFormatWidth;
   double get colPlaysWidth => _colPlaysWidth;
   double get colLastPlayedWidth => _colLastPlayedWidth;
   double get colTitleWidth => _colTitleWidth;
@@ -804,6 +811,10 @@ class LibraryController extends ChangeNotifier {
       case 'time':
         clamped = width.clamp(40.0, 120.0);
         _colTimeWidth = clamped;
+        break;
+      case 'format':
+        clamped = width.clamp(44.0, 120.0);
+        _colFormatWidth = clamped;
         break;
       case 'plays':
         clamped = width.clamp(36.0, 120.0);
@@ -1020,6 +1031,16 @@ class LibraryController extends ChangeNotifier {
           return dir * ak.compareTo(bk);
         case TrackSortColumn.duration:
           return dir * a.duration.compareTo(b.duration);
+        case TrackSortColumn.format:
+          // Empty / unrecognised extensions sort to the bottom in
+          // both directions, matching the key / artist / lastPlayed
+          // empty-bucket convention.
+          final af = fileFormatLabel(a.filename);
+          final bf = fileFormatLabel(b.filename);
+          if (af.isEmpty && bf.isEmpty) return 0;
+          if (af.isEmpty) return 1;
+          if (bf.isEmpty) return -1;
+          return dir * af.compareTo(bf);
         case TrackSortColumn.plays:
           return dir * a.playCount.compareTo(b.playCount);
         case TrackSortColumn.lastPlayed:

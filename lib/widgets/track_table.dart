@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
+import '../utils/file_format.dart';
 import 'track_artwork.dart';
 
 class TrackTable extends StatefulWidget {
@@ -504,6 +505,8 @@ double _columnWidth(String col, LibraryController c) {
       return c.colKeyWidth;
     case 'time':
       return c.colTimeWidth;
+    case 'format':
+      return c.colFormatWidth;
     case 'plays':
       return c.colPlaysWidth;
     case 'lastPlayed':
@@ -563,6 +566,13 @@ Widget _buildHeaderInner(String col, LibraryController c) {
       return _HeaderCell(
         label: 'TIME',
         column: TrackSortColumn.duration,
+        controller: c,
+        align: TextAlign.center,
+      );
+    case 'format':
+      return _HeaderCell(
+        label: 'FORMAT',
+        column: TrackSortColumn.format,
         controller: c,
         align: TextAlign.center,
       );
@@ -684,6 +694,17 @@ Widget _buildRowInner(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(
           child: Text(_formatDuration(t.duration), style: _numStyle),
+        ),
+      );
+    case 'format':
+      final fmt = fileFormatLabel(t.filename);
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4),
+        child: Center(
+          child: Text(
+            fmt.isEmpty ? '—' : fmt,
+            style: fmt.isEmpty ? _numStyleDim : _numStyle,
+          ),
         ),
       );
     case 'plays':

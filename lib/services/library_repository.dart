@@ -503,6 +503,154 @@ class LibraryRepository {
     });
   }
 
+  /// Force every `indexed_files` row whose path is in [paths] (the
+  /// song-identity bucket: same basename-no-ext + title + artist +
+  /// duration-in-seconds) to share a single canonical `tracks` row.
+  ///
+  /// Three cases:
+  ///   - **No intel yet**: create a new `tracks` row for the first
+  ///     path and point every variant at it. Returns the new uid.
+  ///   - **One intel uid already shared**: every variant points at
+  ///     it already (or is re-pointed). Returns that uid.
+  ///   - **Multiple distinct intel uids**: pick a canonical (highest
+  ///     play count, ties broken by lexicographic uid for
+  ///     determinism), merge the others' rows into it
+  ///     (OR favorite · sum playCount · sum cumulativeMs · max
+  ///     lastPlayedAt), delete the orphans, re-point every variant
+  ///     at canonical. Returns canonical uid.
+  ///
+  /// The merge is OR-favorite / sum-listening / max-recency on
+  /// purpose: variant-level intelligence accumulated separately
+  /// before this consolidation existed; sum-listening reflects the
+  /// total time the user spent on the song. Whether to call this
+  /// destructive matters only if the user ever set conflicting
+  /// favorites on individual variants — which the UI never let them
+  /// do (favorite was always on a single bucket primary row); the
+  /// only way to land in that state is via direct DB editing.
+  ///
+  /// Returns `null` only if [paths] is empty or no `indexed_files`
+  /// rows match (shouldn't happen — caller treats as no-op).
+  Future<String?> consolidateBucketIntelligence(List<String> paths) async {
+    if (paths.isEmpty) return null;
+    return _db.transaction<String?>((txn) async {
+      final placeholders = List.filled(paths.length, '?').join(',');
+      final rows = await txn.query(
+        'indexed_files',
+        columns: ['uid', 'fingerprint', 'path', 'intel_uid'],
+        where: 'path IN ($placeholders)',
+        whereArgs: paths,
+      );
+      if (rows.isEmpty) return null;
+
+      // Collect the set of distinct existing intel uids in this
+      // bucket. Each one corresponds to a `tracks` row.
+      final distinctUids = <String>{
+        for (final r in rows)
+          if ((r['intel_uid'] as String?) != null)
+            r['intel_uid'] as String,
+      };
+
+      String canonicalUid;
+      if (distinctUids.isEmpty) {
+        // Promote the first row in the bucket: create a fresh
+        // `tracks` row keyed by its uid. Subsequent variants will
+        // be pointed at it below.
+        canonicalUid = rows.first['uid'] as String;
+        final fingerprint = rows.first['fingerprint'] as String;
+        await txn.insert('tracks', {
+          'uid': canonicalUid,
+          'fingerprint': fingerprint,
+          'created_at': DateTime.now().millisecondsSinceEpoch,
+          'favorite': 0,
+          'play_count': 0,
+          'cumulative_ms': 0,
+          'last_played_at': null,
+        }, conflictAlgorithm: ConflictAlgorithm.ignore);
+      } else if (distinctUids.length == 1) {
+        canonicalUid = distinctUids.first;
+      } else {
+        // Multiple distinct intel records — merge them into one.
+        // Copy out of sqflite's read-only `QueryResultSet` so we can
+        // sort + iterate.
+        final intelRows = List<Map<String, Object?>>.from(
+          await txn.query(
+            'tracks',
+            where:
+                'uid IN (${List.filled(distinctUids.length, '?').join(',')})',
+            whereArgs: distinctUids.toList(),
+          ),
+        );
+        // Pick canonical: highest play count wins; tie → lowest uid
+        // alphabetically (deterministic across runs).
+        intelRows.sort((a, b) {
+          final pa = (a['play_count'] as int?) ?? 0;
+          final pb = (b['play_count'] as int?) ?? 0;
+          if (pa != pb) return pb.compareTo(pa); // desc
+          return (a['uid'] as String).compareTo(b['uid'] as String);
+        });
+        canonicalUid = intelRows.first['uid'] as String;
+
+        // Aggregate the merge.
+        var favorite = false;
+        var playCount = 0;
+        var cumulativeMs = 0;
+        int? lastPlayedAt;
+        for (final r in intelRows) {
+          if (((r['favorite'] as int?) ?? 0) != 0) favorite = true;
+          playCount += (r['play_count'] as int?) ?? 0;
+          cumulativeMs += (r['cumulative_ms'] as int?) ?? 0;
+          final lp = r['last_played_at'] as int?;
+          if (lp != null && (lastPlayedAt == null || lp > lastPlayedAt)) {
+            lastPlayedAt = lp;
+          }
+        }
+
+        // Write merged values to canonical.
+        await txn.update(
+          'tracks',
+          {
+            'favorite': favorite ? 1 : 0,
+            'play_count': playCount,
+            'cumulative_ms': cumulativeMs,
+            'last_played_at': lastPlayedAt,
+          },
+          where: 'uid = ?',
+          whereArgs: [canonicalUid],
+        );
+
+        // Delete orphans + re-point any indexed_files rows that
+        // still point at them (siblings outside this bucket — e.g.,
+        // literal fingerprint-duplicates of a non-canonical variant).
+        final orphanUids =
+            distinctUids.where((u) => u != canonicalUid).toList();
+        final orphanPlaceholders =
+            List.filled(orphanUids.length, '?').join(',');
+        await txn.update(
+          'indexed_files',
+          {'intel_uid': canonicalUid},
+          where: 'intel_uid IN ($orphanPlaceholders)',
+          whereArgs: orphanUids,
+        );
+        await txn.delete(
+          'tracks',
+          where: 'uid IN ($orphanPlaceholders)',
+          whereArgs: orphanUids,
+        );
+      }
+
+      // Final sweep: any bucket variants still NULL get pointed at
+      // canonical.
+      await txn.update(
+        'indexed_files',
+        {'intel_uid': canonicalUid},
+        where: 'path IN ($placeholders) AND intel_uid IS NULL',
+        whereArgs: paths,
+      );
+
+      return canonicalUid;
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Intelligence export / import (cross-machine portability).
   // ---------------------------------------------------------------------------

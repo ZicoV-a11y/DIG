@@ -1629,67 +1629,125 @@ class LibraryController extends ChangeNotifier {
   }
 
   // ---------------------------------------------------------------------------
-  // Intelligence-mutating actions (lazy promotion).
-  // Each user-driven write goes: in-memory mutation → promote → persist.
+  // Intelligence-mutating actions (lazy promotion + bucket consolidation).
+  // Each user-driven write goes:
+  //   resolve bucket → consolidate intel → mutate canonical → mirror
+  //   in-memory across every Track sharing that intel uid.
+  // The consolidation step (slice 3) ensures the song-identity bucket
+  // shares a single `tracks` row, so favorite / play count / cumulative
+  // listening / last-played stay coherent across format variants
+  // regardless of which row the user interacted with.
   // ---------------------------------------------------------------------------
 
-  Future<void> _ensurePromoted(Track t) async {
-    if (t.intelUid != null) return;
-    final intelUid = await repo.promoteToIntelligence(t.path);
-    if (intelUid == null) return;
-    t.intelUid = intelUid;
-    // If we just reconnected to an existing tracks row (ghost
-    // intelligence from a prior session — e.g. user removed +
-    // re-added the source), pull its favorite / playCount /
-    // cumulativeMs / lastPlayedAt back into the in-memory Track.
-    // Without this, the row would show defaults until a full
-    // reload. Cheap: one indexed lookup by uid.
-    final intel = await repo.fetchIntelligence(intelUid);
-    if (intel != null) {
-      t.favorite = intel.favorite;
-      t.playCount = intel.playCount;
-      t.cumulativeListened = Duration(milliseconds: intel.cumulativeMs);
-      if (intel.lastPlayedAt != null) {
-        t.lastPlayedAt =
-            DateTime.fromMillisecondsSinceEpoch(intel.lastPlayedAt!);
-      }
-      _markLibraryDirty();
+  /// Every in-memory Track sharing [t]'s song identity. Returns just
+  /// [t] when the track has empty title/artist (no identity to group
+  /// on) or when no siblings exist. Linear over `_tracks`; called
+  /// only on mutation, so the cost is negligible.
+  List<Track> variantsFor(Track t) {
+    final key = songIdentityKey(t);
+    if (key == null) return [t];
+    final out = <Track>[];
+    for (final candidate in _tracks) {
+      if (songIdentityKey(candidate) == key) out.add(candidate);
     }
+    return out.isEmpty ? [t] : out;
+  }
+
+  /// Run [mutate] against the canonical intel uid for [origin]'s
+  /// bucket, then mirror canonical state back to every in-memory
+  /// Track that points at it. Returns the canonical uid (`null` if
+  /// promotion failed — caller should treat as a no-op).
+  ///
+  /// `mutate` receives the canonical uid and is expected to issue
+  /// the `repo.updateIntelligence` write itself. After it returns,
+  /// `fetchIntelligence` reads the now-current values and the
+  /// helper propagates them to all in-memory tracks sharing the
+  /// uid — including bucket variants AND any literal fingerprint
+  /// duplicates (which may not be in the same song-identity bucket
+  /// but already share intel via the older fingerprint-sharing path).
+  Future<String?> _writeBucketIntelligence(
+    Track origin,
+    Future<void> Function(String canonicalUid) mutate,
+  ) async {
+    final bucket = variantsFor(origin);
+    final canonical = await repo.consolidateBucketIntelligence(
+      bucket.map((t) => t.path).toList(),
+    );
+    if (canonical == null) return null;
+    // Mirror the canonical uid onto every bucket variant before
+    // running the mutation — keeps the in-memory linkage current
+    // even if the mutate call throws.
+    for (final v in bucket) {
+      v.intelUid = canonical;
+    }
+    await mutate(canonical);
+    final intel = await repo.fetchIntelligence(canonical);
+    if (intel != null) {
+      for (final t in _tracks) {
+        if (t.intelUid != canonical) continue;
+        t.favorite = intel.favorite;
+        t.playCount = intel.playCount;
+        t.cumulativeListened = Duration(milliseconds: intel.cumulativeMs);
+        t.lastPlayedAt = intel.lastPlayedAt != null
+            ? DateTime.fromMillisecondsSinceEpoch(intel.lastPlayedAt!)
+            : null;
+      }
+    }
+    return canonical;
   }
 
   Future<void> toggleFavorite(String uid) async {
     final t = _trackByUid(uid);
     if (t == null) return;
-    t.favorite = !t.favorite;
+    final bucket = variantsFor(t);
+    // The user sees the AGGREGATE on the row, so toggling flips
+    // from whatever the aggregate shows — not from any individual
+    // variant's flag.
+    final currentFavorite =
+        AggregatedTrackView(bucket).favorite;
+    final next = !currentFavorite;
+
+    // Optimistic in-memory flip on every bucket variant so the UI
+    // updates instantly. _writeBucketIntelligence below will
+    // overwrite these with canonical state once persisted.
+    for (final v in bucket) {
+      v.favorite = next;
+    }
     _markLibraryDirty();
     notifyListeners();
-    await _ensurePromoted(t);
-    if (t.intelUid != null) {
-      await repo.updateIntelligence(
-        intelUid: t.intelUid!,
-        favorite: t.favorite,
-      );
-    }
+
+    await _writeBucketIntelligence(t, (canonical) async {
+      await repo.updateIntelligence(intelUid: canonical, favorite: next);
+    });
+    _markLibraryDirty();
+    notifyListeners();
   }
 
   Future<void> toggleReviewed(String uid) async {
     final t = _trackByUid(uid);
     if (t == null) return;
-    if (t.reviewed) {
-      t.cumulativeListened = Duration.zero;
-    } else {
-      t.cumulativeListened = const Duration(seconds: 3);
-      _pushRecentReviewed(uid);
+    final bucket = variantsFor(t);
+    final view = AggregatedTrackView(bucket);
+    final reviewed = view.reviewed;
+    final nextCumulativeMs = reviewed ? 0 : 3000;
+
+    // Optimistic in-memory update across the bucket.
+    final nextDuration = Duration(milliseconds: nextCumulativeMs);
+    for (final v in bucket) {
+      v.cumulativeListened = nextDuration;
     }
+    if (!reviewed) _pushRecentReviewed(uid);
     _markLibraryDirty();
     notifyListeners();
-    await _ensurePromoted(t);
-    if (t.intelUid != null) {
+
+    await _writeBucketIntelligence(t, (canonical) async {
       await repo.updateIntelligence(
-        intelUid: t.intelUid!,
-        cumulativeMs: t.cumulativeListened.inMilliseconds,
+        intelUid: canonical,
+        cumulativeMs: nextCumulativeMs,
       );
-    }
+    });
+    _markLibraryDirty();
+    notifyListeners();
   }
 
   void cyclePlaybackMode() {
@@ -1923,16 +1981,14 @@ class LibraryController extends ChangeNotifier {
       enrichOnDemand(track.path);
       tick('enrichOnDemand queued');
 
-      await _ensurePromoted(track);
-      tick('_ensurePromoted (DB)');
-      if (track.intelUid != null) {
-        track.lastPlayedAt = DateTime.now();
+      final now = DateTime.now();
+      await _writeBucketIntelligence(track, (canonical) async {
         await repo.updateIntelligence(
-          intelUid: track.intelUid!,
-          lastPlayedAt: track.lastPlayedAt!.millisecondsSinceEpoch,
+          intelUid: canonical,
+          lastPlayedAt: now.millisecondsSinceEpoch,
         );
-        tick('updateIntelligence (lastPlayedAt)');
-      }
+      });
+      tick('updateIntelligence (lastPlayedAt, bucket)');
       _pushNowPlaying();
       tick('_pushNowPlaying');
     }
@@ -1947,11 +2003,18 @@ class LibraryController extends ChangeNotifier {
     final t = currentTrack;
     if (t == null) return;
     if (t.intelUid == null) return;
-    await repo.updateIntelligence(
-      intelUid: t.intelUid!,
-      cumulativeMs: t.cumulativeListened.inMilliseconds,
-      playCount: t.playCount,
-    );
+    // The in-memory cumulativeListened / playCount on `t` is the
+    // authoritative session state (this is the file the engine is
+    // playing). Mirror it onto canonical intel + every bucket
+    // sibling so favoriting / reviewing on a different variant
+    // after this flush stays coherent.
+    await _writeBucketIntelligence(t, (canonical) async {
+      await repo.updateIntelligence(
+        intelUid: canonical,
+        cumulativeMs: t.cumulativeListened.inMilliseconds,
+        playCount: t.playCount,
+      );
+    });
   }
 
   Future<void> togglePlayPause() async {
@@ -2050,14 +2113,20 @@ class LibraryController extends ChangeNotifier {
           _pushRecentReviewed(track.uid);
           _markLibraryDirty();
           notifyListeners();
-          // Persist to intelligence row (already promoted at play start).
-          if (track.intelUid != null) {
-            repo.updateIntelligence(
-              intelUid: track.intelUid!,
-              cumulativeMs: track.cumulativeListened.inMilliseconds,
-              playCount: track.playCount,
+          // Persist through the bucket helper so the play-count
+          // increment and cumulative listening propagate to every
+          // sibling variant in memory + the canonical intel row.
+          // Promotion already happened at play() start, so this
+          // call is just a write + mirror.
+          final cumulativeMs = track.cumulativeListened.inMilliseconds;
+          final playCount = track.playCount;
+          unawaited(_writeBucketIntelligence(track, (canonical) async {
+            await repo.updateIntelligence(
+              intelUid: canonical,
+              cumulativeMs: cumulativeMs,
+              playCount: playCount,
             );
-          }
+          }));
         }
       }
     }

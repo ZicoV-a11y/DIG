@@ -1,0 +1,299 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:music_tracker/models/track.dart';
+import 'package:music_tracker/utils/aggregated_track_view.dart';
+
+Track _t({
+  required String filename,
+  String title = 'Title',
+  String artist = 'Artist',
+  Duration duration = const Duration(minutes: 4),
+  String musicalKey = '',
+  double? bpm,
+  int playCount = 0,
+  Duration cumulativeListened = Duration.zero,
+  bool favorite = false,
+  DateTime? lastPlayedAt,
+  String? uid,
+}) {
+  return Track(
+    uid: uid ?? 'uid-$filename',
+    fingerprint: 'fp-$filename',
+    path: '/lib/$filename',
+    filename: filename,
+    sourceId: 'src',
+    title: title,
+    artist: artist,
+    duration: duration,
+    musicalKey: musicalKey,
+    bpm: bpm,
+    playCount: playCount,
+    cumulativeListened: cumulativeListened,
+    favorite: favorite,
+    lastPlayedAt: lastPlayedAt,
+  );
+}
+
+void main() {
+  group('AggregatedTrackView — singleton bucket', () {
+    test('mirrors the single variant for every field', () {
+      final track = _t(
+        filename: 'a.mp3',
+        bpm: 124,
+        musicalKey: 'Dm',
+        playCount: 3,
+        favorite: true,
+        cumulativeListened: const Duration(seconds: 90),
+      );
+      final v = AggregatedTrackView([track]);
+
+      expect(v.primary, same(track));
+      expect(v.hasSiblings, isFalse);
+      expect(v.variantCount, 1);
+      expect(v.playCount, 3);
+      expect(v.cumulativeListened, const Duration(seconds: 90));
+      expect(v.reviewed, isTrue);
+      expect(v.favorite, isTrue);
+      expect(v.bpm, 124);
+      expect(v.displayKey, '7A'); // Dm → 7A
+      expect(v.formatLabel, 'MP3');
+    });
+  });
+
+  group('AggregatedTrackView — aggregation across variants', () {
+    test('playCount sums across variants', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', playCount: 2),
+        _t(filename: 'x.aiff', playCount: 5),
+      ]);
+      expect(v.playCount, 7);
+    });
+
+    test('cumulativeListened sums across variants', () {
+      final v = AggregatedTrackView([
+        _t(
+          filename: 'x.mp3',
+          cumulativeListened: const Duration(seconds: 30),
+        ),
+        _t(
+          filename: 'x.aiff',
+          cumulativeListened: const Duration(seconds: 90),
+        ),
+      ]);
+      expect(v.cumulativeListened, const Duration(seconds: 120));
+    });
+
+    test('favorite is OR across variants', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', favorite: false),
+        _t(filename: 'x.aiff', favorite: true),
+      ]);
+      expect(v.favorite, isTrue);
+
+      final none = AggregatedTrackView([
+        _t(filename: 'x.mp3', favorite: false),
+        _t(filename: 'x.aiff', favorite: false),
+      ]);
+      expect(none.favorite, isFalse);
+    });
+
+    test('reviewed derives from summed cumulativeListened', () {
+      // Each variant alone is under threshold (3s); together they're
+      // over → bucket counts as reviewed.
+      final v = AggregatedTrackView([
+        _t(
+          filename: 'x.mp3',
+          cumulativeListened: const Duration(seconds: 2),
+        ),
+        _t(
+          filename: 'x.aiff',
+          cumulativeListened: const Duration(seconds: 2),
+        ),
+      ]);
+      expect(v.reviewed, isTrue);
+    });
+
+    test('lastPlayedAt picks most recent across variants', () {
+      final early = DateTime(2026, 5, 1);
+      final late_ = DateTime(2026, 5, 9);
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', lastPlayedAt: late_),
+        _t(filename: 'x.aiff', lastPlayedAt: early),
+      ]);
+      expect(v.lastPlayedAt, late_);
+    });
+
+    test('lastPlayedAt returns null when no variant has played', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3'),
+        _t(filename: 'x.aiff'),
+      ]);
+      expect(v.lastPlayedAt, isNull);
+    });
+  });
+
+  group('AggregatedTrackView — blank-on-disagreement (BPM)', () {
+    test('agreement passes the value through', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', bpm: 125),
+        _t(filename: 'x.aiff', bpm: 125),
+      ]);
+      expect(v.bpm, 125);
+    });
+
+    test('one variant present + one blank → present value passes', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', bpm: 125),
+        _t(filename: 'x.aiff', bpm: null),
+      ]);
+      expect(v.bpm, 125);
+    });
+
+    test('disagreement → null (blank)', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', bpm: 125),
+        _t(filename: 'x.aiff', bpm: 124),
+      ]);
+      expect(v.bpm, isNull);
+    });
+
+    test('all blank → null', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', bpm: null),
+        _t(filename: 'x.aiff', bpm: null),
+      ]);
+      expect(v.bpm, isNull);
+    });
+
+    test('zero / negative BPMs are treated as blank', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', bpm: 0),
+        _t(filename: 'x.aiff', bpm: 124),
+      ]);
+      expect(v.bpm, 124);
+    });
+  });
+
+  group('AggregatedTrackView — blank-on-disagreement (key)', () {
+    test('agreement on Camelot value', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', musicalKey: 'Dm'), // 7A
+        _t(filename: 'x.aiff', musicalKey: '7A'), // 7A
+      ]);
+      expect(v.displayKey, '7A');
+    });
+
+    test('one variant has key, other blank → present value passes', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', musicalKey: 'Dm'),
+        _t(filename: 'x.aiff', musicalKey: ''),
+      ]);
+      expect(v.displayKey, '7A');
+    });
+
+    test('disagreement → empty string (blank)', () {
+      // The A.C.N. — Warriors case from the user's screenshot:
+      // one variant tagged 1B, another tagged 10A → blank.
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', musicalKey: '1B'),
+        _t(filename: 'x.aiff', musicalKey: '10A'),
+      ]);
+      expect(v.displayKey, '');
+    });
+
+    test('unparseable keys are treated as blank', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', musicalKey: 'xyz'),
+        _t(filename: 'x.aiff', musicalKey: 'Dm'),
+      ]);
+      expect(v.displayKey, '7A');
+    });
+  });
+
+  group('AggregatedTrackView — FORMAT label', () {
+    test('single variant returns single format', () {
+      final v = AggregatedTrackView([_t(filename: 'x.mp3')]);
+      expect(v.formatLabel, 'MP3');
+    });
+
+    test('two variants joined by middle-dot', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3'),
+        _t(filename: 'x.aiff'),
+      ]);
+      expect(v.formatLabel, 'MP3 · AIFF');
+    });
+
+    test('formats appear in lowest-quality-first order', () {
+      // Even if AIFF is added first, MP3 sorts before AIFF.
+      final v = AggregatedTrackView([
+        _t(filename: 'x.aiff'),
+        _t(filename: 'x.mp3'),
+      ]);
+      expect(v.formatLabel, 'MP3 · AIFF');
+    });
+
+    test('duplicates collapse', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3'),
+        _t(filename: 'y.mp3'),
+      ]);
+      expect(v.formatLabel, 'MP3');
+    });
+
+    test('unknown extensions go last, alphabetised', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3'),
+        _t(filename: 'x.zzz'),
+        _t(filename: 'x.aiff'),
+        _t(filename: 'x.qqq'),
+      ]);
+      expect(v.formatLabel, 'MP3 · AIFF · QQQ · ZZZ');
+    });
+
+    test('empty when no variant has an extension', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'noext'),
+        _t(filename: '.hidden'),
+      ]);
+      expect(v.formatLabel, '');
+    });
+  });
+
+  group('orderBucketByPlaybackPreference', () {
+    test('single track returns a one-element list', () {
+      final t = _t(filename: 'a.mp3');
+      expect(orderBucketByPlaybackPreference([t]), [t]);
+    });
+
+    test('lowest-quality format comes first', () {
+      final mp3 = _t(filename: 'x.mp3', uid: 'mp3');
+      final aiff = _t(filename: 'x.aiff', uid: 'aiff');
+      final flac = _t(filename: 'x.flac', uid: 'flac');
+      final wav = _t(filename: 'x.wav', uid: 'wav');
+      final ordered = orderBucketByPlaybackPreference([aiff, wav, flac, mp3]);
+      expect(ordered.map((t) => t.uid), ['mp3', 'flac', 'wav', 'aiff']);
+    });
+
+    test('does not mutate the input list', () {
+      final mp3 = _t(filename: 'x.mp3', uid: 'mp3');
+      final aiff = _t(filename: 'x.aiff', uid: 'aiff');
+      final input = [aiff, mp3];
+      orderBucketByPlaybackPreference(input);
+      expect(input.map((t) => t.uid), ['aiff', 'mp3']);
+    });
+
+    test('ties broken by insertion order', () {
+      final mp3a = _t(filename: 'a.mp3', uid: 'a');
+      final mp3b = _t(filename: 'b.mp3', uid: 'b');
+      final ordered = orderBucketByPlaybackPreference([mp3b, mp3a]);
+      expect(ordered.map((t) => t.uid), ['b', 'a']);
+    });
+
+    test('unknown formats sort last', () {
+      final mp3 = _t(filename: 'x.mp3', uid: 'mp3');
+      final zzz = _t(filename: 'x.zzz', uid: 'zzz');
+      final ordered = orderBucketByPlaybackPreference([zzz, mp3]);
+      expect(ordered.map((t) => t.uid), ['mp3', 'zzz']);
+    });
+  });
+}

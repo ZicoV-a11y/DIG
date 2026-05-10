@@ -15,8 +15,10 @@ import '../services/library_repository.dart';
 import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
+import '../utils/aggregated_track_view.dart';
 import '../utils/file_format.dart';
 import '../utils/key_normalizer.dart';
+import '../utils/song_identity.dart';
 
 enum TrackSortColumn {
   favorite,
@@ -134,7 +136,9 @@ class LibraryController extends ChangeNotifier {
   double _colBpmWidth = 38;
   double _colKeyWidth = 50;
   double _colTimeWidth = 50;
-  double _colFormatWidth = 56;
+  // Wide enough to fit aggregated `MP3 · AIFF` style labels comfortably
+  // when grouping is on, plus the expand-chevron prefix.
+  double _colFormatWidth = 78;
   double _colPlaysWidth = 52;
   double _colLastPlayedWidth = 90;
   // Text columns: persisted absolute widths.
@@ -163,6 +167,22 @@ class LibraryController extends ChangeNotifier {
   List<Track>? _visibleCache;
   int _visibleCacheVersion = -1;
   int? _lockedCurrentIndex;
+
+  // Variant-collapse state. When `_groupVariants` is true, the
+  // visible-tracks pipeline collapses each song-identity bucket
+  // into a single primary row (lowest-quality format wins — MP3 >
+  // FLAC > WAV > AIFF). `_expandedSongIdentities` carries the set
+  // of identity keys whose siblings are currently surfaced as
+  // indented sub-rows. Both invalidate `_visibleCache` when they
+  // change, so the pipeline re-runs.
+  bool _groupVariants = true;
+  final Set<String> _expandedSongIdentities = <String>{};
+  // Side-table built each pipeline run: lookup from primary's uid
+  // → the bucket's AggregatedTrackView so the table can render
+  // aggregated cells (sum plays, blank-on-disagreement BPM/key,
+  // FORMAT label) without re-grouping on every row build.
+  Map<String, AggregatedTrackView> _bucketsByPrimaryUid =
+      const <String, AggregatedTrackView>{};
 
   // Cached per-source counts. Sidebar build calls
   // `sourceTrackCount(sourceId)` once per tile; without this cache
@@ -284,6 +304,8 @@ class LibraryController extends ChangeNotifier {
         double.tryParse(settings['col_artist_width'] ?? '') ?? _colArtistWidth;
     _colFormatWidth =
         double.tryParse(settings['col_format_width'] ?? '') ?? _colFormatWidth;
+    final groupVariantsRaw = settings['group_variants'];
+    if (groupVariantsRaw != null) _groupVariants = groupVariantsRaw == '1';
     final orderStr = settings['column_order'];
     if (orderStr != null && orderStr.isNotEmpty) {
       final parsed = orderStr
@@ -710,6 +732,53 @@ class LibraryController extends ChangeNotifier {
   double get colTimeWidth => _colTimeWidth;
   double get colFormatWidth => _colFormatWidth;
   double get colPlaysWidth => _colPlaysWidth;
+
+  /// When `true`, the visible-tracks pipeline collapses each
+  /// song-identity bucket into a single primary row. See
+  /// `project_track_identity_vs_file_variants.md` and
+  /// [AggregatedTrackView] for the rules.
+  bool get groupVariants => _groupVariants;
+
+  /// Aggregated cell values for a collapsed bucket whose primary
+  /// row is [primary]. Returns `null` when grouping is off, when
+  /// [primary] is not a bucket primary (e.g., it's an expanded
+  /// sibling), or before the visible-tracks pipeline has been run.
+  AggregatedTrackView? aggregatedViewForPrimary(Track primary) =>
+      _bucketsByPrimaryUid[primary.uid];
+
+  /// `true` when [primary] is the displayed primary of a multi-
+  /// variant bucket — i.e., the row has siblings that can be
+  /// surfaced by toggling expansion.
+  bool primaryHasSiblings(Track primary) {
+    final view = _bucketsByPrimaryUid[primary.uid];
+    return view != null && view.hasSiblings;
+  }
+
+  bool isSongExpanded(String identityKey) =>
+      _expandedSongIdentities.contains(identityKey);
+
+  void toggleSongExpansion(String identityKey) {
+    if (!_expandedSongIdentities.remove(identityKey)) {
+      _expandedSongIdentities.add(identityKey);
+    }
+    // Pipeline output changes (siblings appear/disappear in the
+    // flat list) but the underlying library hasn't, so invalidate
+    // the cache directly without bumping _libraryVersion.
+    _visibleCache = null;
+    notifyListeners();
+  }
+
+  Future<void> setGroupVariants(bool value) async {
+    if (_groupVariants == value) return;
+    _groupVariants = value;
+    _visibleCache = null;
+    // Expansion state only makes sense while grouping is on. When
+    // the user turns grouping off, clear it so re-enabling starts
+    // from a clean "everything collapsed" state.
+    if (!value) _expandedSongIdentities.clear();
+    notifyListeners();
+    await repo.setSetting('group_variants', value ? '1' : '0');
+  }
   double get colLastPlayedWidth => _colLastPlayedWidth;
   double get colTitleWidth => _colTitleWidth;
   double get colArtistWidth => _colArtistWidth;
@@ -988,7 +1057,7 @@ class LibraryController extends ChangeNotifier {
       });
     }
 
-    final result = list.toList();
+    var result = list.toList();
     final dir = _sortAscending ? 1 : -1;
     result.sort((a, b) {
       switch (_sortColumn) {
@@ -1068,6 +1137,39 @@ class LibraryController extends ChangeNotifier {
           result.insert(insertAt, t);
         }
       }
+    }
+
+    if (_groupVariants) {
+      // Collapse each song-identity bucket to a single primary row
+      // (lowest-quality format first). `groupBySongIdentity` is
+      // first-seen-stable, so a bucket's position in the visible
+      // list is set by whichever variant sorted highest. Within
+      // each bucket, `orderBucketByPlaybackPreference` puts the
+      // primary at index 0 regardless of sort.
+      final buckets = groupBySongIdentity(result);
+      final flat = <Track>[];
+      final views = <String, AggregatedTrackView>{};
+      for (final bucket in buckets) {
+        final ordered = orderBucketByPlaybackPreference(bucket);
+        final primary = ordered.first;
+        flat.add(primary);
+        views[primary.uid] = AggregatedTrackView(ordered);
+        // When the user has expanded this bucket, emit the
+        // siblings right after the primary so they read as
+        // indented sub-rows in the table.
+        final key = songIdentityKey(primary);
+        if (key != null &&
+            ordered.length > 1 &&
+            _expandedSongIdentities.contains(key)) {
+          for (var i = 1; i < ordered.length; i++) {
+            flat.add(ordered[i]);
+          }
+        }
+      }
+      _bucketsByPrimaryUid = views;
+      result = flat;
+    } else {
+      _bucketsByPrimaryUid = const <String, AggregatedTrackView>{};
     }
 
     _visibleCache = result;

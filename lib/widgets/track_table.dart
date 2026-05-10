@@ -6,6 +6,7 @@ import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
+import '../utils/song_identity.dart';
 import 'track_artwork.dart';
 
 class TrackTable extends StatefulWidget {
@@ -604,17 +605,27 @@ Widget _buildRowInner(
   required Color titleColor,
   required FontWeight titleWeight,
 }) {
+  // When grouping by song identity is on, primaries render
+  // aggregated values across their bucket; siblings render their
+  // own per-file values like a non-grouped row. `aggView` is non-
+  // null only for primaries — siblings and ungrouped rows fall
+  // through to the underlying Track fields.
+  final aggView = c.aggregatedViewForPrimary(t);
+  final isBucketPrimary = aggView != null;
+  final favorite = aggView?.favorite ?? t.favorite;
+  final reviewed = aggView?.reviewed ?? t.reviewed;
+
   switch (col) {
     case 'fav':
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(
           child: _IconAction(
-            tooltip: t.favorite ? 'Unfavorite' : 'Favorite',
-            icon: t.favorite
+            tooltip: favorite ? 'Unfavorite' : 'Favorite',
+            icon: favorite
                 ? Icons.star_rounded
                 : Icons.star_border_rounded,
-            color: t.favorite
+            color: favorite
                 ? AppColors.favorite
                 : AppColors.textSecondary,
             onPressed: () => c.toggleFavorite(t.uid),
@@ -626,11 +637,11 @@ Widget _buildRowInner(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(
           child: Text(
-            t.reviewed ? '✔' : '○',
+            reviewed ? '✔' : '○',
             style: TextStyle(
               fontSize: 17,
               height: 1.0,
-              color: t.reviewed
+              color: reviewed
                   ? AppColors.reviewed
                   : AppColors.textSecondary,
             ),
@@ -672,20 +683,24 @@ Widget _buildRowInner(
         ),
       );
     case 'bpm':
+      final bpm = aggView?.bpm ?? t.bpm;
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
-        child: Center(child: Text(_formatBpm(t.bpm), style: _numStyle)),
+        child: Center(child: Text(_formatBpm(bpm), style: _numStyle)),
       );
     case 'key':
       // displayKey hits a per-Track cache; the underlying parser
       // is regex-on-basename and does no I/O, so this is cheap
-      // even at 60fps with ~50 visible rows.
+      // even at 60fps with ~50 visible rows. When the row is a
+      // bucket primary, the aggregated `displayKey` enforces the
+      // blank-on-disagreement rule per project memory.
+      final key = aggView?.displayKey ?? t.displayKey;
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(
           child: Text(
-            t.displayKey.isEmpty ? '—' : t.displayKey,
-            style: t.displayKey.isEmpty ? _numStyleDim : _numStyle,
+            key.isEmpty ? '—' : key,
+            style: key.isEmpty ? _numStyleDim : _numStyle,
           ),
         ),
       );
@@ -697,7 +712,24 @@ Widget _buildRowInner(
         ),
       );
     case 'format':
-      final fmt = fileFormatLabel(t.filename);
+      // Primary row with siblings: the cell shows the aggregated
+      // format set (`MP3 · AIFF`) and is the expand/collapse
+      // affordance for the bucket. Single-variant rows and
+      // expanded sibling rows show just their own format label.
+      if (isBucketPrimary && aggView.hasSiblings) {
+        final identityKey = songIdentityKey(t);
+        final expanded =
+            identityKey != null && c.isSongExpanded(identityKey);
+        return _FormatExpandCell(
+          label: aggView.formatLabel,
+          variantCount: aggView.variantCount,
+          expanded: expanded,
+          onTap: identityKey == null
+              ? null
+              : () => c.toggleSongExpansion(identityKey),
+        );
+      }
+      final fmt = aggView?.formatLabel ?? fileFormatLabel(t.filename);
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(
@@ -708,16 +740,17 @@ Widget _buildRowInner(
         ),
       );
     case 'plays':
+      final plays = aggView?.playCount ?? t.playCount;
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
-        child: Center(child: Text('${t.playCount}', style: _numStyle)),
+        child: Center(child: Text('$plays', style: _numStyle)),
       );
     case 'lastPlayed':
       // `_formatLastPlayed` returns a short, allocation-light
       // string (one of `Today` / `Yesterday` / `3d ago` / `Apr 28`
       // / `Never`). No DateTime arithmetic per-comparison sort —
       // the sort comparator works on `lastPlayedAt` directly.
-      final at = t.lastPlayedAt;
+      final at = aggView?.lastPlayedAt ?? t.lastPlayedAt;
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(
@@ -884,7 +917,26 @@ class _TrackRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isCurrent = controller.currentTrackUid == track.uid;
+    // Surface "currently playing" on a collapsed bucket's primary if
+    // any variant in its bucket is the current track. When the
+    // bucket is expanded, the actual playing variant has its own
+    // row and the primary stays unhighlighted (the existing strict
+    // uid match handles that path). When grouping is off, this
+    // reduces to a plain uid match.
+    final currentUid = controller.currentTrackUid;
+    bool isCurrent = currentUid != null && currentUid == track.uid;
+    if (!isCurrent && currentUid != null) {
+      final aggView = controller.aggregatedViewForPrimary(track);
+      if (aggView != null && aggView.hasSiblings) {
+        final identityKey = songIdentityKey(track);
+        final collapsed =
+            identityKey == null || !controller.isSongExpanded(identityKey);
+        if (collapsed &&
+            aggView.variants.any((v) => v.uid == currentUid)) {
+          isCurrent = true;
+        }
+      }
+    }
     final isLoading = isCurrent && controller.isLoadingTrack;
     final isSelected = !isCurrent && controller.selectedTrackUid == track.uid;
     final titleColor = isCurrent
@@ -1120,6 +1172,68 @@ class _TitleCell extends StatelessWidget {
         fontSize: 13,
         fontWeight: titleWeight,
         height: 1.0,
+      ),
+    );
+  }
+}
+
+/// FORMAT cell for a bucket primary that has siblings. Renders the
+/// aggregated format label with a leading chevron and toggles bucket
+/// expansion on tap. Single-variant primaries and expanded sibling
+/// rows render as plain text — this widget is only used when the
+/// bucket is collapsable / expandable.
+class _FormatExpandCell extends StatelessWidget {
+  final String label;
+  final int variantCount;
+  final bool expanded;
+  final VoidCallback? onTap;
+
+  const _FormatExpandCell({
+    required this.label,
+    required this.variantCount,
+    required this.expanded,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: expanded
+          ? 'Collapse $variantCount variants'
+          : 'Show $variantCount variants',
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          hoverColor: AppColors.hoverRow,
+          focusColor: AppColors.focusOverlay,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  expanded
+                      ? Icons.keyboard_arrow_down_rounded
+                      : Icons.keyboard_arrow_right_rounded,
+                  size: 14,
+                  color: AppColors.textSecondary,
+                ),
+                const SizedBox(width: 2),
+                Flexible(
+                  child: Text(
+                    label,
+                    style: _numStyle,
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }

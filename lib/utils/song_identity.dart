@@ -61,7 +61,7 @@ List<List<Track>> groupBySongIdentity(Iterable<Track> tracks) {
   final byKey = <String, int>{};
 
   for (final t in tracks) {
-    final key = _identityKey(t);
+    final key = songIdentityKey(t);
     if (key == null) {
       buckets.add([t]);
       continue;
@@ -77,7 +77,14 @@ List<List<Track>> groupBySongIdentity(Iterable<Track> tracks) {
   return buckets;
 }
 
-String? _identityKey(Track t) {
+/// Stable string key that two tracks share iff [sameSongIdentity]
+/// returns `true` for them. Returns `null` when the track is missing
+/// canonical title or artist — those rows never group with anything.
+///
+/// Exposed so callers can drive collapse / expansion state (which
+/// song-identities are "expanded" in the table) by string key rather
+/// than by holding Track references.
+String? songIdentityKey(Track t) {
   if (t.title.isEmpty || t.artist.isEmpty) return null;
   // U+001F (Unit Separator) — never appears in filesystem basenames
   // or ID3 strings on any platform we target, so it can't collide

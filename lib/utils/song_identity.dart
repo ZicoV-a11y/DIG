@@ -22,20 +22,21 @@ import '../models/track.dart';
 /// Returns `true` when [a] and [b] represent the same song under the
 /// strict 4-field rule.
 ///
-/// All four conditions must hold (case-sensitive, no whitespace
-/// normalization, no unicode folding):
+/// All four conditions must hold character-for-character (case-
+/// sensitive, no whitespace normalization, no unicode folding) and
+/// millisecond-exact on duration:
 ///
 ///   - basename without extension
 ///   - canonical title (from ID3 / Vorbis, via `Track.title`)
 ///   - canonical artist (from ID3 / Vorbis, via `Track.artist`)
-///   - duration rounded to whole seconds (`Duration.inSeconds`)
+///   - duration in milliseconds (`Duration` equality)
 ///
-/// Title / artist / filename are matched character-for-character.
-/// Duration uses truncated-to-seconds equality so that codec rounding
-/// between MP3 and AIFF (different frame / sample alignments routinely
-/// report durations a few hundred ms apart) doesn't block obvious
-/// variant matches. Real radio-edit / extended-mix pairs differ by
-/// many seconds and still fail the rule.
+/// Tightness is the safety property — false-positive merges would
+/// silently hide files. The cost is that MP3 and AIFF of the same
+/// master often report durations a few hundred ms apart because
+/// codec frame counts don't align cleanly with PCM sample counts;
+/// those pairs won't auto-collapse and need a manual link
+/// (not implemented yet — slice 4 territory).
 ///
 /// Tracks with empty canonical title or artist never match anything,
 /// even each other — without metadata there's no song identity to
@@ -44,7 +45,7 @@ bool sameSongIdentity(Track a, Track b) {
   if (identical(a, b)) return true;
   if (a.title.isEmpty || a.artist.isEmpty) return false;
   if (b.title.isEmpty || b.artist.isEmpty) return false;
-  if (a.duration.inSeconds != b.duration.inSeconds) return false;
+  if (a.duration != b.duration) return false;
   if (a.title != b.title) return false;
   if (a.artist != b.artist) return false;
   return _basenameNoExt(a.filename) == _basenameNoExt(b.filename);
@@ -100,7 +101,7 @@ String? songIdentityKey(Track t) {
   return '${_basenameNoExt(t.filename)}$sep'
       '${t.title}$sep'
       '${t.artist}$sep'
-      '${t.duration.inSeconds}';
+      '${t.duration.inMilliseconds}';
 }
 
 String _basenameNoExt(String filename) {

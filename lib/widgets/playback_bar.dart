@@ -562,6 +562,6 @@ String _fmtDuration(Duration d) => d == Duration.zero ? '—' : _fmt(d);
 String _formatTrackMeta(Track t) {
   final dur = t.duration > Duration.zero ? _fmt(t.duration) : '—';
   final bpm = (t.bpm != null && t.bpm! > 0) ? '${t.bpm!.round()}' : '—';
-  final key = t.musicalKey.trim().isEmpty ? '—' : t.musicalKey.trim();
+  final key = t.displayKey.isEmpty ? '—' : t.displayKey;
   return '$dur • $bpm BPM • $key';
 }

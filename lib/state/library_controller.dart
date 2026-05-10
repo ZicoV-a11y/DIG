@@ -15,6 +15,7 @@ import '../services/library_repository.dart';
 import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
+import '../utils/key_normalizer.dart';
 
 enum TrackSortColumn {
   favorite,
@@ -955,14 +956,25 @@ class LibraryController extends ChangeNotifier {
     }
     if (_searchQuery.isNotEmpty) {
       final q = _searchQuery.toLowerCase();
+      // If the query parses as a key in any notation (musical /
+      // Camelot / Open Key), match it against each track's
+      // normalized Camelot too — so "Dm" finds 7A-tagged tracks
+      // and "7A" finds Dm-tagged tracks symmetrically.
+      final qCamelot = normalizeKeyToCamelot(_searchQuery)?.toLowerCase();
       // Search hits the display fields too so users can find tracks
       // by filename-derived artist while ID3 extraction is still in
       // flight.
-      list = list.where(
-        (t) =>
-            t.displayTitle.toLowerCase().contains(q) ||
-            t.displayArtist.toLowerCase().contains(q),
-      );
+      list = list.where((t) {
+        if (t.displayTitle.toLowerCase().contains(q)) return true;
+        if (t.displayArtist.toLowerCase().contains(q)) return true;
+        if (t.rawKey.toLowerCase().contains(q)) return true;
+        if (t.displayKey.toLowerCase().contains(q)) return true;
+        if (qCamelot != null &&
+            t.displayKey.toLowerCase() == qCamelot) {
+          return true;
+        }
+        return false;
+      });
     }
 
     final result = list.toList();
@@ -996,13 +1008,15 @@ class LibraryController extends ChangeNotifier {
           if (bb == null) return -1;
           return dir * ab.compareTo(bb);
         case TrackSortColumn.key:
-          // Empty keys always sort to the bottom regardless of
-          // direction so unknown rows don't crowd the top.
-          final ak = a.displayKey.toLowerCase();
-          final bk = b.displayKey.toLowerCase();
-          if (ak.isEmpty && bk.isEmpty) return 0;
-          if (ak.isEmpty) return 1;
-          if (bk.isEmpty) return -1;
+          // Sort by harmonic-wheel position (1A, 1B, 2A, 2B, ...),
+          // not lexicographic on the Camelot string. Unknown keys
+          // always sink to the bottom regardless of direction so
+          // they don't crowd the top.
+          final ak = camelotSortIndex(a.rawKey);
+          final bk = camelotSortIndex(b.rawKey);
+          if (ak == unknownSortIndex && bk == unknownSortIndex) return 0;
+          if (ak == unknownSortIndex) return 1;
+          if (bk == unknownSortIndex) return -1;
           return dir * ak.compareTo(bk);
         case TrackSortColumn.duration:
           return dir * a.duration.compareTo(b.duration);

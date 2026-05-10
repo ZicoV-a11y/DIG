@@ -1,4 +1,5 @@
 import '../services/filename_parser.dart';
+import '../utils/key_normalizer.dart';
 
 /// A unified view over `indexed_files` (location + metadata) and
 /// `tracks` (intelligence). The split is a database concern; consumers
@@ -141,15 +142,25 @@ class Track {
     return _parsedKeyCache;
   }
 
-  /// Best-effort musical key for display. Priority:
+  /// Raw key as resolved from metadata or filename, before notation
+  /// normalization. Priority:
   ///   1. canonical [musicalKey] (from ID3 / Vorbis tags)
   ///   2. trailing-bracket / trailing-token key in the filename
-  ///   3. empty string (caller renders `—`)
+  ///   3. empty string
   ///
-  /// Like [displayArtist] / [displayTitle], purely a read-side
-  /// fallback — never written to the DB, never overrides ID3.
-  String get displayKey {
+  /// Used for searching against the original tag (so a user typing
+  /// "Dm" still finds a track tagged "Dm", even though the column
+  /// renders "7A").
+  String get rawKey {
     if (musicalKey.isNotEmpty) return musicalKey;
     return _parsedKey ?? '';
   }
+
+  /// Canonical Camelot form ("1A".."12B") of [rawKey] for display
+  /// and harmonic-wheel sorting. Empty string if the raw value is
+  /// missing or in an unrecognised notation.
+  ///
+  /// Like [displayArtist] / [displayTitle], purely a read-side
+  /// transform — never written to the DB, never overrides ID3.
+  String get displayKey => normalizeKeyToCamelot(rawKey) ?? '';
 }

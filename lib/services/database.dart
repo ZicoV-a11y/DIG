@@ -201,13 +201,19 @@ class AppDatabase {
   static Future<void> _migrateV6toV7(Database db) async {
     debugPrint('[db] starting v6 → v7 migration (sub-view columns)');
     final stopwatch = Stopwatch()..start();
-    await db.execute(
-      'ALTER TABLE sources ADD COLUMN parent_source_id TEXT '
-      'REFERENCES sources(id) ON DELETE CASCADE',
-    );
-    await db.execute(
-      'ALTER TABLE sources ADD COLUMN path_prefix TEXT',
-    );
+    final columns = await db.rawQuery('PRAGMA table_info(sources)');
+    final names = columns.map((c) => c['name']).toSet();
+    if (!names.contains('parent_source_id')) {
+      await db.execute(
+        'ALTER TABLE sources ADD COLUMN parent_source_id TEXT '
+        'REFERENCES sources(id) ON DELETE CASCADE',
+      );
+    }
+    if (!names.contains('path_prefix')) {
+      await db.execute(
+        'ALTER TABLE sources ADD COLUMN path_prefix TEXT',
+      );
+    }
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_sources_parent '
       'ON sources(parent_source_id)',

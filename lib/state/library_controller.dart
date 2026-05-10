@@ -192,11 +192,16 @@ class LibraryController extends ChangeNotifier {
   int _sourceCountCacheVersion = -1;
 
   // Cached library-wide tallies for the always-on status bar:
-  // enriched (any metadata extracted), available (file present on
-  // last scan), missing (rows surviving the last scan as
-  // `is_available=0`). Recomputed on `_libraryVersion` change.
+  // enriched (any metadata extracted), missing (rows surviving the
+  // last scan as `is_available=0`), song count (distinct song-
+  // identities — same canonical bucket the variant collapse uses),
+  // and reviewed song count (a song is reviewed if ANY variant
+  // crossed the cumulative-listen threshold). Recomputed on
+  // `_libraryVersion` change.
   int? _enrichedCountCache;
   int? _missingCountCache;
+  int? _songCountCache;
+  int? _reviewedSongCountCache;
   int _libraryStatsVersion = -1;
 
   // Set while a metadata wave is in flight: a representative
@@ -702,16 +707,68 @@ class LibraryController extends ChangeNotifier {
     return _missingCountCache ?? 0;
   }
 
+  /// Distinct song-identity count — same buckets the variant
+  /// collapse uses. Tracks with empty title/artist (no identity to
+  /// group on) each count as their own song.
+  int get songCount {
+    _ensureLibraryStats();
+    return _songCountCache ?? 0;
+  }
+
+  /// Count of songs (not files) where any variant in the bucket has
+  /// crossed the cumulative-listen threshold. Mirrors how the
+  /// table's REV column resolves a primary row.
+  int get reviewedSongCount {
+    _ensureLibraryStats();
+    return _reviewedSongCountCache ?? 0;
+  }
+
+  /// `songCount - reviewedSongCount`, exposed for status-bar
+  /// readability.
+  int get unreviewedSongCount => songCount - reviewedSongCount;
+
+  /// Files − songs: how many duplicate / variant rows the library
+  /// holds beyond one-canonical-per-song. Always non-negative.
+  int get variantFileCount {
+    final v = totalTrackCount - songCount;
+    return v < 0 ? 0 : v;
+  }
+
   void _ensureLibraryStats() {
     if (_libraryStatsVersion == _libraryVersion) return;
     var enriched = 0;
     var missing = 0;
+    // Song-identity bucketing in the same pass. Tracks with empty
+    // title/artist (songIdentityKey returns null) can't bucket and
+    // each count as a singleton song. Other tracks are deduped by
+    // their identity key.
+    var singletonSongs = 0;
+    var singletonReviewed = 0;
+    final reviewedByBucket = <String, bool>{};
     for (final t in _tracks) {
       if (t.metadataReadAt != null) enriched++;
       if (!t.isAvailable) missing++;
+      final key = songIdentityKey(t);
+      if (key == null) {
+        singletonSongs++;
+        if (t.reviewed) singletonReviewed++;
+        continue;
+      }
+      final prior = reviewedByBucket[key];
+      if (prior == null) {
+        reviewedByBucket[key] = t.reviewed;
+      } else if (!prior && t.reviewed) {
+        reviewedByBucket[key] = true;
+      }
+    }
+    var reviewedBucketed = 0;
+    for (final v in reviewedByBucket.values) {
+      if (v) reviewedBucketed++;
     }
     _enrichedCountCache = enriched;
     _missingCountCache = missing;
+    _songCountCache = singletonSongs + reviewedByBucket.length;
+    _reviewedSongCountCache = singletonReviewed + reviewedBucketed;
     _libraryStatsVersion = _libraryVersion;
   }
   ValueListenable<Duration> get positionListenable => _positionNotifier;

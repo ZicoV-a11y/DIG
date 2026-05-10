@@ -208,21 +208,33 @@ class _LibraryTally extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final total = controller.totalTrackCount;
+    final songs = controller.songCount;
+    final variants = controller.variantFileCount;
     final enriched = controller.enrichedCount;
     final missing = controller.missingCount;
+    final reviewed = controller.reviewedSongCount;
+    final unreviewed = controller.unreviewedSongCount;
     return Row(
       children: [
-        _TallyChunk(label: 'tracks', value: total),
+        _TallyChunk(label: 'files', value: total),
+        const SizedBox(width: 12),
+        _TallyChunk(label: 'songs', value: songs),
+        // Files − songs. Only worth surfacing when the user
+        // actually has duplicates / format variants in the library.
+        if (variants > 0) ...[
+          const SizedBox(width: 12),
+          _TallyChunk(label: 'variants', value: variants),
+        ],
         const SizedBox(width: 12),
         _TallyChunk(label: 'enriched', value: enriched),
         if (missing > 0) ...[
           const SizedBox(width: 12),
-          _TallyChunk(
-            label: 'missing',
-            value: missing,
-            warning: true,
-          ),
+          _TallyChunk(label: 'missing', value: missing, warning: true),
         ],
+        const SizedBox(width: 12),
+        _TallyChunk(label: 'reviewed', value: reviewed),
+        const SizedBox(width: 12),
+        _TallyChunk(label: 'unreviewed', value: unreviewed),
       ],
     );
   }

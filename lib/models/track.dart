@@ -20,7 +20,16 @@ import '../utils/key_normalizer.dart';
 class Track {
   // From indexed_files (file identity + location):
   final String uid;
+
+  /// File-content equivalence hash — same physical file at any path
+  /// collapses to the same value. **Not** a song-identity hash:
+  /// re-encodes of the same song (MP3 vs AIFF) get *different*
+  /// fingerprints because the extension and filesize change. Use
+  /// `sameSongIdentity` / `groupBySongIdentity` in `lib/utils/song_identity.dart`
+  /// for cross-format identity. See `project_track_identity_vs_file_variants.md`
+  /// in project memory.
   final String fingerprint;
+
   String? intelUid;
 
   final String path;

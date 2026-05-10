@@ -13,6 +13,13 @@ import 'package:crypto/crypto.dart';
 ///   duplicates and reconnect intelligence after a folder move.
 /// - [uid] = file revision identity. Unique per concrete file revision
 ///   (changes if mtime changes). Used as the `tracks.uid` PK.
+///
+/// **Naming caveat:** [fingerprint] here is a file-equivalence hash, not
+/// a song-identity hash. Re-encodes of the same song (MP3 vs AIFF) hash
+/// to *different* fingerprints because the extension and filesize change.
+/// For cross-format "same song" matching, see `sameSongIdentity` in
+/// `lib/utils/song_identity.dart` and the project memory entry
+/// `project_track_identity_vs_file_variants.md`.
 class TrackUid {
   final String fingerprint;
   final String uid;

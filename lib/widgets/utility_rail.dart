@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../services/intelligence_export.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
+import '../utils/file_format.dart';
 import 'import_confirm_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
@@ -291,31 +292,122 @@ class _ModeModule extends StatelessWidget {
 
 // ---------- SHOW IN FINDER ----------
 
-class _ShowInFinderModule extends StatelessWidget {
+class _ShowInFinderModule extends StatefulWidget {
   final LibraryController controller;
   const _ShowInFinderModule({required this.controller});
 
   @override
-  Widget build(BuildContext context) {
-    final hasCurrent = controller.currentTrackPath != null;
-    return _RailButton(
-      tooltip: hasCurrent
-          ? 'Show in Finder'
-          : 'Show in Finder (no track)',
-      onPressed: hasCurrent ? controller.showCurrentTrackInFinder : null,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const _SectionLabel('FINDER'),
-          const SizedBox(height: 6),
-          Icon(
-            Icons.open_in_new_rounded,
-            size: 22,
-            color: hasCurrent
-                ? AppColors.textSecondary
-                : AppColors.textTertiary,
+  State<_ShowInFinderModule> createState() => _ShowInFinderModuleState();
+}
+
+class _ShowInFinderModuleState extends State<_ShowInFinderModule> {
+  final GlobalKey _buttonKey = GlobalKey();
+
+  /// Picks which Finder reveal path to use: when the current track is
+  /// a multi-variant bucket primary, surfaces a per-format menu
+  /// anchored to the rail button so the user picks exactly which file
+  /// to open (mirrors the row-level right-click submenu). For
+  /// single-variant rows the call falls through to the existing
+  /// `showCurrentTrackInFinder` which honors playing-instance +
+  /// fallback semantics.
+  Future<void> _handlePress() async {
+    final controller = widget.controller;
+    final current = controller.currentTrack;
+    if (current == null) return;
+    final view = controller.aggregatedViewForPrimary(current);
+    if (view == null || !view.hasSiblings) {
+      await controller.showCurrentTrackInFinder();
+      return;
+    }
+
+    final renderBox =
+        _buttonKey.currentContext?.findRenderObject() as RenderBox?;
+    if (renderBox == null) {
+      // Defensive fallback — should never happen in practice.
+      await controller.showCurrentTrackInFinder();
+      return;
+    }
+    final overlayBox =
+        Overlay.of(context).context.findRenderObject() as RenderBox;
+    final topLeft = renderBox.localToGlobal(Offset.zero);
+    final size = renderBox.size;
+    // Anchor the menu at the button's top-right corner so it opens
+    // alongside the rail, not on top of it.
+    final anchor = Rect.fromLTWH(
+      topLeft.dx + size.width,
+      topLeft.dy,
+      0,
+      size.height,
+    );
+
+    final result = await showMenu<int>(
+      context: context,
+      position: RelativeRect.fromRect(anchor, Offset.zero & overlayBox.size),
+      color: AppColors.surface,
+      elevation: 6,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.zero,
+        side: const BorderSide(color: AppColors.border),
+      ),
+      items: [
+        for (var i = 0; i < view.variants.length; i++)
+          PopupMenuItem<int>(
+            value: i,
+            height: 32,
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.folder_open_rounded,
+                  size: 14,
+                  color: AppColors.textSecondary,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  () {
+                    final f = fileFormatLabel(view.variants[i].filename);
+                    return f.isEmpty
+                        ? 'Show variant ${i + 1} in Finder'
+                        : 'Show $f in Finder';
+                  }(),
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
           ),
-        ],
+      ],
+    );
+
+    if (result == null) return;
+    if (result < 0 || result >= view.variants.length) return;
+    await controller.revealVariantInFinder(view.variants[result]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasCurrent = widget.controller.currentTrackPath != null;
+    return KeyedSubtree(
+      key: _buttonKey,
+      child: _RailButton(
+        tooltip:
+            hasCurrent ? 'Show in Finder' : 'Show in Finder (no track)',
+        onPressed: hasCurrent ? _handlePress : null,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const _SectionLabel('FINDER'),
+            const SizedBox(height: 6),
+            Icon(
+              Icons.open_in_new_rounded,
+              size: 22,
+              color: hasCurrent
+                  ? AppColors.textSecondary
+                  : AppColors.textTertiary,
+            ),
+          ],
+        ),
       ),
     );
   }

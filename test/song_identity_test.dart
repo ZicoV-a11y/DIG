@@ -10,10 +10,11 @@ Track _t({
   String? uid,
   String? path,
   String? identityOverride,
+  String? fingerprint,
 }) {
   return Track(
     uid: uid ?? 'uid-$filename',
-    fingerprint: 'fp-$filename',
+    fingerprint: fingerprint ?? 'fp-$filename',
     identityOverride: identityOverride,
     path: path ?? '/library/$filename',
     filename: filename,
@@ -191,6 +192,120 @@ void main() {
       final a = _t(filename: '.hidden', title: 'T', artist: 'A');
       final b = _t(filename: '.hidden', title: 'T', artist: 'A');
       expect(sameSongIdentity(a, b), isTrue);
+    });
+  });
+
+  group('fingerprint fallback', () {
+    test('same fingerprint pairs even when ID3 tags differ', () {
+      // Two MP3 files with the same filename and audio length but
+      // different ID3 metadata (different tagger / edited tags).
+      // The 4-field rule would fail (title or artist differs); the
+      // fingerprint fallback catches it.
+      final a = _t(
+        filename: 'song.mp3',
+        title: 'Original Title',
+        artist: 'Original Artist',
+        fingerprint: 'shared-fp',
+      );
+      final b = _t(
+        filename: 'song.mp3',
+        title: 'Edited Title',
+        artist: 'Edited Artist',
+        fingerprint: 'shared-fp',
+      );
+      expect(sameSongIdentity(a, b), isTrue);
+    });
+
+    test('same fingerprint pairs even with empty tags', () {
+      final a = _t(
+        filename: 'song.mp3',
+        title: '',
+        artist: '',
+        fingerprint: 'shared-fp',
+      );
+      final b = _t(
+        filename: 'song.mp3',
+        title: 'Tagged',
+        artist: 'Artist',
+        fingerprint: 'shared-fp',
+      );
+      expect(sameSongIdentity(a, b), isTrue);
+    });
+
+    test('different fingerprints + different tags do not match', () {
+      final a = _t(
+        filename: 'one.mp3',
+        title: 'A',
+        artist: 'X',
+        fingerprint: 'fp-a',
+      );
+      final b = _t(
+        filename: 'two.mp3',
+        title: 'B',
+        artist: 'Y',
+        fingerprint: 'fp-b',
+      );
+      expect(sameSongIdentity(a, b), isFalse);
+    });
+
+    test('manual override outranks fingerprint match', () {
+      // Two byte-identical files (same fingerprint) but the user
+      // explicitly set different overrides. Override wins —
+      // they stay distinct.
+      final a = _t(
+        filename: 'song.mp3',
+        title: 'Song',
+        artist: 'Artist',
+        fingerprint: 'shared-fp',
+        identityOverride: 'group-x',
+      );
+      final b = _t(
+        filename: 'song.mp3',
+        title: 'Song',
+        artist: 'Artist',
+        fingerprint: 'shared-fp',
+        identityOverride: 'group-y',
+      );
+      expect(sameSongIdentity(a, b), isFalse);
+    });
+
+    test('groupBySongIdentity merges via fingerprint', () {
+      // The user's reported scenario: two MP3s appear identical on
+      // the row (same filename, same display BPM/key/time) but
+      // have drifted ID3 metadata. They should bucket together.
+      final a = _t(
+        filename: 'Apparel Wax - 008A1.mp3',
+        title: '008A1 (Original Mix)',
+        artist: 'Apparel Wax',
+        fingerprint: 'shared',
+      );
+      final b = _t(
+        filename: 'Apparel Wax - 008A1.mp3',
+        title: '008A1 (Original Mix) ', // trailing space — tag drift
+        artist: 'Apparel Wax',
+        fingerprint: 'shared',
+      );
+      final result = groupBySongIdentity([a, b]);
+      expect(result, hasLength(1));
+      expect(result.first, [a, b]);
+    });
+
+    test('empty fingerprint falls back to 4-field only', () {
+      // Defensive — a row that hasn't been hashed yet shouldn't
+      // collide with all other empty-fingerprint rows.
+      final a = _t(
+        filename: 'a.mp3',
+        title: 'A',
+        artist: 'X',
+        fingerprint: '',
+      );
+      final b = _t(
+        filename: 'b.mp3',
+        title: 'B',
+        artist: 'Y',
+        fingerprint: '',
+      );
+      expect(sameSongIdentity(a, b), isFalse);
     });
   });
 

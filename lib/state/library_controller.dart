@@ -1592,16 +1592,14 @@ class LibraryController extends ChangeNotifier {
   // regardless of which row the user interacted with.
   // ---------------------------------------------------------------------------
 
-  /// Every in-memory Track sharing [t]'s song identity. Returns just
-  /// [t] when the track has empty title/artist (no identity to group
-  /// on) or when no siblings exist. Linear over `_tracks`; called
-  /// only on mutation, so the cost is negligible.
+  /// Every in-memory Track sharing [t]'s song identity. Uses the
+  /// same two-tier rule as the matcher: manual override → 4-field
+  /// match → fingerprint match. Linear over `_tracks`; called only
+  /// on mutation, so the cost is negligible.
   List<Track> variantsFor(Track t) {
-    final key = songIdentityKey(t);
-    if (key == null) return [t];
     final out = <Track>[];
     for (final candidate in _tracks) {
-      if (songIdentityKey(candidate) == key) out.add(candidate);
+      if (sameSongIdentity(t, candidate)) out.add(candidate);
     }
     return out.isEmpty ? [t] : out;
   }

@@ -44,15 +44,23 @@ import '../models/track.dart';
 /// match on.
 bool sameSongIdentity(Track a, Track b) {
   if (identical(a, b)) return true;
-  // Manual override wins over the strict 4-field rule. Two tracks
-  // with the same non-empty override pair regardless of fields; if
-  // only one has an override they're intentionally distinct.
+  // Manual override wins over everything else. Two tracks with the
+  // same non-empty override pair regardless of fields; if only one
+  // has an override they're intentionally distinct (no fallthrough
+  // to fingerprint or 4-field).
   final ao = a.identityOverride;
   final bo = b.identityOverride;
   final aHasOverride = ao != null && ao.isNotEmpty;
   final bHasOverride = bo != null && bo.isNotEmpty;
   if (aHasOverride && bHasOverride) return ao == bo;
   if (aHasOverride != bHasOverride) return false;
+  // Fingerprint fallback: two files with the same `(basename +
+  // filesize + durationMs)` hash are byte-equivalent at the file
+  // level. Always pair them, even when their ID3 tags drifted
+  // (different tagger, edited tags, etc).
+  if (a.fingerprint.isNotEmpty && a.fingerprint == b.fingerprint) {
+    return true;
+  }
   if (a.title.isEmpty || a.artist.isEmpty) return false;
   if (b.title.isEmpty || b.artist.isEmpty) return false;
   if (a.duration.inSeconds != b.duration.inSeconds) return false;
@@ -73,24 +81,32 @@ bool sameSongIdentity(Track a, Track b) {
 /// they round-trip through the table without being silently dropped.
 List<List<Track>> groupBySongIdentity(Iterable<Track> tracks) {
   final buckets = <List<Track>>[];
-  // Hash table over the same key shape as `sameSongIdentity` for
-  // O(n) grouping. Tracks with empty title/artist short-circuit to a
-  // null key and never group with anything.
+  // Two parallel indices, mirroring the two-tier match rule in
+  // `sameSongIdentity`:
+  //   - byKey: primary key (manual override or 4-field) → bucket
+  //   - byFingerprint: file-content equivalence hash → bucket
+  // A track joins an existing bucket if its key matches, else if
+  // its fingerprint matches, else creates a new bucket. When a
+  // track joins (or creates) a bucket, both its key and its
+  // fingerprint are registered to that bucket so future tracks
+  // matching by either signal follow it in.
   final byKey = <String, int>{};
+  final byFingerprint = <String, int>{};
 
   for (final t in tracks) {
     final key = songIdentityKey(t);
-    if (key == null) {
-      buckets.add([t]);
-      continue;
+    int? bucketIdx;
+    if (key != null) bucketIdx = byKey[key];
+    if (bucketIdx == null && t.fingerprint.isNotEmpty) {
+      bucketIdx = byFingerprint[t.fingerprint];
     }
-    final existing = byKey[key];
-    if (existing == null) {
-      byKey[key] = buckets.length;
-      buckets.add([t]);
-    } else {
-      buckets[existing].add(t);
+    if (bucketIdx == null) {
+      bucketIdx = buckets.length;
+      buckets.add([]);
     }
+    buckets[bucketIdx].add(t);
+    if (key != null) byKey[key] = bucketIdx;
+    if (t.fingerprint.isNotEmpty) byFingerprint[t.fingerprint] = bucketIdx;
   }
   return buckets;
 }

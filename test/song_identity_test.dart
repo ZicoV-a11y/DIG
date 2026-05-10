@@ -195,6 +195,85 @@ void main() {
     });
   });
 
+  group('macOS Cmd+D duplicate suffix', () {
+    test('"<name> copy" pairs with "<name>"', () {
+      final original = _t(
+        filename: 'Apparel Wax - 008A1 (Original Mix).mp3',
+        title: '008A1 (Original Mix)',
+        artist: 'Apparel Wax',
+      );
+      final dup = _t(
+        filename: 'Apparel Wax - 008A1 (Original Mix) copy.mp3',
+        title: '008A1 (Original Mix)',
+        artist: 'Apparel Wax',
+      );
+      expect(sameSongIdentity(original, dup), isTrue);
+    });
+
+    test('numbered duplicates (" copy 2", " copy 3") strip too', () {
+      final original = _t(
+        filename: 'song.mp3',
+        title: 'T',
+        artist: 'A',
+      );
+      final dup2 = _t(
+        filename: 'song copy 2.mp3',
+        title: 'T',
+        artist: 'A',
+      );
+      final dup3 = _t(
+        filename: 'song copy 3.mp3',
+        title: 'T',
+        artist: 'A',
+      );
+      expect(sameSongIdentity(original, dup2), isTrue);
+      expect(sameSongIdentity(original, dup3), isTrue);
+      expect(sameSongIdentity(dup2, dup3), isTrue);
+    });
+
+    test('case-insensitive on the "copy" word', () {
+      final a = _t(filename: 'song.mp3', title: 'T', artist: 'A');
+      final b = _t(filename: 'song COPY.mp3', title: 'T', artist: 'A');
+      final c = _t(filename: 'song Copy 2.mp3', title: 'T', artist: 'A');
+      expect(sameSongIdentity(a, b), isTrue);
+      expect(sameSongIdentity(a, c), isTrue);
+    });
+
+    test('only a single trailing " copy[N]" is stripped', () {
+      // macOS actually produces ` copy`, ` copy 2`, ` copy 3` — never
+      // ` copy copy`. The strip is single-shot to match reality: a
+      // file artificially named "track copy copy" strips once to
+      // "track copy" and does not pair with the original "track".
+      final original = _t(filename: 'track.mp3', title: 'T', artist: 'A');
+      final doubleCopy = _t(
+        filename: 'track copy copy.mp3',
+        title: 'T',
+        artist: 'A',
+      );
+      expect(sameSongIdentity(original, doubleCopy), isFalse);
+    });
+
+    test('"copy" inside the name is not stripped', () {
+      // Only matches at the END, with leading whitespace.
+      final a = _t(
+        filename: 'copy machine.mp3',
+        title: 'T',
+        artist: 'A',
+      );
+      final b = _t(filename: 'song.mp3', title: 'T', artist: 'A');
+      expect(sameSongIdentity(a, b), isFalse);
+    });
+
+    test('a file LITERALLY named "copy" is not collapsed to empty', () {
+      // Defensive: "copy.mp3" basename-no-ext = "copy". Stripping
+      // would leave "" which is too aggressive. The whole-name-
+      // empty case falls back to the original.
+      final a = _t(filename: 'copy.mp3', title: 'T', artist: 'A');
+      final b = _t(filename: 'song.mp3', title: 'T', artist: 'A');
+      expect(sameSongIdentity(a, b), isFalse);
+    });
+  });
+
   group('fingerprint fallback', () {
     test('same fingerprint pairs even when ID3 tags differ', () {
       // Two MP3 files with the same filename and audio length but

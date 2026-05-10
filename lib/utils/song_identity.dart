@@ -145,6 +145,26 @@ String _basenameNoExt(String filename) {
   // Caller passes a basename, not a full path — we don't need to
   // hunt for separators.
   final dot = filename.lastIndexOf('.');
-  if (dot <= 0) return filename;
-  return filename.substring(0, dot);
+  final base = (dot <= 0) ? filename : filename.substring(0, dot);
+  return _stripMacOsDuplicateSuffix(base);
+}
+
+// macOS Finder appends " copy" (and " copy 2", " copy 3", etc) when
+// the user duplicates a file via Cmd+D. Strip those suffixes during
+// identity matching so the duplicate pairs with the original. The
+// user reported "ONE OF THEM IS NAMED COPY, THE MAC MADE A DUP AND
+// ADDED COPY TO THE FILE NAME" — this rule unifies that specific
+// flow. Case-insensitive on "copy" (Finder lowercases but a user
+// rename might not). The optional trailing " N" handles further
+// duplicates of duplicates.
+final RegExp _macOsCopySuffix =
+    RegExp(r'\s+copy(?:\s+\d+)?$', caseSensitive: false);
+
+String _stripMacOsDuplicateSuffix(String baseNoExt) {
+  final stripped = baseNoExt.replaceFirst(_macOsCopySuffix, '');
+  // Never strip the whole name — if the input WAS just "copy" or
+  // "copy 2", leave it alone so the comparison still distinguishes
+  // it from other tracks.
+  if (stripped.isEmpty) return baseNoExt;
+  return stripped;
 }

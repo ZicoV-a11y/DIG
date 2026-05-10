@@ -232,12 +232,35 @@ void main() {
       expect(v.formatLabel, 'MP3 · AIFF');
     });
 
-    test('duplicates collapse', () {
+    test('duplicates of the same format show a count suffix', () {
+      // Two MP3 copies (e.g., macOS Cmd+D " copy" duplicate) show
+      // `MP3 ×2` so the user sees there's more than one file under
+      // the bucket without the FORMAT cell hiding the fact.
       final v = AggregatedTrackView([
         _t(filename: 'x.mp3'),
         _t(filename: 'y.mp3'),
       ]);
-      expect(v.formatLabel, 'MP3');
+      expect(v.formatLabel, 'MP3 ×2');
+    });
+
+    test('mixed multi-format + multi-variant', () {
+      // Two MP3s and one AIFF → `MP3 ×2 · AIFF`. The single-
+      // occurrence format omits the count.
+      final v = AggregatedTrackView([
+        _t(filename: 'a.mp3'),
+        _t(filename: 'a copy.mp3'),
+        _t(filename: 'a.aiff'),
+      ]);
+      expect(v.formatLabel, 'MP3 ×2 · AIFF');
+    });
+
+    test('counts appear in preference order', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'a.aiff'),
+        _t(filename: 'b.aiff'),
+        _t(filename: 'a.mp3'),
+      ]);
+      expect(v.formatLabel, 'MP3 · AIFF ×2');
     });
 
     test('unknown extensions go last, alphabetised', () {

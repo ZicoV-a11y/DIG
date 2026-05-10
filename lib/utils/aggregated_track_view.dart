@@ -116,27 +116,39 @@ class AggregatedTrackView {
     return value ?? '';
   }
 
-  /// `MP3 · AIFF` style label of the unique formats present in the
-  /// bucket, in `_formatPreferenceOrder` (lowest-quality first, so
-  /// the bucket leader's format reads first). Unrecognised
-  /// extensions sort to the end.
+  /// `MP3 · AIFF` style label of the formats present in the bucket,
+  /// in `_formatPreferenceOrder` (lowest-quality first, so the
+  /// bucket leader's format reads first). When a format appears
+  /// more than once (e.g., two MP3 copies — typically the macOS
+  /// Cmd+D " copy" duplicate), the count is appended as ` ×N`:
+  ///
+  ///   1 MP3                → `MP3`
+  ///   1 MP3 + 1 AIFF       → `MP3 · AIFF`
+  ///   2 MP3                → `MP3 ×2`
+  ///   2 MP3 + 1 AIFF       → `MP3 ×2 · AIFF`
+  ///   3 MP3 + 2 AIFF       → `MP3 ×3 · AIFF ×2`
+  ///
+  /// Unrecognised extensions sort to the end, alphabetised.
   String get formatLabel {
-    final seen = <String>{};
+    final counts = <String, int>{};
     for (final t in variants) {
       final f = fileFormatLabel(t.filename);
       if (f.isEmpty) continue;
-      seen.add(f);
+      counts[f] = (counts[f] ?? 0) + 1;
     }
-    if (seen.isEmpty) return '';
+    if (counts.isEmpty) return '';
     final ordered = <String>[];
     for (final f in _formatPreferenceOrder) {
-      if (seen.remove(f)) ordered.add(f);
+      if (counts.containsKey(f)) ordered.add(f);
     }
     // Anything not in the canonical order goes at the end,
     // alphabetised so the display is deterministic.
-    final tail = seen.toList()..sort();
+    final remaining = counts.keys.toSet()..removeAll(ordered);
+    final tail = remaining.toList()..sort();
     ordered.addAll(tail);
-    return ordered.join(' · ');
+    return ordered
+        .map((f) => counts[f]! > 1 ? '$f ×${counts[f]}' : f)
+        .join(' · ');
   }
 }
 

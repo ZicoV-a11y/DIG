@@ -992,7 +992,21 @@ class LibraryController extends ChangeNotifier {
     if (_visibleCache != null && _visibleCacheVersion == _libraryVersion) {
       return _visibleCache!;
     }
+    final result = _groupVariants
+        ? _computeGroupedVisible()
+        : _computeFlatVisible();
+    _visibleCache = result;
+    _visibleCacheVersion = _libraryVersion;
+    return result;
+  }
 
+  // ---------------------------------------------------------------------------
+  // Flat (ungrouped) pipeline: per-track filter → sort → sticky-current.
+  // Used when `_groupVariants == false`. Variants render as their own rows
+  // and all filters operate on individual tracks.
+  // ---------------------------------------------------------------------------
+
+  List<Track> _computeFlatVisible() {
     Iterable<Track> list = _tracks;
 
     if (_selectedSourceId != null) {
@@ -1006,51 +1020,94 @@ class LibraryController extends ChangeNotifier {
       }
     }
     if (_unreviewedOnly) {
-      final exemptUids = <String>{};
-      if (_currentTrackUid != null) exemptUids.add(_currentTrackUid!);
-      final upper = _recentReviewedUids.length < _trailVisibleCount
-          ? _recentReviewedUids.length
-          : _trailVisibleCount;
-      for (var i = 0; i < upper; i++) {
-        exemptUids.add(_recentReviewedUids[i]);
-      }
+      final exemptUids = _unreviewedExemptUids();
       list = list.where((t) => !t.reviewed || exemptUids.contains(t.uid));
     }
     if (_searchQuery.isNotEmpty) {
-      final q = _searchQuery.toLowerCase();
-      // If the query parses as a key in any notation (musical /
-      // Camelot / Open Key), match it against each track's
-      // normalized Camelot too — so "Dm" finds 7A-tagged tracks
-      // and "7A" finds Dm-tagged tracks symmetrically.
-      final qCamelot = normalizeKeyToCamelot(_searchQuery)?.toLowerCase();
-      // Search hits the display fields too so users can find tracks
-      // by filename-derived artist while ID3 extraction is still in
-      // flight.
-      list = list.where((t) {
-        if (t.displayTitle.toLowerCase().contains(q)) return true;
-        if (t.displayArtist.toLowerCase().contains(q)) return true;
-        if (t.rawKey.toLowerCase().contains(q)) return true;
-        if (t.displayKey.toLowerCase().contains(q)) return true;
-        if (qCamelot != null &&
-            t.displayKey.toLowerCase() == qCamelot) {
-          return true;
+      final matcher = _buildSearchMatcher();
+      list = list.where(matcher);
+    }
+
+    final result = list.toList();
+    result.sort(_flatComparator);
+    _applyStickyCurrent(result, (t) => t.uid == _currentTrackUid);
+    _bucketsByPrimaryUid = const <String, AggregatedTrackView>{};
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Grouped pipeline: group ALL tracks by song identity first, then filter
+  // at the bucket level (source / unreviewed / search). Sort and sticky-
+  // current operate on primaries using aggregated values. This is the path
+  // that keeps a song's variant set intact across source views — e.g., when
+  // the user navigates into "Z CRATE", a song whose MP3 lives in a different
+  // crate still shows `MP3 · AIFF` and the favorite that was set on the MP3.
+  // ---------------------------------------------------------------------------
+
+  List<Track> _computeGroupedVisible() {
+    // Step 1: group the whole library. Order each bucket so the
+    // lowest-quality format (the displayed primary) is at index 0.
+    final rawBuckets = groupBySongIdentity(_tracks);
+    final buckets = [
+      for (final b in rawBuckets) orderBucketByPlaybackPreference(b),
+    ];
+    // Build the per-bucket aggregated view once so filter / sort don't
+    // have to recompute.
+    final views = <String, AggregatedTrackView>{
+      for (final b in buckets) b.first.uid: AggregatedTrackView(b),
+    };
+
+    // Step 2: bucket-level filtering. A bucket passes if ANY variant
+    // satisfies the filter. This keeps variant sets intact across
+    // source / search views — the user sees the song with full
+    // FORMAT aggregation and aggregated stats regardless of which
+    // crate / folder they're currently looking at.
+    Iterable<List<Track>> filtered = buckets;
+
+    if (_selectedSourceId != null) {
+      final selected = _sourceById(_selectedSourceId!);
+      bool matchesSource(Track t) {
+        if (selected != null && selected.isSubView) {
+          return t.sourceId == selected.parentSourceId &&
+              t.path.startsWith(selected.pathPrefix!);
         }
-        return false;
+        return t.sourceId == _selectedSourceId;
+      }
+      filtered = filtered.where((b) => b.any(matchesSource));
+    }
+
+    if (_unreviewedOnly) {
+      final exemptUids = _unreviewedExemptUids();
+      filtered = filtered.where((b) {
+        // Aggregated reviewed = any variant's cumulativeListened sum
+        // ≥ threshold. Exempt-uid match on any variant keeps the
+        // recent-reviewed trail and the currently-playing bucket
+        // visible while filtering everything else.
+        final view = views[b.first.uid]!;
+        if (!view.reviewed) return true;
+        return b.any((t) => exemptUids.contains(t.uid));
       });
     }
 
-    var result = list.toList();
+    if (_searchQuery.isNotEmpty) {
+      final matcher = _buildSearchMatcher();
+      filtered = filtered.where((b) => b.any(matcher));
+    }
+
+    // Step 3: emit primaries and sort using aggregated values where
+    // applicable so the user's mental model ("the song has 13 plays")
+    // matches what they sort by.
+    final primaries = filtered.map((b) => b.first).toList();
     final dir = _sortAscending ? 1 : -1;
-    result.sort((a, b) {
+    primaries.sort((a, b) {
+      final va = views[a.uid]!;
+      final vb = views[b.uid]!;
       switch (_sortColumn) {
         case TrackSortColumn.favorite:
-          return dir * ((a.favorite ? 1 : 0) - (b.favorite ? 1 : 0));
+          return dir * ((va.favorite ? 1 : 0) - (vb.favorite ? 1 : 0));
         case TrackSortColumn.reviewed:
-          return dir * ((a.reviewed ? 1 : 0) - (b.reviewed ? 1 : 0));
+          return dir * ((va.reviewed ? 1 : 0) - (vb.reviewed ? 1 : 0));
         case TrackSortColumn.title:
-          // Sort uses the display value so newly-scanned files
-          // (no ID3 yet) order naturally by their filename-derived
-          // title rather than collapsing to a single bucket.
           return dir *
               a.displayTitle
                   .toLowerCase()
@@ -1063,19 +1120,18 @@ class LibraryController extends ChangeNotifier {
           if (ba.isEmpty) return -1;
           return dir * aa.compareTo(ba);
         case TrackSortColumn.bpm:
-          final ab = a.bpm;
-          final bb = b.bpm;
+          // Aggregated BPM honours blank-on-disagreement. Buckets
+          // with a usable value sort numerically; rows that show "—"
+          // sink to the bottom in both directions.
+          final ab = va.bpm;
+          final bb = vb.bpm;
           if (ab == null && bb == null) return 0;
           if (ab == null) return 1;
           if (bb == null) return -1;
           return dir * ab.compareTo(bb);
         case TrackSortColumn.key:
-          // Sort by harmonic-wheel position (1A, 1B, 2A, 2B, ...),
-          // not lexicographic on the Camelot string. Unknown keys
-          // always sink to the bottom regardless of direction so
-          // they don't crowd the top.
-          final ak = camelotSortIndex(a.rawKey);
-          final bk = camelotSortIndex(b.rawKey);
+          final ak = camelotSortIndex(va.displayKey);
+          final bk = camelotSortIndex(vb.displayKey);
           if (ak == unknownSortIndex && bk == unknownSortIndex) return 0;
           if (ak == unknownSortIndex) return 1;
           if (bk == unknownSortIndex) return -1;
@@ -1083,24 +1139,20 @@ class LibraryController extends ChangeNotifier {
         case TrackSortColumn.duration:
           return dir * a.duration.compareTo(b.duration);
         case TrackSortColumn.format:
-          // Empty / unrecognised extensions sort to the bottom in
-          // both directions, matching the key / artist / lastPlayed
-          // empty-bucket convention.
-          final af = fileFormatLabel(a.filename);
-          final bf = fileFormatLabel(b.filename);
+          // Sort by the aggregated label so `MP3 · AIFF` buckets sort
+          // together rather than being scattered by their primary's
+          // single-format string.
+          final af = va.formatLabel;
+          final bf = vb.formatLabel;
           if (af.isEmpty && bf.isEmpty) return 0;
           if (af.isEmpty) return 1;
           if (bf.isEmpty) return -1;
           return dir * af.compareTo(bf);
         case TrackSortColumn.plays:
-          return dir * a.playCount.compareTo(b.playCount);
+          return dir * va.playCount.compareTo(vb.playCount);
         case TrackSortColumn.lastPlayed:
-          // Never-played rows sort to the bottom in both directions
-          // (consistent with key/artist's empty-bucket handling) so
-          // the user always sees their actually-played history near
-          // the top when sorting by recency.
-          final la = a.lastPlayedAt;
-          final lb = b.lastPlayedAt;
+          final la = va.lastPlayedAt;
+          final lb = vb.lastPlayedAt;
           if (la == null && lb == null) return 0;
           if (la == null) return 1;
           if (lb == null) return -1;
@@ -1108,47 +1160,135 @@ class LibraryController extends ChangeNotifier {
       }
     });
 
-    if (_currentTrackUid != null) {
-      final naturalIdx = result.indexWhere((t) => t.uid == _currentTrackUid);
-      if (naturalIdx >= 0) {
-        if (_lockedCurrentIndex == null) {
-          _lockedCurrentIndex = naturalIdx;
-        } else if (naturalIdx != _lockedCurrentIndex) {
-          final t = result.removeAt(naturalIdx);
-          final insertAt = _lockedCurrentIndex!.clamp(0, result.length);
-          result.insert(insertAt, t);
-        }
-      }
-    }
+    // Step 4: sticky-current. The current track may be the primary OR
+    // a sibling — pin whichever bucket *contains* it. Matches the
+    // existing flat-pipeline rule (lock natural index on first
+    // observation, otherwise move the row to honour the lock).
+    _applyStickyCurrent(primaries, (primary) {
+      final view = views[primary.uid]!;
+      return view.variants.any((t) => t.uid == _currentTrackUid);
+    });
 
-    if (_groupVariants) {
-      // Collapse each song-identity bucket to a single primary row
-      // (lowest-quality format first). Siblings never appear as
-      // their own rows — the user reaches them via the right-click
-      // "Show in Finder" submenu, which enumerates the bucket's
-      // variants from `_bucketsByPrimaryUid`. `groupBySongIdentity`
-      // is first-seen-stable, so a bucket's position in the visible
-      // list is set by whichever variant sorted highest. Within
-      // each bucket, `orderBucketByPlaybackPreference` puts the
-      // primary at index 0 regardless of sort.
-      final buckets = groupBySongIdentity(result);
-      final flat = <Track>[];
-      final views = <String, AggregatedTrackView>{};
-      for (final bucket in buckets) {
-        final ordered = orderBucketByPlaybackPreference(bucket);
-        final primary = ordered.first;
-        flat.add(primary);
-        views[primary.uid] = AggregatedTrackView(ordered);
-      }
-      _bucketsByPrimaryUid = views;
-      result = flat;
-    } else {
-      _bucketsByPrimaryUid = const <String, AggregatedTrackView>{};
-    }
+    // Step 5: trim the bucket map to visible primaries only. The table
+    // builds row-level renderers off this map (`aggregatedViewForPrimary`)
+    // and consults it for context-menu variant lists — no point
+    // exposing buckets the user can't see in the current view.
+    final visibleViews = <String, AggregatedTrackView>{
+      for (final p in primaries) p.uid: views[p.uid]!,
+    };
+    _bucketsByPrimaryUid = visibleViews;
+    return primaries;
+  }
 
-    _visibleCache = result;
-    _visibleCacheVersion = _libraryVersion;
-    return result;
+  // ---------------------------------------------------------------------------
+  // Shared filter / sort / sticky helpers — kept private to the controller.
+  // ---------------------------------------------------------------------------
+
+  Set<String> _unreviewedExemptUids() {
+    final exempt = <String>{};
+    if (_currentTrackUid != null) exempt.add(_currentTrackUid!);
+    final upper = _recentReviewedUids.length < _trailVisibleCount
+        ? _recentReviewedUids.length
+        : _trailVisibleCount;
+    for (var i = 0; i < upper; i++) {
+      exempt.add(_recentReviewedUids[i]);
+    }
+    return exempt;
+  }
+
+  /// Builds the per-track search predicate. Reused by both pipelines so
+  /// the search semantics ("Dm" finds 7A-tagged, "7A" finds Dm-tagged,
+  /// raw musicalKey contains, display fields contain) stay identical
+  /// whether grouping is on or off.
+  bool Function(Track) _buildSearchMatcher() {
+    final q = _searchQuery.toLowerCase();
+    final qCamelot = normalizeKeyToCamelot(_searchQuery)?.toLowerCase();
+    return (t) {
+      if (t.displayTitle.toLowerCase().contains(q)) return true;
+      if (t.displayArtist.toLowerCase().contains(q)) return true;
+      if (t.rawKey.toLowerCase().contains(q)) return true;
+      if (t.displayKey.toLowerCase().contains(q)) return true;
+      if (qCamelot != null && t.displayKey.toLowerCase() == qCamelot) {
+        return true;
+      }
+      return false;
+    };
+  }
+
+  int _flatComparator(Track a, Track b) {
+    final dir = _sortAscending ? 1 : -1;
+    switch (_sortColumn) {
+      case TrackSortColumn.favorite:
+        return dir * ((a.favorite ? 1 : 0) - (b.favorite ? 1 : 0));
+      case TrackSortColumn.reviewed:
+        return dir * ((a.reviewed ? 1 : 0) - (b.reviewed ? 1 : 0));
+      case TrackSortColumn.title:
+        return dir *
+            a.displayTitle
+                .toLowerCase()
+                .compareTo(b.displayTitle.toLowerCase());
+      case TrackSortColumn.artist:
+        final aa = a.displayArtist.toLowerCase();
+        final ba = b.displayArtist.toLowerCase();
+        if (aa.isEmpty && ba.isEmpty) return 0;
+        if (aa.isEmpty) return 1;
+        if (ba.isEmpty) return -1;
+        return dir * aa.compareTo(ba);
+      case TrackSortColumn.bpm:
+        final ab = a.bpm;
+        final bb = b.bpm;
+        if (ab == null && bb == null) return 0;
+        if (ab == null) return 1;
+        if (bb == null) return -1;
+        return dir * ab.compareTo(bb);
+      case TrackSortColumn.key:
+        final ak = camelotSortIndex(a.rawKey);
+        final bk = camelotSortIndex(b.rawKey);
+        if (ak == unknownSortIndex && bk == unknownSortIndex) return 0;
+        if (ak == unknownSortIndex) return 1;
+        if (bk == unknownSortIndex) return -1;
+        return dir * ak.compareTo(bk);
+      case TrackSortColumn.duration:
+        return dir * a.duration.compareTo(b.duration);
+      case TrackSortColumn.format:
+        final af = fileFormatLabel(a.filename);
+        final bf = fileFormatLabel(b.filename);
+        if (af.isEmpty && bf.isEmpty) return 0;
+        if (af.isEmpty) return 1;
+        if (bf.isEmpty) return -1;
+        return dir * af.compareTo(bf);
+      case TrackSortColumn.plays:
+        return dir * a.playCount.compareTo(b.playCount);
+      case TrackSortColumn.lastPlayed:
+        final la = a.lastPlayedAt;
+        final lb = b.lastPlayedAt;
+        if (la == null && lb == null) return 0;
+        if (la == null) return 1;
+        if (lb == null) return -1;
+        return dir * la.compareTo(lb);
+    }
+  }
+
+  /// Locks the row identified by [matchesCurrent] to the index where it
+  /// first appeared in the sorted list; if it later sorts to a
+  /// different natural position (because its play count / favorite /
+  /// last-played changed under the hood), move it back to the locked
+  /// index so the user's eye doesn't have to chase the row.
+  void _applyStickyCurrent(
+    List<Track> rows,
+    bool Function(Track) matchesCurrent,
+  ) {
+    if (_currentTrackUid == null) return;
+    final naturalIdx = rows.indexWhere(matchesCurrent);
+    if (naturalIdx < 0) return;
+    if (_lockedCurrentIndex == null) {
+      _lockedCurrentIndex = naturalIdx;
+      return;
+    }
+    if (naturalIdx == _lockedCurrentIndex) return;
+    final t = rows.removeAt(naturalIdx);
+    final insertAt = _lockedCurrentIndex!.clamp(0, rows.length);
+    rows.insert(insertAt, t);
   }
 
   void _markLibraryDirty() {

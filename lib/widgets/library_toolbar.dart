@@ -136,13 +136,6 @@ class LibraryToolbar extends StatelessWidget {
                     onTap: controller.toggleUnreviewedOnly,
                   ),
                   const SizedBox(width: 8),
-                  ToolbarToggle(
-                    label: 'Group variants',
-                    value: controller.groupVariants,
-                    onTap: () => controller
-                        .setGroupVariants(!controller.groupVariants),
-                  ),
-                  const SizedBox(width: 8),
                   _ToolbarIconButton(
                     icon: Icons.keyboard_outlined,
                     tooltip: 'Keyboard shortcuts',

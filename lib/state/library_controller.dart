@@ -16,7 +16,6 @@ import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
 import '../utils/aggregated_track_view.dart';
-import '../utils/file_format.dart';
 import '../utils/key_normalizer.dart';
 import '../utils/song_identity.dart';
 
@@ -168,14 +167,13 @@ class LibraryController extends ChangeNotifier {
   int _visibleCacheVersion = -1;
   int? _lockedCurrentIndex;
 
-  // Variant-collapse state. When `_groupVariants` is true, the
-  // visible-tracks pipeline collapses each song-identity bucket
-  // into a single primary row (lowest-quality format wins — MP3 >
-  // FLAC > WAV > AIFF). The siblings never appear as their own
-  // table rows; the user gets at them via the right-click "Show in
-  // Finder" submenu (one item per variant) and via aggregated
-  // cell values on the primary row.
-  bool _groupVariants = true;
+  // The visible-tracks pipeline always collapses each song-identity
+  // bucket into a single primary row (lowest-quality format wins —
+  // MP3 > FLAC > WAV > AIFF). Siblings never appear as their own
+  // table rows; the user reaches them via the right-click "Show in
+  // Finder" submenu (one item per variant) and via aggregated cell
+  // values on the primary row.
+  //
   // Side-table built each pipeline run: lookup from primary's uid
   // → the bucket's AggregatedTrackView so the table can render
   // aggregated cells (sum plays, blank-on-disagreement BPM/key,
@@ -304,8 +302,6 @@ class LibraryController extends ChangeNotifier {
         double.tryParse(settings['col_artist_width'] ?? '') ?? _colArtistWidth;
     _colFormatWidth =
         double.tryParse(settings['col_format_width'] ?? '') ?? _colFormatWidth;
-    final groupVariantsRaw = settings['group_variants'];
-    if (groupVariantsRaw != null) _groupVariants = groupVariantsRaw == '1';
     final orderStr = settings['column_order'];
     if (orderStr != null && orderStr.isNotEmpty) {
       final parsed = orderStr
@@ -733,16 +729,9 @@ class LibraryController extends ChangeNotifier {
   double get colFormatWidth => _colFormatWidth;
   double get colPlaysWidth => _colPlaysWidth;
 
-  /// When `true`, the visible-tracks pipeline collapses each
-  /// song-identity bucket into a single primary row. See
-  /// `project_track_identity_vs_file_variants.md` and
-  /// [AggregatedTrackView] for the rules.
-  bool get groupVariants => _groupVariants;
-
   /// Aggregated cell values for a collapsed bucket whose primary
-  /// row is [primary]. Returns `null` when grouping is off, when
-  /// [primary] is not a bucket primary (e.g., it's an expanded
-  /// sibling), or before the visible-tracks pipeline has been run.
+  /// row is [primary]. Returns `null` when [primary] is not a bucket
+  /// primary or before the visible-tracks pipeline has been run.
   AggregatedTrackView? aggregatedViewForPrimary(Track primary) =>
       _bucketsByPrimaryUid[primary.uid];
 
@@ -752,14 +741,6 @@ class LibraryController extends ChangeNotifier {
   bool primaryHasSiblings(Track primary) {
     final view = _bucketsByPrimaryUid[primary.uid];
     return view != null && view.hasSiblings;
-  }
-
-  Future<void> setGroupVariants(bool value) async {
-    if (_groupVariants == value) return;
-    _groupVariants = value;
-    _visibleCache = null;
-    notifyListeners();
-    await repo.setSetting('group_variants', value ? '1' : '0');
   }
   double get colLastPlayedWidth => _colLastPlayedWidth;
   double get colTitleWidth => _colTitleWidth;
@@ -992,46 +973,9 @@ class LibraryController extends ChangeNotifier {
     if (_visibleCache != null && _visibleCacheVersion == _libraryVersion) {
       return _visibleCache!;
     }
-    final result = _groupVariants
-        ? _computeGroupedVisible()
-        : _computeFlatVisible();
+    final result = _computeGroupedVisible();
     _visibleCache = result;
     _visibleCacheVersion = _libraryVersion;
-    return result;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Flat (ungrouped) pipeline: per-track filter → sort → sticky-current.
-  // Used when `_groupVariants == false`. Variants render as their own rows
-  // and all filters operate on individual tracks.
-  // ---------------------------------------------------------------------------
-
-  List<Track> _computeFlatVisible() {
-    Iterable<Track> list = _tracks;
-
-    if (_selectedSourceId != null) {
-      final selected = _sourceById(_selectedSourceId!);
-      if (selected != null && selected.isSubView) {
-        list = list.where((t) =>
-            t.sourceId == selected.parentSourceId &&
-            t.path.startsWith(selected.pathPrefix!));
-      } else {
-        list = list.where((t) => t.sourceId == _selectedSourceId);
-      }
-    }
-    if (_unreviewedOnly) {
-      final exemptUids = _unreviewedExemptUids();
-      list = list.where((t) => !t.reviewed || exemptUids.contains(t.uid));
-    }
-    if (_searchQuery.isNotEmpty) {
-      final matcher = _buildSearchMatcher();
-      list = list.where(matcher);
-    }
-
-    final result = list.toList();
-    result.sort(_flatComparator);
-    _applyStickyCurrent(result, (t) => t.uid == _currentTrackUid);
-    _bucketsByPrimaryUid = const <String, AggregatedTrackView>{};
     return result;
   }
 
@@ -1213,60 +1157,6 @@ class LibraryController extends ChangeNotifier {
       }
       return false;
     };
-  }
-
-  int _flatComparator(Track a, Track b) {
-    final dir = _sortAscending ? 1 : -1;
-    switch (_sortColumn) {
-      case TrackSortColumn.favorite:
-        return dir * ((a.favorite ? 1 : 0) - (b.favorite ? 1 : 0));
-      case TrackSortColumn.reviewed:
-        return dir * ((a.reviewed ? 1 : 0) - (b.reviewed ? 1 : 0));
-      case TrackSortColumn.title:
-        return dir *
-            a.displayTitle
-                .toLowerCase()
-                .compareTo(b.displayTitle.toLowerCase());
-      case TrackSortColumn.artist:
-        final aa = a.displayArtist.toLowerCase();
-        final ba = b.displayArtist.toLowerCase();
-        if (aa.isEmpty && ba.isEmpty) return 0;
-        if (aa.isEmpty) return 1;
-        if (ba.isEmpty) return -1;
-        return dir * aa.compareTo(ba);
-      case TrackSortColumn.bpm:
-        final ab = a.bpm;
-        final bb = b.bpm;
-        if (ab == null && bb == null) return 0;
-        if (ab == null) return 1;
-        if (bb == null) return -1;
-        return dir * ab.compareTo(bb);
-      case TrackSortColumn.key:
-        final ak = camelotSortIndex(a.rawKey);
-        final bk = camelotSortIndex(b.rawKey);
-        if (ak == unknownSortIndex && bk == unknownSortIndex) return 0;
-        if (ak == unknownSortIndex) return 1;
-        if (bk == unknownSortIndex) return -1;
-        return dir * ak.compareTo(bk);
-      case TrackSortColumn.duration:
-        return dir * a.duration.compareTo(b.duration);
-      case TrackSortColumn.format:
-        final af = fileFormatLabel(a.filename);
-        final bf = fileFormatLabel(b.filename);
-        if (af.isEmpty && bf.isEmpty) return 0;
-        if (af.isEmpty) return 1;
-        if (bf.isEmpty) return -1;
-        return dir * af.compareTo(bf);
-      case TrackSortColumn.plays:
-        return dir * a.playCount.compareTo(b.playCount);
-      case TrackSortColumn.lastPlayed:
-        final la = a.lastPlayedAt;
-        final lb = b.lastPlayedAt;
-        if (la == null && lb == null) return 0;
-        if (la == null) return 1;
-        if (lb == null) return -1;
-        return dir * la.compareTo(lb);
-    }
   }
 
   /// Locks the row identified by [matchesCurrent] to the index where it

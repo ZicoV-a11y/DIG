@@ -898,6 +898,11 @@ class _TrackRow extends StatelessWidget {
     }
     items.add(const PopupMenuDivider(height: 1));
     items.add(_linkMenuItem());
+    // UNLINK only meaningful when the row is the primary of a
+    // multi-variant bucket. Hidden on singletons.
+    if (aggView != null && aggView.hasSiblings) {
+      items.add(_unlinkMenuItem(variantCount: aggView.variantCount));
+    }
 
     final result = await showMenu<String>(
       context: context,
@@ -931,7 +936,92 @@ class _TrackRow extends StatelessWidget {
       if (target != null) {
         await controller.linkTracks(track, target);
       }
+    } else if (result == 'unlink' && context.mounted) {
+      final view = controller.aggregatedViewForPrimary(track);
+      if (view == null || !view.hasSiblings) return;
+      final confirmed = await _confirmUnlink(
+        context,
+        variantCount: view.variantCount,
+      );
+      if (confirmed == true) {
+        await controller.unlinkBucket(track);
+      }
     }
+  }
+
+  Future<bool?> _confirmUnlink(
+    BuildContext context, {
+    required int variantCount,
+  }) {
+    return showDialog<bool>(
+      context: context,
+      barrierColor: Colors.black54,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.zero,
+          side: const BorderSide(color: AppColors.border),
+        ),
+        title: const Text(
+          'Unlink variants?',
+          style: TextStyle(
+            color: AppColors.textPrimary,
+            fontSize: 14,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.4,
+          ),
+        ),
+        content: Text(
+          'This breaks the song-identity bucket of $variantCount '
+          'files into separate songs. Play count, favorite, and '
+          'review state will reset for all of them. File analysis '
+          '(BPM, key, duration) is kept.',
+          style: const TextStyle(
+            color: AppColors.textSecondary,
+            fontSize: 12,
+            height: 1.4,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.textSecondary,
+            ),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: TextButton.styleFrom(
+              foregroundColor: AppColors.favorite,
+            ),
+            child: const Text('Unlink'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _unlinkMenuItem({required int variantCount}) {
+    return PopupMenuItem<String>(
+      value: 'unlink',
+      height: 32,
+      child: Row(
+        children: [
+          const Icon(
+            Icons.link_off_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          const SizedBox(width: 8),
+          Text(
+            'Unlink $variantCount variants…',
+            style:
+                const TextStyle(color: AppColors.textPrimary, fontSize: 12),
+          ),
+        ],
+      ),
+    );
   }
 
   PopupMenuItem<String> _linkMenuItem() {

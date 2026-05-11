@@ -1767,6 +1767,39 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Tear down [origin]'s song-identity bucket. Every variant becomes
+  /// its own singleton (its `identityOverride` is forced to its own
+  /// uid, ensuring no future auto-match re-pairs them), and every
+  /// piece of *behavioral* intelligence — play count, favorite,
+  /// cumulative listened, last played, review state — resets to its
+  /// default on all variants.
+  ///
+  /// Per project memory: unlink means "these are NOT the same song
+  /// anymore." File-analysis fields (BPM, key, duration, fingerprint)
+  /// live on the per-file row and stay untouched.
+  ///
+  /// No-ops when the bucket has only one variant — nothing to unlink.
+  Future<void> unlinkBucket(Track origin) async {
+    final bucket = variantsFor(origin);
+    if (bucket.length < 2) return;
+
+    await repo.unlinkBucketIntelligence(
+      bucket.map((t) => t.path).toList(),
+    );
+    // Mirror the DB tear-down into the in-memory tracks so the
+    // table redraws immediately without a full reload.
+    for (final t in bucket) {
+      t.identityOverride = t.uid;
+      t.intelUid = null;
+      t.favorite = false;
+      t.playCount = 0;
+      t.cumulativeListened = Duration.zero;
+      t.lastPlayedAt = null;
+    }
+    _markLibraryDirty();
+    notifyListeners();
+  }
+
   Future<void> toggleFavorite(String uid) async {
     final t = _trackByUid(uid);
     if (t == null) return;

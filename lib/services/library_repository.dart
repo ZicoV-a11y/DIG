@@ -503,6 +503,93 @@ class LibraryRepository {
     });
   }
 
+  /// Tear down a song-identity bucket: each file in [paths] is
+  /// pushed back to a singleton identity, the shared `tracks` row
+  /// (if any) is deleted, and every variant's reference is cleared.
+  ///
+  /// Per project philosophy (`project_track_identity_vs_file_variants.md`):
+  /// unlink means "these are NOT the same song anymore", so the
+  /// behavioral intelligence — play count, favorite, cumulative
+  /// listened, last played, review state — is *reset*. Not cloned,
+  /// not "winner-takes-all". File-analysis fields (BPM, key,
+  /// duration, fingerprint) live on `indexed_files` and survive
+  /// untouched.
+  ///
+  /// Side effects, all inside one transaction:
+  ///   1. Each row in [paths]: `identity_override = uid` (the row's
+  ///      own uid → guaranteed-unique singleton bucket).
+  ///   2. Each row in [paths]: `intel_uid = NULL`.
+  ///   3. Each `tracks` row that was referenced by one of these
+  ///      paths and has no other referrer left is deleted.
+  ///
+  /// Returns the set of `tracks.uid` values deleted, so the
+  /// in-memory controller can drop any cached references.
+  Future<Set<String>> unlinkBucketIntelligence(List<String> paths) async {
+    if (paths.isEmpty) return <String>{};
+    return _db.transaction<Set<String>>((txn) async {
+      final placeholders = List.filled(paths.length, '?').join(',');
+      final rows = await txn.query(
+        'indexed_files',
+        columns: ['uid', 'path', 'intel_uid'],
+        where: 'path IN ($placeholders)',
+        whereArgs: paths,
+      );
+      if (rows.isEmpty) return <String>{};
+
+      // Snapshot the intel_uids that were referenced by this bucket
+      // before we null them out — we'll check below whether they
+      // still have any referrers outside the bucket and delete
+      // those that don't.
+      final priorIntelUids = <String>{
+        for (final r in rows)
+          if ((r['intel_uid'] as String?) != null)
+            r['intel_uid'] as String,
+      };
+
+      // Force each row into a singleton identity (override = own
+      // uid) and drop its intel reference. Use a per-row update
+      // because identity_override differs across rows.
+      final batch = txn.batch();
+      for (final r in rows) {
+        batch.update(
+          'indexed_files',
+          {
+            'identity_override': r['uid'] as String,
+            'intel_uid': null,
+          },
+          where: 'path = ?',
+          whereArgs: [r['path'] as String],
+        );
+      }
+      await batch.commit(noResult: true);
+
+      // Delete any tracks rows that became orphaned. A `tracks`
+      // row is orphaned iff no `indexed_files` row references it
+      // anymore. (Defensive — in the post-slice-3 world a bucket
+      // shares one intel uid, so almost always the prior uid set
+      // has exactly one element and it's now orphaned.)
+      final deleted = <String>{};
+      for (final uid in priorIntelUids) {
+        final referrers = await txn.query(
+          'indexed_files',
+          columns: ['path'],
+          where: 'intel_uid = ?',
+          whereArgs: [uid],
+          limit: 1,
+        );
+        if (referrers.isEmpty) {
+          await txn.delete(
+            'tracks',
+            where: 'uid = ?',
+            whereArgs: [uid],
+          );
+          deleted.add(uid);
+        }
+      }
+      return deleted;
+    });
+  }
+
   /// Set (or clear) the manual identity override for a set of file
   /// paths. When [value] is non-null, the listed rows will bucket
   /// together under [value] regardless of whether the strict 4-field

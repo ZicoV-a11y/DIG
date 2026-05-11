@@ -16,7 +16,7 @@ class AppDatabase {
   // v7 adds `sources.parent_source_id` + `sources.path_prefix` so a
   // folder picked inside an already-watched source becomes a virtual
   // "sub-view" instead of a duplicate scanning source.
-  static const _schemaVersion = 10;
+  static const _schemaVersion = 11;
 
   late final Database _db;
 
@@ -162,6 +162,31 @@ class AppDatabase {
       )
     ''');
     batch.execute('CREATE INDEX idx_tracks_fingerprint ON tracks(fingerprint)');
+
+    // Append-only activity log. Every lifecycle decision the
+    // system makes (mark missing, auto-supersede, purge, manual
+    // relink, etc.) records a row here, so the UI can narrate
+    // *why* a track ended up in its current state. Cross-cutting
+    // concern — not its own domain layer, just the readout
+    // surface over the file-lifecycle + identity layers.
+    //
+    // event_type is a stable string constant; payload is
+    // type-specific JSON so we can extend without schema churn.
+    batch.execute('''
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recorded_at INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        path TEXT,
+        source_id TEXT,
+        payload TEXT
+      )
+    ''');
+    batch.execute(
+      'CREATE INDEX idx_events_recorded_at ON events(recorded_at)',
+    );
+    batch.execute('CREATE INDEX idx_events_type ON events(event_type)');
+    batch.execute('CREATE INDEX idx_events_path ON events(path)');
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -207,6 +232,48 @@ class AppDatabase {
     if (oldVersion < 10) {
       await _migrateV9toV10(db);
     }
+    if (oldVersion < 11) {
+      await _migrateV10toV11(db);
+    }
+  }
+
+  /// Add the `events` activity log. Append-only audit table —
+  /// every lifecycle decision the system makes (mark missing,
+  /// auto-supersede, purge, etc.) records here so the user
+  /// can see *why* a row ended up in its current state.
+  ///
+  /// Idempotent — safe to retry after a partial migration.
+  static Future<void> _migrateV10toV11(Database db) async {
+    debugPrint('[db] starting v10 → v11 migration (events activity log)');
+    final stopwatch = Stopwatch()..start();
+    final tables = await db.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+    );
+    if (tables.isEmpty) {
+      await db.execute('''
+        CREATE TABLE events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          recorded_at INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          path TEXT,
+          source_id TEXT,
+          payload TEXT
+        )
+      ''');
+    }
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_events_recorded_at '
+      'ON events(recorded_at)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_events_path ON events(path)',
+    );
+    debugPrint(
+      '[db] v10 → v11 done in ${stopwatch.elapsedMilliseconds}ms.',
+    );
   }
 
   /// Add `indexed_files.content_hash` (nullable TEXT) + an index on

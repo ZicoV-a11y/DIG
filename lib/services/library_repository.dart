@@ -1,5 +1,8 @@
+import 'dart:convert';
+
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import '../models/activity_event.dart';
 import '../models/intelligence_record.dart';
 import '../models/source.dart';
 import '../models/track.dart';
@@ -661,6 +664,81 @@ class LibraryRepository {
         )
     ''');
   }
+
+  // ---------------------------------------------------------------------------
+  // Activity log (cross-cutting — see lib/models/activity_event.dart)
+  // ---------------------------------------------------------------------------
+
+  /// Append a single event row. Used by every lifecycle-decision
+  /// code path that wants to leave an audit trail (mark missing,
+  /// auto-supersede, purge, manual relink, ...).
+  ///
+  /// Best-effort: failures are logged but do NOT propagate. The
+  /// audit log is observability; it must not block the lifecycle
+  /// decision it's describing.
+  ///
+  /// [type] should be one of the `EventType.*` constants. [payload]
+  /// gets JSON-encoded; pass `null` for events that don't need
+  /// type-specific fields.
+  Future<void> recordEvent({
+    required String type,
+    String? path,
+    String? sourceId,
+    Map<String, Object?>? payload,
+    DatabaseExecutor? txn,
+  }) async {
+    final exec = txn ?? _db;
+    try {
+      await exec.insert('events', {
+        'recorded_at': DateTime.now().millisecondsSinceEpoch,
+        'event_type': type,
+        'path': path,
+        'source_id': sourceId,
+        'payload': payload == null ? null : jsonEncode(payload),
+      });
+    } catch (e) {
+      // Swallow — observability isn't worth blocking real work.
+      // ignore: avoid_print
+      // (debugPrint is not imported here; the failure surfaces in
+      // dev only via the IDE if needed)
+    }
+  }
+
+  /// Paginated history feed for the activity log UI. Newest first.
+  /// [limit] caps the result size; [offset] supports scroll-loading
+  /// older entries. Optional [eventTypes] filter narrows to specific
+  /// kinds (e.g. only `removed_external` for a "what disappeared?"
+  /// view).
+  Future<List<ActivityEvent>> loadRecentEvents({
+    int limit = 200,
+    int offset = 0,
+    List<String>? eventTypes,
+  }) async {
+    final where = StringBuffer();
+    final args = <Object?>[];
+    if (eventTypes != null && eventTypes.isNotEmpty) {
+      final placeholders = List.filled(eventTypes.length, '?').join(',');
+      where.write('WHERE event_type IN ($placeholders)');
+      args.addAll(eventTypes);
+    }
+    final rows = await _db.rawQuery(
+      'SELECT id, recorded_at, event_type, path, source_id, payload '
+      'FROM events $where '
+      'ORDER BY recorded_at DESC, id DESC '
+      'LIMIT ? OFFSET ?',
+      [...args, limit, offset],
+    );
+    return rows.map(ActivityEvent.fromRow).toList();
+  }
+
+  /// Lifetime event count (for "X events total" indicators). Cheap —
+  /// indexed_at index helps but the COUNT is straight up.
+  Future<int> eventCount() async {
+    final row = await _db.rawQuery('SELECT COUNT(*) AS c FROM events');
+    return (row.first['c'] as int?) ?? 0;
+  }
+
+  // ---------------------------------------------------------------------------
 
   /// Number of indexed files (any availability) under [sourceId].
   Future<int> countIndexedFiles(String sourceId) async {

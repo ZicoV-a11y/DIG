@@ -222,6 +222,15 @@ class LibraryController extends ChangeNotifier {
   // pile the queue forever and exaggerate "Enriching" totals.
   final Set<String> _failedEnrichmentPaths = {};
 
+  // Per-source filesystem watchers. Each watcher fires on any
+  // create / modify / delete inside the source folder (recursive
+  // when the source's scan mode is recursive). Events are coalesced
+  // through `_watcherDebounce` — a burst of events from a file save
+  // or a folder move only triggers one rescan.
+  final Map<String, StreamSubscription<FileSystemEvent>> _watchers = {};
+  final Map<String, Timer> _watcherDebounce = {};
+  static const _watcherDebounceWindow = Duration(milliseconds: 500);
+
   // Throttle notifyListeners() during phase-2 metadata enrichment.
   // Without this, each 100-file batch triggered a full UI rebuild +
   // visible-cache invalidation + 12k-element re-sort. With ~25
@@ -355,6 +364,18 @@ class LibraryController extends ChangeNotifier {
     _replaceTracks(tracks);
     _markLibraryDirty();
     notifyListeners();
+
+    // Start a filesystem watcher per non-sub-view source so external
+    // changes (deletes, renames, new drops) flow into the table
+    // without a manual rescan. Best-effort: failures (unsupported
+    // FS, missing path) are logged and the manual rescan path still
+    // works.
+    for (final source in sources) {
+      // Don't await — watchers should come up in parallel; we
+      // don't want to gate hydrate completion on per-source
+      // watcher setup, especially over slow cloud volumes.
+      unawaited(_startWatcher(source));
+    }
 
     final unenriched =
         tracks.where((t) => t.metadataReadAt == null).length;
@@ -1398,6 +1419,7 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
 
     await _scanIntoSource(source);
+    unawaited(_startWatcher(source));
   }
 
   /// Insert a sub-view source row. Sub-views never scan, never own
@@ -1550,11 +1572,76 @@ class LibraryController extends ChangeNotifier {
     }
   }
 
+  /// Start watching [source]'s folder for filesystem events. On any
+  /// change (create / modify / delete) inside the folder, schedule a
+  /// debounced rescan of just this source so the in-memory library
+  /// stays current with what's actually on disk. The user reported
+  /// "i just deleted one of those, but still shows up" — this is the
+  /// instant-sync path that closes that loop.
+  ///
+  /// No-op for sub-views (they don't own files), non-existent paths,
+  /// and non-macOS platforms (only macOS has been verified to deliver
+  /// usable events from `Directory.watch`).
+  Future<void> _startWatcher(Source source) async {
+    if (!Platform.isMacOS) return;
+    if (source.isSubView) return;
+    await _stopWatcher(source.id);
+    final dir = Directory(source.folderPath);
+    if (!await dir.exists()) return;
+    try {
+      final sub = dir
+          .watch(
+            events: FileSystemEvent.all,
+            recursive: source.scanMode == ScanMode.recursive,
+          )
+          .listen(
+            (event) => _onWatcherEvent(source.id, event),
+            onError: (e) => debugPrint(
+              '[watcher] ${source.displayName}: $e',
+            ),
+            cancelOnError: false,
+          );
+      _watchers[source.id] = sub;
+    } catch (e) {
+      // Directory.watch can throw on some filesystems (older NFS,
+      // unsupported sandbox configurations). Fail soft — manual
+      // rescan still works.
+      debugPrint('[watcher] failed to start for ${source.displayName}: $e');
+    }
+  }
+
+  void _onWatcherEvent(String sourceId, FileSystemEvent event) {
+    // Coalesce bursts. A single file save can fire create + modify
+    // events in quick succession; a folder move can fire dozens.
+    _watcherDebounce[sourceId]?.cancel();
+    _watcherDebounce[sourceId] = Timer(_watcherDebounceWindow, () {
+      _watcherDebounce.remove(sourceId);
+      rescanSource(sourceId);
+    });
+  }
+
+  Future<void> _stopWatcher(String sourceId) async {
+    final sub = _watchers.remove(sourceId);
+    await sub?.cancel();
+    _watcherDebounce.remove(sourceId)?.cancel();
+  }
+
+  Future<void> _stopAllWatchers() async {
+    for (final t in _watcherDebounce.values) {
+      t.cancel();
+    }
+    _watcherDebounce.clear();
+    final futures = _watchers.values.map((s) => s.cancel()).toList();
+    _watchers.clear();
+    await Future.wait(futures);
+  }
+
   /// Remove the source. The FK cascade drops `indexed_files` rows under
   /// it; `tracks` rows are intentionally untouched (guardrail 5 — user
   /// work survives source removal). Re-adding the same folder will
   /// reconnect intelligence by fingerprint.
   Future<void> removeSource(String sourceId) async {
+    await _stopWatcher(sourceId);
     await repo.deleteSource(sourceId);
     _sources.removeWhere((s) => s.id == sourceId);
     _removeTracksWhere((t) => t.sourceId == sourceId);
@@ -2357,6 +2444,7 @@ class LibraryController extends ChangeNotifier {
     _processingSub?.cancel();
     _positionNotifier.dispose();
     _revealTick.dispose();
+    unawaited(_stopAllWatchers());
     super.dispose();
   }
 }

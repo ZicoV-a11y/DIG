@@ -880,8 +880,12 @@ class _TrackRow extends StatelessWidget {
     // flat "Show in Finder" item with its currently-playing
     // override + fallback semantics.
     final aggView = controller.aggregatedViewForPrimary(track);
+    // Hide unavailable variants from the reveal menu so a file the
+    // user deleted in Finder (and that's been picked up by the
+    // filesystem watcher → marked `is_available = 0` on the next
+    // rescan) doesn't sit there inviting a no-op click.
     final variants = (aggView != null && aggView.hasSiblings)
-        ? aggView.variants
+        ? aggView.variants.where((t) => t.isAvailable).toList()
         : const <Track>[];
 
     final items = <PopupMenuEntry<String>>[];

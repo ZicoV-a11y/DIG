@@ -275,6 +275,36 @@ void main() {
       expect(destRow['availability_state'], 'available');
     });
 
+    test(
+        'destination uid differs from source — no Map collision in _trackByUid',
+        () async {
+      // Regression: on macOS, Dart's `File.copySync` uses
+      // `copyfile` which preserves the source's mtime by default.
+      // Because computeTrackUid hashes mtime, naive recompute on
+      // the destination produces the same uid as the source —
+      // collides in LibraryController's _trackByUid Map, breaks
+      // playback for the visible row (whichever Track instance
+      // was inserted last wins, click dispatches to the wrong
+      // path). copyTrackFile must explicitly stamp the dest with
+      // a fresh mtime to keep uids unique.
+      final f = await writeFile('clash.mp3', 800 * 1024, seed: 17);
+      await seedIndexedRow(file: f, sourceId: srcA.id);
+
+      await repo.copyTrackFile(sourcePath: f.path, destSource: srcB);
+
+      final src = await rowAt(f.path);
+      final dest = await rowAt('${srcB.folderPath}/clash.mp3');
+      expect(src, isNotNull);
+      expect(dest, isNotNull);
+      expect(
+        dest!['uid'],
+        isNot(equals(src!['uid'])),
+        reason:
+            'destination uid must NOT collide with source uid; '
+            'mtime should have been bumped after copySync',
+      );
+    });
+
     test('records app_initiated_copy event', () async {
       final f = await writeFile('song.mp3', 800 * 1024, seed: 11);
       await seedIndexedRow(file: f, sourceId: srcA.id);

@@ -1051,8 +1051,27 @@ class LibraryRepository {
       );
     }
 
-    // Re-stat to capture the fresh copy's mtime (mtime drives uid).
-    final destStat = File(destPath).statSync();
+    // CRITICAL: Dart's File.copySync uses macOS's `copyfile`, which
+    // PRESERVES the source's mtime. Without explicitly bumping it,
+    // the destination's mtime == source's mtime, which means
+    // `computeTrackUid` (which hashes basename+filesize+duration+mtime)
+    // produces the SAME uid on both rows. That breaks the
+    // controller's `_trackByUid` Map: only one of the two rows
+    // wins the slot, click-to-play on the surviving row's uid
+    // dispatches to whichever Track instance was inserted last,
+    // and playback tries the wrong path.
+    //
+    // Stamp the destination with "now" so uid genuinely differs
+    // from the source. Re-stat afterward to capture the new value.
+    final destFile = File(destPath);
+    try {
+      destFile.setLastModifiedSync(DateTime.now());
+    } on FileSystemException {
+      // Best-effort: if we can't set mtime (read-only mount?), the
+      // copy proceeds but uid may collide. Caller's tests + the
+      // map lookup will surface the issue.
+    }
+    final destStat = destFile.statSync();
     final newMtime = destStat.modified.millisecondsSinceEpoch;
     final newUid = computeTrackUid(
       basename: basename,

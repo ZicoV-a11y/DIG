@@ -330,7 +330,11 @@ class LibraryRepository {
       //     whatever was there before; never overwrite a real hash
       //     with null just because a single read happened to fail.
       if (existing.isEmpty) {
-        final hash = computeContentHashSync(file.path);
+        // Async hash so the main isolate stays responsive even
+        // when Dropbox CloudStorage paths take seconds per read.
+        // The sync variant blocks the UI thread for the duration
+        // of the file I/O.
+        final hash = await computeContentHash(file.path);
         await txn.insert('indexed_files', {
           'path': file.path,
           'source_id': sourceId,
@@ -382,7 +386,11 @@ class LibraryRepository {
       if (statUnchanged && oldContentHash != null) {
         newContentHash = oldContentHash;
       } else {
-        final computed = computeContentHashSync(file.path);
+        // Async to avoid blocking the main isolate. See INSERT
+        // path above; same reasoning applies here at higher
+        // volume (the initial v9 → v10 scan recomputes for
+        // every row that has NULL content_hash).
+        final computed = await computeContentHash(file.path);
         // Guardrail: a transient read failure must not erase a
         // previously-good hash. Only overwrite with non-null OR if
         // there was nothing there to begin with.

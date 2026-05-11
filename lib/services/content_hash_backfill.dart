@@ -47,6 +47,13 @@ class ContentHashBackfillWorker {
   /// well under any reasonable foreground workload.
   static const Duration _batchInterval = Duration(milliseconds: 500);
 
+  /// Per-file hash timeout. A Dropbox "online-only" placeholder
+  /// or a stat hiccup that takes minutes to resolve would
+  /// otherwise stall the whole backfill on one file. After the
+  /// timeout the path is treated like any other read failure —
+  /// added to the in-session skip list, retried next session.
+  static const Duration _hashTimeout = Duration(seconds: 30);
+
   bool _running = false;
   bool _cancelled = false;
   Timer? _scheduler;
@@ -121,7 +128,30 @@ class ContentHashBackfillWorker {
     var batchSuccesses = 0;
     for (final path in fresh) {
       if (_cancelled) return;
-      final hash = computeContentHashSync(path);
+      // ASYNC hash + per-file timeout. Two reasons:
+      //   1. The sync variant blocks the main isolate on file
+      //      I/O. With Dropbox CloudStorage paths that can stall
+      //      the UI thread for seconds-to-minutes per file. The
+      //      async variant uses Dart's IO thread pool; main
+      //      stays responsive between awaits.
+      //   2. The timeout caps the worst case at 30s/file so
+      //      one truly-stuck file (Dropbox online-only
+      //      placeholder pending download, dead mount) can't
+      //      stall the whole backfill.
+      String? hash;
+      try {
+        hash = await computeContentHash(path).timeout(
+          _hashTimeout,
+          onTimeout: () {
+            debugPrint('[content_hash backfill] timeout: $path');
+            return null;
+          },
+        );
+      } catch (e) {
+        debugPrint('[content_hash backfill] error hashing $path: $e');
+        hash = null;
+      }
+      if (_cancelled) return;
       if (hash != null) {
         await _repo.setContentHashForPath(path, hash);
         batchSuccesses++;

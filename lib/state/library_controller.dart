@@ -14,6 +14,7 @@ import '../models/intelligence_record.dart';
 import '../models/source.dart';
 import '../models/track.dart';
 import '../services/audio_scanner.dart';
+import '../services/content_hash_backfill.dart';
 import '../services/intelligence_export.dart';
 import '../services/library_repository.dart';
 import '../services/media_keys.dart';
@@ -267,11 +268,31 @@ class LibraryController extends ChangeNotifier {
   Timer? _flushTimer;
 
   LibraryController({required this.engine, required this.repo}) {
+    _backfillWorker = ContentHashBackfillWorker(
+      repo,
+      onProgress: _onBackfillProgress,
+    );
     _positionSub = engine.positionStream.listen(_onPosition);
     _playingSub = engine.playingStream.listen(_onPlaying);
     _durationSub = engine.durationStream.listen(_onDuration);
     _processingSub = engine.processingStateStream.listen(_onProcessing);
     _wireMediaBridge();
+  }
+
+  /// content_hash backfill — see `services/content_hash_backfill.dart`.
+  /// Owned here so the controller can pause it cleanly around
+  /// foreground scans and surface its progress.
+  late final ContentHashBackfillWorker _backfillWorker;
+
+  /// Cumulative rows hashed in the most-recent (or in-flight)
+  /// backfill session. Read by the status bar to show progress.
+  int get backfillHashedThisSession => _backfillHashedThisSession;
+  int _backfillHashedThisSession = 0;
+  bool get isBackfillingContentHashes => _backfillWorker.isRunning;
+
+  void _onBackfillProgress(int batch, int session) {
+    _backfillHashedThisSession = session;
+    notifyListeners();
   }
 
   void _wireMediaBridge() {
@@ -1678,6 +1699,11 @@ class LibraryController extends ChangeNotifier {
 
   Future<void> _scanIntoSource(Source source) async {
     _isScanning = true;
+    // Yield SQLite + disk to the foreground scan. The backfill
+    // worker is best-effort by design; we'll restart it after the
+    // scan finishes, picking up wherever it left off (the
+    // candidates query is stateless).
+    _backfillWorker.cancel();
     notifyListeners();
     try {
       // Snapshot the in-memory unavailable count BEFORE the rescan
@@ -1840,6 +1866,11 @@ class LibraryController extends ChangeNotifier {
       debugPrint('$st');
     } finally {
       _isScanning = false;
+      // Resume the content_hash backfill now that foreground
+      // scanning is done. Picks up any newly-null rows the scan
+      // just inserted as well as legacy rows the migration left
+      // unhashed.
+      _backfillWorker.start();
       notifyListeners();
     }
   }
@@ -2830,6 +2861,7 @@ class LibraryController extends ChangeNotifier {
     _processingSub?.cancel();
     _positionNotifier.dispose();
     _revealTick.dispose();
+    _backfillWorker.cancel();
     unawaited(_stopAllWatchers());
     if (_lifecycleObserverRegistered) {
       WidgetsBinding.instance.removeObserver(_lifecycleObserver);

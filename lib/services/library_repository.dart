@@ -526,6 +526,62 @@ class LibraryRepository {
   /// excluded so the scanner's transient I/O glitches never
   /// trigger cascading false supersessions.
   ///
+  /// Backfill candidates: paths whose `content_hash` is NULL on
+  /// rows we can actually still read. Used by the background
+  /// `ContentHashBackfillWorker` (Slice 3) to populate the column
+  /// for legacy rows (pre-v10) and any row that returned null
+  /// from the scan-time hash.
+  ///
+  /// Filters:
+  ///   - `content_hash IS NULL`
+  ///   - `availability_state = 'available'` (no point trying to
+  ///     hash a file the scan can't see)
+  ///   - `filesize > 0` (junk stat inputs would just fail again)
+  ///   - `path` is not in [skip] — caller's in-memory failed-set
+  ///     so we don't loop on permanent failures.
+  ///
+  /// Ordered by `last_seen_at DESC` so the rows the user touched
+  /// most recently get hashed first. Returns up to [limit] paths.
+  Future<List<String>> contentHashCandidates({
+    required int limit,
+    Set<String> skip = const {},
+  }) async {
+    // SQLite doesn't bind list parameters directly. For the skip
+    // set we either filter in-memory after a wider query or build
+    // an IN-clause inline. The worker already filters in memory;
+    // SQL filter would be redundant. Keep this query simple.
+    final rows = await _db.rawQuery(
+      '''
+      SELECT path FROM indexed_files
+      WHERE content_hash IS NULL
+        AND availability_state = 'available'
+        AND filesize > 0
+      ORDER BY last_seen_at DESC
+      LIMIT ?
+      ''',
+      [limit],
+    );
+    final paths =
+        rows.map((r) => r['path'] as String).where((p) => !skip.contains(p));
+    return paths.toList();
+  }
+
+  /// Write a freshly-computed content_hash for a single path.
+  /// Called by the backfill worker once per row; intentionally
+  /// targeted so it doesn't fight the scan upsert's broader
+  /// transaction on the same row.
+  ///
+  /// No-op if the row has been removed between the candidate
+  /// query and this write (returns 0).
+  Future<int> setContentHashForPath(String path, String hash) async {
+    return await _db.update(
+      'indexed_files',
+      {'content_hash': hash},
+      where: 'path = ?',
+      whereArgs: [path],
+    );
+  }
+
   /// Idempotent — safe to call after every scan.
   ///
   /// Returns the number of rows upgraded from missing → superseded.

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 
@@ -887,12 +888,19 @@ class _TrackRow extends StatelessWidget {
     if (variants.isEmpty) {
       items.add(_revealMenuItem(value: 'reveal', label: 'Show in Finder'));
     } else {
+      // Multi-variant rows: every reveal item gets a parent-folder
+      // disambiguator so two `Show MP3 in Finder` items don't read
+      // identically (the common case after Cmd+D, where the
+      // original and the " copy" live in different folders).
       for (var i = 0; i < variants.length; i++) {
         final v = variants[i];
         final format = fileFormatLabel(v.filename);
-        final label = format.isEmpty
-            ? 'Show variant ${i + 1} in Finder'
-            : 'Show $format in Finder';
+        final formatLabel =
+            format.isEmpty ? 'variant ${i + 1}' : format;
+        final parent = _parentDirName(v.path);
+        final label = parent.isEmpty
+            ? 'Show $formatLabel in Finder'
+            : 'Show $formatLabel in Finder — $parent/';
         items.add(_revealMenuItem(value: 'reveal:$i', label: label));
       }
     }
@@ -1000,6 +1008,23 @@ class _TrackRow extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  /// Return the immediate parent folder of [path], used to
+  /// disambiguate multi-variant `Show <FORMAT> in Finder` menu
+  /// items. Returns `''` when the path has no parent component
+  /// (e.g. a bare filename with no separators).
+  ///
+  /// `/Users/me/Music/House - MP3/song.mp3` → `House - MP3`
+  String _parentDirName(String path) {
+    final sep = Platform.pathSeparator;
+    final lastSep = path.lastIndexOf(sep);
+    if (lastSep <= 0) return '';
+    final parentPath = path.substring(0, lastSep);
+    final prevSep = parentPath.lastIndexOf(sep);
+    return prevSep < 0
+        ? parentPath
+        : parentPath.substring(prevSep + 1);
   }
 
   PopupMenuItem<String> _unlinkMenuItem({required int variantCount}) {

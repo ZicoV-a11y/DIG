@@ -10,6 +10,7 @@ import '../utils/file_format.dart';
 import 'activity_log_dialog.dart';
 import 'duplicates_audit_dialog.dart';
 import 'import_confirm_dialog.dart';
+import 'move_copy_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
 /// Stacked modules (top → bottom): Volume, Play Threshold, Favorite,
@@ -58,6 +59,8 @@ class UtilityRail extends StatelessWidget {
                   _AuditModule(controller: controller),
                   const _RailDivider(),
                   _HistoryModule(controller: controller),
+                  const _RailDivider(),
+                  _MoveCopyModule(controller: controller),
                   const _RailDivider(),
                   _ShowInFinderModule(controller: controller),
                   const _RailDivider(),
@@ -385,6 +388,53 @@ class _HistoryModule extends StatelessWidget {
           // Spacer matching the height of count badges in adjacent
           // modules (AUDIT, etc.) so the rail items align.
           SizedBox(height: 14),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- MOVE / COPY ----------
+
+class _MoveCopyModule extends StatelessWidget {
+  final LibraryController controller;
+  const _MoveCopyModule({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    // Operates on the currently-loaded/playing track. Same signal
+    // SHOW IN FINDER uses — keeps the per-track action buttons in
+    // the rail behaving consistently. Disabled when nothing's
+    // loaded so the user doesn't end up opening a dialog with
+    // nothing to act on.
+    final track = controller.currentTrack;
+    final enabled = track != null;
+    return _RailButton(
+      tooltip: enabled
+          ? 'Move or copy the current track to another watched folder'
+          : 'Play or load a track first',
+      onPressed: enabled
+          ? () => showMoveCopyDialog(
+                context: context,
+                controller: controller,
+                track: track,
+              )
+          : null,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const _SectionLabel('MOVE / COPY'),
+          const SizedBox(height: 6),
+          Icon(
+            Icons.drive_file_move_rounded,
+            size: 22,
+            color: enabled
+                ? AppColors.textSecondary
+                : AppColors.textTertiary,
+          ),
+          // Spacer to match the height of count badges in
+          // adjacent modules so rail items stay aligned.
+          const SizedBox(height: 18),
         ],
       ),
     );

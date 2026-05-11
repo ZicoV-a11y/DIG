@@ -43,11 +43,23 @@ class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
       listenable: widget.controller,
       builder: (ctx, _) {
         final tracks = widget.controller.tracksNeedingReview;
+        // A 'missing' row whose content_hash also lives on at
+        // least one currently-available row gets pulled out of
+        // the alarming MISSING section and folded into MOVED —
+        // the bytes survived elsewhere, even if uniqueness on
+        // content_hash blocks the system from picking a single
+        // successor (typical Cmd+D-coexistence + move case).
+        final coexisting = widget.controller.coexistingMissingPaths;
         final missing = tracks
-            .where((t) => t.availability == 'missing')
+            .where((t) =>
+                t.availability == 'missing' &&
+                !coexisting.contains(t.path))
             .toList();
         final moved = tracks
-            .where((t) => t.availability == 'superseded')
+            .where((t) =>
+                t.availability == 'superseded' ||
+                (t.availability == 'missing' &&
+                    coexisting.contains(t.path)))
             .toList();
         final selectedAll = _selected.length == tracks.length &&
             tracks.isNotEmpty;
@@ -94,9 +106,11 @@ class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
                                   label: 'MISSING',
                                   sublabel:
                                       'Was on disk before. Last scan didn\'t '
-                                      'find it and no replacement file was '
-                                      'detected. Purge if you removed it on '
-                                      'purpose; intel survives until purged.',
+                                      "find it and no byte-identical copy was "
+                                      'detected in any watched folder. Treat '
+                                      'as genuinely lost — purge if you '
+                                      'removed it on purpose; intel survives '
+                                      'until purged.',
                                   count: missing.length,
                                   accent: AppColors.favorite,
                                 ),
@@ -114,11 +128,15 @@ class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
                                 _SectionHeader(
                                   label: 'MOVED',
                                   sublabel:
-                                      "Auto-detected as moved within its "
-                                      'source (same fingerprint at a new '
-                                      'path). The old DB row is hidden '
-                                      'from the main table but kept here so '
-                                      'you can verify or purge.',
+                                      'File is no longer at the original '
+                                      'path, but the same byte-content exists '
+                                      'on at least one other watched file. '
+                                      "Either auto-detected as the old row's "
+                                      'replacement (single match), or one of '
+                                      'multiple byte-identical copies the app '
+                                      "won't auto-pick between. Either way "
+                                      'the data is preserved; verify or purge '
+                                      'as you wish.',
                                   count: moved.length,
                                   accent: AppColors.reviewed,
                                 ),

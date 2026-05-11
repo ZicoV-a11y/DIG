@@ -212,6 +212,18 @@ class LibraryController extends ChangeNotifier {
   int? _enrichedCountCache;
   int? _missingCountCache;
   int? _movedCountCache;
+  // Paths of rows whose `availability_state == 'missing'` AND whose
+  // content_hash is also present on at least one `available` row
+  // anywhere in the library — i.e. the bytes survived elsewhere, the
+  // missing row is just the trailing record at the old path. These
+  // are NOT counted toward `missingCount` (would falsely alarm the
+  // user that data was lost) and are folded into `movedCount` /
+  // surfaced under the MOVED section of the Review dialog.
+  //
+  // Strict content_hash match — fingerprint coincidences don't
+  // count. Computed in the same pass as the other stats in
+  // `_ensureLibraryStats`.
+  Set<String>? _coexistingMissingPathsCache;
   int? _songCountCache;
   int? _reviewedSongCountCache;
   int _libraryStatsVersion = -1;
@@ -856,8 +868,13 @@ class LibraryController extends ChangeNotifier {
     // / sort changes shouldn't force a 12k-track recompute.
     if (_libraryStatsVersion == _dataVersion) return;
     var enriched = 0;
-    var missing = 0;
-    var moved = 0;
+    var supersededCount = 0;
+    // Build the byte-equivalence side index in pass 1: every
+    // content_hash that has at least one currently-`available`
+    // row. Used in pass 2 to reclassify "missing but content
+    // exists elsewhere" rows out of the alarming MISSING tally
+    // and into the calmer MOVED bucket.
+    final availableContentHashes = <String>{};
     // Song-identity bucketing in the same pass. Tracks with empty
     // title/artist (songIdentityKey returns null) can't bucket and
     // each count as a singleton song. Other tracks are deduped by
@@ -865,17 +882,16 @@ class LibraryController extends ChangeNotifier {
     var singletonSongs = 0;
     var singletonReviewed = 0;
     final reviewedByBucket = <String, bool>{};
+    final missingTracks = <Track>[];
     for (final t in _tracks) {
       if (t.metadataReadAt != null) enriched++;
-      // Split the legacy "missing" tally into truly-gone vs
-      // moved-within-source so the status bar can show them
-      // separately. Pre-migration rows that haven't been re-scanned
-      // since v9 may still show as `missing` even when they're
-      // moved — they'll re-classify next scan.
       if (t.availability == 'missing') {
-        missing++;
+        missingTracks.add(t);
       } else if (t.availability == 'superseded') {
-        moved++;
+        supersededCount++;
+      }
+      if (t.availability == 'available' && (t.contentHash?.isNotEmpty ?? false)) {
+        availableContentHashes.add(t.contentHash!);
       }
       final key = songIdentityKey(t);
       if (key == null) {
@@ -890,16 +906,46 @@ class LibraryController extends ChangeNotifier {
         reviewedByBucket[key] = true;
       }
     }
+    // Pass 2 over the missing-only subset: bucket into
+    // truly-missing vs coexisting-elsewhere by content_hash match.
+    // A missing row with a known content_hash that appears on at
+    // least one available row is "coexisting" — UI counts it as
+    // moved rather than missing.
+    final coexistingPaths = <String>{};
+    var trulyMissing = 0;
+    for (final t in missingTracks) {
+      final ch = t.contentHash;
+      if (ch != null && ch.isNotEmpty &&
+          availableContentHashes.contains(ch)) {
+        coexistingPaths.add(t.path);
+      } else {
+        trulyMissing++;
+      }
+    }
     var reviewedBucketed = 0;
     for (final v in reviewedByBucket.values) {
       if (v) reviewedBucketed++;
     }
     _enrichedCountCache = enriched;
-    _missingCountCache = missing;
-    _movedCountCache = moved;
+    _missingCountCache = trulyMissing;
+    _movedCountCache = supersededCount + coexistingPaths.length;
+    _coexistingMissingPathsCache = coexistingPaths;
     _songCountCache = singletonSongs + reviewedByBucket.length;
     _reviewedSongCountCache = singletonReviewed + reviewedBucketed;
     _libraryStatsVersion = _dataVersion;
+  }
+
+  /// Paths of rows whose `availability_state == 'missing'` but
+  /// whose `content_hash` is present on at least one available
+  /// row anywhere in the library. UI surfaces (Review dialog,
+  /// status bar tally) treat these as "found elsewhere" — folded
+  /// into the MOVED count, NOT the MISSING count, since the bytes
+  /// haven't been lost. The DB state stays `'missing'` because
+  /// uniqueness fails (≥ 2 byte-twins available); only the user
+  /// can pick a single successor manually.
+  Set<String> get coexistingMissingPaths {
+    _ensureLibraryStats();
+    return _coexistingMissingPathsCache ?? const <String>{};
   }
   ValueListenable<Duration> get positionListenable => _positionNotifier;
   ValueListenable<int> get revealTick => _revealTick;

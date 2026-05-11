@@ -16,7 +16,7 @@ class AppDatabase {
   // v7 adds `sources.parent_source_id` + `sources.path_prefix` so a
   // folder picked inside an already-watched source becomes a virtual
   // "sub-view" instead of a duplicate scanning source.
-  static const _schemaVersion = 11;
+  static const _schemaVersion = 12;
 
   late final Database _db;
 
@@ -235,6 +235,56 @@ class AppDatabase {
     if (oldVersion < 11) {
       await _migrateV10toV11(db);
     }
+    if (oldVersion < 12) {
+      await _migrateV11toV12(db);
+    }
+  }
+
+  /// Data-only migration: dedupe `indexed_files.uid` collisions
+  /// caused by the pre-fix `copyTrackFile` implementation.
+  ///
+  /// Before the fix, app-initiated Copy used Dart's `File.copySync`
+  /// which on macOS preserves the source's mtime via `copyfile`.
+  /// Because `computeTrackUid` hashes mtime, the destination row
+  /// ended up with the SAME uid as the source. That broke
+  /// `LibraryController._trackByUid` (a `Map<String, Track>` — two
+  /// rows racing for one slot), and click-to-play on the visible
+  /// row would dispatch to whichever Track instance was inserted
+  /// last by `loadTracks`, often the wrong path.
+  ///
+  /// The implementation fix (set mtime to `DateTime.now()` after
+  /// copySync) prevents NEW collisions. This migration cleans up
+  /// any rows already in the DB carrying a duplicate uid: for
+  /// each cluster sharing a uid, the rows in 'superseded' or
+  /// 'missing' state get a `_dup<rowid>` suffix appended so each
+  /// row has a unique uid. The 'available' row keeps the original
+  /// uid — that's the one playback should resolve to.
+  ///
+  /// No row data is lost; just uids on non-available rows are
+  /// disambiguated. The Review-removed-&-moved dialog still
+  /// surfaces those rows; their intel_uid still points at the
+  /// shared song's tracks row.
+  ///
+  /// Idempotent — re-running it on a DB with no collisions is a
+  /// no-op (the WHERE clause filters to uids appearing more than
+  /// once).
+  static Future<void> _migrateV11toV12(Database db) async {
+    debugPrint('[db] starting v11 → v12 migration (uid collision dedupe)');
+    final stopwatch = Stopwatch()..start();
+    final affected = await db.rawUpdate('''
+      UPDATE indexed_files
+      SET uid = uid || '_dup' || rowid
+      WHERE availability_state IN ('superseded', 'missing')
+        AND uid IN (
+          SELECT uid FROM indexed_files
+          GROUP BY uid
+          HAVING COUNT(*) > 1
+        )
+    ''');
+    debugPrint(
+      '[db] v11 → v12 done in ${stopwatch.elapsedMilliseconds}ms '
+      '($affected uid collision(s) deduped).',
+    );
   }
 
   /// Add the `events` activity log. Append-only audit table —

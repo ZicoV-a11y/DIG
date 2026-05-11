@@ -789,7 +789,10 @@ class LibraryController extends ChangeNotifier {
   }
 
   void _ensureLibraryStats() {
-    if (_libraryStatsVersion == _libraryVersion) return;
+    // Keyed on `_dataVersion` (not `_libraryVersion`) — library-wide
+    // totals don't care about the current filter, so source / search
+    // / sort changes shouldn't force a 12k-track recompute.
+    if (_libraryStatsVersion == _dataVersion) return;
     var enriched = 0;
     var missing = 0;
     // Song-identity bucketing in the same pass. Tracks with empty
@@ -823,7 +826,7 @@ class LibraryController extends ChangeNotifier {
     _missingCountCache = missing;
     _songCountCache = singletonSongs + reviewedByBucket.length;
     _reviewedSongCountCache = singletonReviewed + reviewedBucketed;
-    _libraryStatsVersion = _libraryVersion;
+    _libraryStatsVersion = _dataVersion;
   }
   ValueListenable<Duration> get positionListenable => _positionNotifier;
   ValueListenable<int> get revealTick => _revealTick;
@@ -852,6 +855,37 @@ class LibraryController extends ChangeNotifier {
   AggregatedTrackView? aggregatedViewForPrimary(Track primary) =>
       _bucketsByPrimaryUid[primary.uid];
 
+  /// Cheap cached count of multi-variant buckets in the library —
+  /// drives the `AUDIT N` badge in the utility rail. Without this,
+  /// every notifyListeners rebuilt the rail and recomputed
+  /// `groupBySongIdentity` on the full track list (12k+ items), which
+  /// saturated the UI thread during normal browsing. Caching at
+  /// `_libraryVersion` granularity means the count is computed once
+  /// per data/filter change and read back in O(1) for subsequent
+  /// rebuilds.
+  int get multiVariantBucketCount {
+    if (_multiVariantBucketCountVersion != _dataVersion) {
+      var count = 0;
+      for (final bucket in groupBySongIdentity(_tracks)) {
+        var available = 0;
+        for (final t in bucket) {
+          if (!t.isAvailable) continue;
+          available++;
+          if (available >= 2) {
+            count++;
+            break; // early exit — we only care whether it's >=2
+          }
+        }
+      }
+      _multiVariantBucketCountCache = count;
+      _multiVariantBucketCountVersion = _dataVersion;
+    }
+    return _multiVariantBucketCountCache;
+  }
+
+  int _multiVariantBucketCountCache = 0;
+  int _multiVariantBucketCountVersion = -1;
+
   /// Every multi-variant bucket the matcher has assembled across the
   /// whole library (manual link, auto 4-field, fingerprint
   /// equivalence — any rule that paired two files), independent of
@@ -860,7 +894,11 @@ class LibraryController extends ChangeNotifier {
   ///
   /// Used by the duplicates audit dialog; recomputed each call so a
   /// rescan or a fresh link / unlink immediately reflects in the
-  /// dialog without needing a `visibleTracks` round-trip.
+  /// dialog without needing a `visibleTracks` round-trip. The audit
+  /// dialog is opened explicitly, so the recompute cost (one
+  /// `groupBySongIdentity` pass + sort) only fires on user action —
+  /// not per UI rebuild. The badge in the rail uses
+  /// `multiVariantBucketCount` instead.
   List<AggregatedTrackView> get multiVariantBuckets {
     final out = <AggregatedTrackView>[];
     for (final bucket in groupBySongIdentity(_tracks)) {
@@ -1036,10 +1074,14 @@ class LibraryController extends ChangeNotifier {
   // ---------------------------------------------------------------------------
 
   int sourceTrackCount(String sourceId) {
+    // Per-source counts depend only on which tracks belong to which
+    // source, not the user's filter. Key on `_dataVersion` so
+    // sidebar tile counts stay valid across source / search / sort
+    // changes.
     if (_sourceCountCache == null ||
-        _sourceCountCacheVersion != _libraryVersion) {
+        _sourceCountCacheVersion != _dataVersion) {
       _sourceCountCache = _computeAllSourceCounts();
-      _sourceCountCacheVersion = _libraryVersion;
+      _sourceCountCacheVersion = _dataVersion;
     }
     return _sourceCountCache![sourceId] ?? 0;
   }
@@ -1385,10 +1427,28 @@ class LibraryController extends ChangeNotifier {
 
   void _markLibraryDirty() {
     _libraryVersion++;
+    _dataVersion++;
     _visibleCache = null;
-    // Source-count cache uses the same version key; invalidation
-    // happens lazily on the next `sourceTrackCount` call.
+    // Source-count cache uses `_dataVersion` and invalidates lazily
+    // on the next `sourceTrackCount` call.
   }
+
+  /// Filter-only invalidation — search, source selection, sort,
+  /// unreviewed-only toggle, sticky-current shifts. Bumps just the
+  /// visible-cache version; library-wide counts (songCount,
+  /// sourceTrackCount, multiVariantBucketCount, etc) stay valid
+  /// because the underlying track data didn't change. Reduces
+  /// per-keystroke cost on the search box from ~3 O(n) recomputes
+  /// down to just the necessary visible-tracks rebuild.
+  void _markFilterDirty() {
+    _libraryVersion++;
+    _visibleCache = null;
+  }
+
+  /// Bumped only when track DATA changes (list mutations, isAvailable
+  /// flips, intel field updates). Used by caches whose value depends
+  /// solely on the track set, not on filter state.
+  int _dataVersion = 0;
 
   /// Coalesced notifier used by long-running enrichment loops
   /// (metadata extraction, future reconciliation). Guarantees at
@@ -1853,21 +1913,21 @@ class LibraryController extends ChangeNotifier {
   void selectSource(String? sourceId) {
     _selectedSourceId = sourceId;
     _invalidateLock();
-    _markLibraryDirty();
+    _markFilterDirty();
     notifyListeners();
   }
 
   void setSearchQuery(String value) {
     _searchQuery = value;
     _invalidateLock();
-    _markLibraryDirty();
+    _markFilterDirty();
     notifyListeners();
   }
 
   void toggleUnreviewedOnly() {
     _unreviewedOnly = !_unreviewedOnly;
     _invalidateLock();
-    _markLibraryDirty();
+    _markFilterDirty();
     notifyListeners();
   }
 
@@ -1915,7 +1975,7 @@ class LibraryController extends ChangeNotifier {
       }
     }
     _invalidateLock();
-    _markLibraryDirty();
+    _markFilterDirty();
     notifyListeners();
   }
 

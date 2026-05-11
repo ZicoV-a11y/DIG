@@ -303,7 +303,12 @@ class _AuditModule extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final count = controller.multiVariantBuckets.length;
+    // Use the cached count getter, NOT `multiVariantBuckets.length`.
+    // The rail rebuilds on every controller notify, so reading the
+    // full list here would re-`groupBySongIdentity` the entire
+    // library (~12k tracks) per rebuild — that was the main cause
+    // of the UI freezing reported during normal browsing.
+    final count = controller.multiVariantBucketCount;
     final hasAny = count > 0;
     return _RailButton(
       tooltip: hasAny

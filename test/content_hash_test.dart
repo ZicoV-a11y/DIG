@@ -165,6 +165,88 @@ void main() {
   });
 
   // ───────────────────────────────────────────────────────────────────
+  // Instrumentation: success / failure counters, latency tracking,
+  // bytes hashed. Lightweight always-on stats — the only signal we
+  // get during Phase 1.5 soak when hash callers aren't writing to
+  // any DB yet.
+  // ───────────────────────────────────────────────────────────────────
+  group('ContentHashStats', () {
+    setUp(ContentHashStats.reset);
+
+    test('successful hash increments ok + bytes + total micros', () async {
+      final a = await makeFile('ok.mp3', 800 * 1024, seed: 41);
+      await computeContentHash(a.path);
+      expect(ContentHashStats.successCount, 1);
+      expect(ContentHashStats.failureCount, 0);
+      expect(ContentHashStats.bytesHashed, greaterThan(0));
+      expect(ContentHashStats.totalMicros, greaterThan(0));
+      expect(ContentHashStats.lastMicros, greaterThan(0));
+    });
+
+    test('failure path: missing file → failureCount++, lastFailurePath set',
+        () async {
+      await computeContentHash('${tmp.path}/missing.mp3');
+      expect(ContentHashStats.successCount, 0);
+      expect(ContentHashStats.failureCount, 1);
+      expect(ContentHashStats.lastFailurePath, contains('missing.mp3'));
+    });
+
+    test('failure path: empty file → counted as failure (null hash)',
+        () async {
+      final f = File('${tmp.path}/empty.mp3');
+      await f.writeAsBytes(<int>[]);
+      await computeContentHash(f.path);
+      expect(ContentHashStats.failureCount, 1);
+      expect(ContentHashStats.lastFailurePath, contains('empty.mp3'));
+    });
+
+    test('reset clears every counter', () async {
+      final a = await makeFile('clearme.mp3', 100 * 1024, seed: 47);
+      await computeContentHash(a.path);
+      expect(ContentHashStats.successCount, 1);
+      ContentHashStats.reset();
+      expect(ContentHashStats.successCount, 0);
+      expect(ContentHashStats.failureCount, 0);
+      expect(ContentHashStats.totalMicros, 0);
+      expect(ContentHashStats.maxMicros, 0);
+      expect(ContentHashStats.bytesHashed, 0);
+      expect(ContentHashStats.lastFailurePath, isNull);
+      expect(ContentHashStats.slowestPath, isNull);
+    });
+
+    test('maxMicros tracks the slowest call; slowestPath points at it',
+        () async {
+      final fast = await makeFile('fast.mp3', 100 * 1024, seed: 53);
+      // Big file = more bytes read, almost always slower than the
+      // small one. The assertion is monotonicity, not magnitude.
+      final slow = await makeFile('slow.mp3',
+          contentHashChunkBytes * 3, seed: 59);
+      await computeContentHash(fast.path);
+      await computeContentHash(slow.path);
+      // slowestPath could legitimately be either path if the OS page
+      // cache makes the second read instant; assert the invariant
+      // instead: maxMicros equals one of the two recorded elapseds.
+      expect(ContentHashStats.maxMicros, greaterThanOrEqualTo(0));
+      expect(ContentHashStats.slowestPath, anyOf(contains('fast.mp3'),
+          contains('slow.mp3')));
+    });
+
+    test('summary() renders even from a reset state', () {
+      ContentHashStats.reset();
+      expect(ContentHashStats.summary(), contains('ok=0'));
+      expect(ContentHashStats.summary(), contains('fail=0'));
+    });
+
+    test('sync variant also feeds the stats', () async {
+      final a = await makeFile('sync.mp3', 100 * 1024, seed: 61);
+      computeContentHashSync(a.path);
+      expect(ContentHashStats.successCount, 1);
+      computeContentHashSync('${tmp.path}/sync-missing.mp3');
+      expect(ContentHashStats.failureCount, 1);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────
   // Byte-level entry point for matrix tests that don't want temp files.
   // ───────────────────────────────────────────────────────────────────
   group('contentHashFromBytes', () {

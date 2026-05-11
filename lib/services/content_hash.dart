@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 
 /// Stable physical-file identity. Reads up to [_chunkBytes] from the
 /// start of the file and up to [_chunkBytes] from the end, concatenates
@@ -37,6 +38,83 @@ import 'package:crypto/crypto.dart';
 /// Bytes read from each end of the file.
 const int _chunkBytes = 256 * 1024;
 
+/// A hash slower than this threshold (microseconds) gets a one-line
+/// debug log so external SSDs, NAS volumes, or slow-Dropbox cases
+/// surface in console output without needing a histogram. 200 ms
+/// — fast SSD reads of 512 KB are typically <10 ms; anything beyond
+/// 200 ms is worth a look.
+const int _slowHashMicros = 200 * 1000;
+
+/// Lightweight, always-on instrumentation for the hashing pipeline.
+/// Counters + max latency only — no histograms, no per-call
+/// allocations. Cost is a few field writes; safe to leave enabled
+/// in release builds.
+///
+/// Process-wide singleton state — single-isolate use only for now;
+/// revisit if hashing ever moves to a background isolate.
+class ContentHashStats {
+  static int _ok = 0;
+  static int _fail = 0;
+  static int _totalMicros = 0;
+  static int _maxMicros = 0;
+  static int _lastMicros = 0;
+  static int _bytesHashed = 0;
+  static String? _lastFailurePath;
+  static String? _slowestPath;
+
+  static int get successCount => _ok;
+  static int get failureCount => _fail;
+  static int get totalCount => _ok + _fail;
+  static int get totalMicros => _totalMicros;
+  static int get maxMicros => _maxMicros;
+  static int get lastMicros => _lastMicros;
+  static int get bytesHashed => _bytesHashed;
+  static String? get lastFailurePath => _lastFailurePath;
+  static String? get slowestPath => _slowestPath;
+  static double get meanMs =>
+      _ok == 0 ? 0.0 : (_totalMicros / _ok) / 1000.0;
+
+  static void reset() {
+    _ok = 0;
+    _fail = 0;
+    _totalMicros = 0;
+    _maxMicros = 0;
+    _lastMicros = 0;
+    _bytesHashed = 0;
+    _lastFailurePath = null;
+    _slowestPath = null;
+  }
+
+  /// One-line human-readable summary. Hand to debugPrint at scan
+  /// boundaries or backfill checkpoints.
+  static String summary() =>
+      '[content_hash] ok=$_ok fail=$_fail '
+      'mean=${meanMs.toStringAsFixed(1)}ms '
+      'max=${(_maxMicros / 1000).toStringAsFixed(1)}ms '
+      'bytes=${(_bytesHashed / 1024 / 1024).toStringAsFixed(1)}MB';
+
+  static void _recordSuccess(int micros, int bytes, String path) {
+    _ok++;
+    _totalMicros += micros;
+    _lastMicros = micros;
+    if (micros > _maxMicros) {
+      _maxMicros = micros;
+      _slowestPath = path;
+    }
+    _bytesHashed += bytes;
+    if (micros > _slowHashMicros) {
+      debugPrint(
+        '[content_hash] slow: ${(micros / 1000).toStringAsFixed(0)}ms · $path',
+      );
+    }
+  }
+
+  static void _recordFailure(String path) {
+    _fail++;
+    _lastFailurePath = path;
+  }
+}
+
 /// Compute the content hash for the file at [path].
 ///
 /// Returns `null` if the file is unreadable (missing, permission
@@ -46,13 +124,21 @@ const int _chunkBytes = 256 * 1024;
 ///
 /// Pure I/O + crypto; safe to call from a background isolate.
 Future<String?> computeContentHash(String path) async {
+  final start = DateTime.now().microsecondsSinceEpoch;
   try {
     final file = File(path);
     final length = await file.length();
-    if (length <= 0) return null;
+    if (length <= 0) {
+      ContentHashStats._recordFailure(path);
+      return null;
+    }
     final bytes = await _readChunks(file, length);
-    return _hash(bytes);
+    final hash = _hash(bytes);
+    final elapsed = DateTime.now().microsecondsSinceEpoch - start;
+    ContentHashStats._recordSuccess(elapsed, bytes.length, path);
+    return hash;
   } on FileSystemException {
+    ContentHashStats._recordFailure(path);
     return null;
   }
 }
@@ -60,13 +146,21 @@ Future<String?> computeContentHash(String path) async {
 /// Synchronous variant. Useful in the scan upsert path where we
 /// already hold a stat'd file and don't want to add another async hop.
 String? computeContentHashSync(String path) {
+  final start = DateTime.now().microsecondsSinceEpoch;
   try {
     final file = File(path);
     final length = file.lengthSync();
-    if (length <= 0) return null;
+    if (length <= 0) {
+      ContentHashStats._recordFailure(path);
+      return null;
+    }
     final bytes = _readChunksSync(file, length);
-    return _hash(bytes);
+    final hash = _hash(bytes);
+    final elapsed = DateTime.now().microsecondsSinceEpoch - start;
+    ContentHashStats._recordSuccess(elapsed, bytes.length, path);
+    return hash;
   } on FileSystemException {
+    ContentHashStats._recordFailure(path);
     return null;
   }
 }

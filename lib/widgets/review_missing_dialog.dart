@@ -5,11 +5,22 @@ import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
 
-/// "Review missing files" dialog — surfaces `indexed_files` rows
-/// whose `availability_state` is `missing` (file truly gone, no
-/// successor) or `superseded` (file detected as moved within its
-/// source). Lets the user permanently purge ghost rows that have
-/// served their purpose.
+/// "Review removed & moved files" dialog — surfaces `indexed_files`
+/// rows whose `availability_state` is `missing` (UI: "Removed" —
+/// file vanished from disk with no byte-identical copy elsewhere)
+/// or `superseded` (UI: "Moved" — auto-resolved relocation, or
+/// coexisting copy detected). Lets the user permanently purge
+/// ghost rows that have served their purpose.
+///
+/// Vocabulary discipline (see project memory):
+///   - "Removed" = file disappeared OUTSIDE the app (Finder delete,
+///     drive disconnect, etc). DB state stays `missing`.
+///   - "Deleted" = future in-app delete action that trashes the file
+///     from disk. Not yet implemented; the term is reserved.
+///   - "Moved" = a relocation we can either confirm (unique match
+///     by content_hash / fingerprint → state `superseded`) or
+///     surface as coexistence (multiple byte-identical copies → DB
+///     stays `missing` but UI reclassifies into MOVED section).
 ///
 /// Per project memory: behavioural intel is never destroyed
 /// automatically; purge is an explicit user action. Intel rows on
@@ -103,14 +114,16 @@ class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
                             children: [
                               if (missing.isNotEmpty) ...[
                                 _SectionHeader(
-                                  label: 'MISSING',
+                                  label: 'REMOVED',
                                   sublabel:
                                       'Was on disk before. Last scan didn\'t '
                                       "find it and no byte-identical copy was "
-                                      'detected in any watched folder. Treat '
-                                      'as genuinely lost — purge if you '
-                                      'removed it on purpose; intel survives '
-                                      'until purged.',
+                                      "detected in any watched folder — so "
+                                      'it was removed from the library\'s '
+                                      'view (intel preserved). Purge if you '
+                                      'intended to lose it; restore the file '
+                                      'or add its new folder as a source if '
+                                      'not.',
                                   count: missing.length,
                                   accent: AppColors.favorite,
                                 ),
@@ -267,7 +280,7 @@ class _Header extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 const Text(
-                  'Review missing files',
+                  'Review removed & moved files',
                   style: TextStyle(
                     fontSize: 14,
                     fontWeight: FontWeight.w600,
@@ -279,7 +292,7 @@ class _Header extends StatelessWidget {
                 Text(
                   missing == 0 && moved == 0
                       ? 'Nothing to review. Every indexed file is on disk.'
-                      : '$missing missing · $moved moved',
+                      : '$missing removed · $moved moved',
                   style: const TextStyle(
                     fontSize: 11,
                     color: AppColors.textTertiary,

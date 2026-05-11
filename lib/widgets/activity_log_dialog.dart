@@ -224,7 +224,7 @@ class _EmptyState extends StatelessWidget {
             ),
             SizedBox(height: 4),
             Text(
-              'Events appear here as the system marks files missing, '
+              'Events appear here as the system removes files, '
               'detects moves, or purges rows.',
               style: TextStyle(
                 color: AppColors.textTertiary,

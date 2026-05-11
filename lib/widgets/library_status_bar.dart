@@ -299,15 +299,20 @@ class _LibraryTally extends StatelessWidget {
         if (missing > 0) ...[
           const SizedBox(width: 12),
           _TallyChunk(
-            label: 'missing',
+            label: 'removed',
             value: missing,
             warning: true,
             tooltip:
                 'Files that were on disk during a previous scan but '
-                'were not found on the last scan, with no successor '
-                'auto-detected. Intelligence (favorite, plays, '
-                'reviews) is preserved on the row even though the '
-                "file is gone. Click to review and purge.",
+                'are no longer found, with no byte-identical copy '
+                'detected in any watched folder. Removed from the '
+                "library's view but their intel (favorite, plays, "
+                'reviews) is preserved on the row until you explicitly '
+                "purge. Click to review.\n\n"
+                'Use "Removed" for files that disappeared externally '
+                '(deleted in Finder, drive disconnected, etc). The '
+                'app reserves "Deleted" for a future in-app delete '
+                'action that explicitly trashes the file from disk.',
             onTap: () => showReviewMissingDialog(
               context: context,
               controller: controller,

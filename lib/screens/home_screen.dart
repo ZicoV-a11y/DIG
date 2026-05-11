@@ -172,6 +172,18 @@ class _HomeScreenState extends State<HomeScreen> {
       widget.controller.toggleSidebarVisible();
       return true;
     }
+    if (key == LogicalKeyboardKey.keyR &&
+        isMeta &&
+        !isCtrl &&
+        !isAlt &&
+        !isShift) {
+      // Manual escape hatch: force a rescan of every source. Useful
+      // when the FS watcher missed something (cloud-sync glitches,
+      // unusual delete flows) and the focus-rescan hasn't fired
+      // because the app never lost focus.
+      widget.controller.rescanAllSources();
+      return true;
+    }
 
     // Suppress single-key shortcuts while typing in any text input.
     if (_isFocusInTextInput()) return false;

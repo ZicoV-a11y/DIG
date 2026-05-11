@@ -1108,10 +1108,22 @@ class LibraryController extends ChangeNotifier {
   List<Track> _computeGroupedVisible() {
     // Step 1: group the whole library. Order each bucket so the
     // lowest-quality format (the displayed primary) is at index 0.
+    // Unavailable variants (file deleted / removed since last scan,
+    // marked `is_available = 0`) are dropped from the bucket so the
+    // FORMAT cell count, the primary picker, and the right-click
+    // submenu all stop referencing them as soon as a rescan marks
+    // them gone. If every variant in a bucket is unavailable, the
+    // bucket disappears from the visible table entirely — its
+    // intelligence still lives on the `tracks` row (guardrail 5)
+    // and reconnects automatically if the user adds the file back.
     final rawBuckets = groupBySongIdentity(_tracks);
-    final buckets = [
-      for (final b in rawBuckets) orderBucketByPlaybackPreference(b),
-    ];
+    final buckets = <List<Track>>[];
+    for (final raw in rawBuckets) {
+      final available =
+          raw.where((t) => t.isAvailable).toList(growable: false);
+      if (available.isEmpty) continue;
+      buckets.add(orderBucketByPlaybackPreference(available));
+    }
     // Build the per-bucket aggregated view once so filter / sort don't
     // have to recompute.
     final views = <String, AggregatedTrackView>{
@@ -1695,6 +1707,12 @@ class LibraryController extends ChangeNotifier {
       _focusRescanInFlight = false;
     }
   }
+
+  /// User-triggered "rescan everything now" (Cmd+R). Reuses the
+  /// focus-rescan path — same sequential walk over non-sub-view
+  /// sources, same re-entry guard. Exposed so the manual escape
+  /// hatch matches the automatic one byte-for-byte.
+  Future<void> rescanAllSources() => _rescanAllOnFocus();
 
   Future<void> _stopWatcher(String sourceId) async {
     final sub = _watchers.remove(sourceId);

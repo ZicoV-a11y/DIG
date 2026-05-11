@@ -78,29 +78,7 @@ class _DuplicatesAuditDialogState extends State<_DuplicatesAuditDialog> {
                   Expanded(
                     child: buckets.isEmpty
                         ? const _EmptyState()
-                        : ListView.builder(
-                            itemCount: buckets.length,
-                            itemBuilder: (_, i) {
-                              final view = buckets[i];
-                              final key = view.primary.uid;
-                              return _BucketRow(
-                                view: view,
-                                expanded: _expanded.contains(key),
-                                onToggleExpand: () {
-                                  setState(() {
-                                    if (!_expanded.remove(key)) {
-                                      _expanded.add(key);
-                                    }
-                                  });
-                                },
-                                onShowVariantInFinder: (t) {
-                                  widget.controller.revealVariantInFinder(t);
-                                },
-                                onUnlinkBucket: () =>
-                                    _confirmUnlink(view),
-                              );
-                            },
-                          ),
+                        : _buildSectionedList(buckets),
                   ),
                 ],
               ),
@@ -108,6 +86,79 @@ class _DuplicatesAuditDialogState extends State<_DuplicatesAuditDialog> {
           ),
         );
       },
+    );
+  }
+
+  /// Render the bucket list grouped by `matchReason`, with the
+  /// most-questionable section first. Within each section, buckets
+  /// keep the controller's disk-size-descending order. Section
+  /// headers separate the categories so the user can scan
+  /// `Needs review` cases without wading through the obvious
+  /// auto-matches.
+  Widget _buildSectionedList(List<AggregatedTrackView> buckets) {
+    final byReason = <BucketMatchReason, List<AggregatedTrackView>>{
+      BucketMatchReason.fingerprintWithTagDrift: [],
+      BucketMatchReason.manualLink: [],
+      BucketMatchReason.exactMatch: [],
+    };
+    for (final v in buckets) {
+      byReason[v.matchReason]!.add(v);
+    }
+    final entries = <Widget>[];
+    void addSection(BucketMatchReason reason, _SectionMeta meta) {
+      final list = byReason[reason]!;
+      if (list.isEmpty) return;
+      entries.add(_SectionHeader(meta: meta, count: list.length));
+      for (final view in list) {
+        final key = view.primary.uid;
+        entries.add(_BucketRow(
+          view: view,
+          expanded: _expanded.contains(key),
+          onToggleExpand: () {
+            setState(() {
+              if (!_expanded.remove(key)) _expanded.add(key);
+            });
+          },
+          onShowVariantInFinder: (t) {
+            widget.controller.revealVariantInFinder(t);
+          },
+          onUnlinkBucket: () => _confirmUnlink(view),
+        ));
+      }
+    }
+    // Order: questionable → user-vetted → trust-the-system.
+    addSection(
+      BucketMatchReason.fingerprintWithTagDrift,
+      const _SectionMeta(
+        label: 'NEEDS REVIEW',
+        sublabel:
+            'Same audio fingerprint, but title / artist / duration '
+            'drifted — confirm these are really the same song.',
+        accent: AppColors.favorite,
+      ),
+    );
+    addSection(
+      BucketMatchReason.manualLink,
+      const _SectionMeta(
+        label: 'MANUAL LINKS',
+        sublabel:
+            'You paired these explicitly via the right-click menu.',
+        accent: AppColors.accent,
+      ),
+    );
+    addSection(
+      BucketMatchReason.exactMatch,
+      const _SectionMeta(
+        label: 'EXACT MATCHES',
+        sublabel:
+            'Every field agrees. The auto-matcher is confident; '
+            'review only if something looks off.',
+        accent: AppColors.textTertiary,
+      ),
+    );
+    return ListView.builder(
+      itemCount: entries.length,
+      itemBuilder: (_, i) => entries[i],
     );
   }
 
@@ -224,6 +275,84 @@ class _DialogHeader extends StatelessWidget {
               color: AppColors.textSecondary,
             ),
             splashRadius: 14,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Compile-time description of one classification section header
+/// (label + sublabel + accent color). One per `BucketMatchReason`.
+class _SectionMeta {
+  final String label;
+  final String sublabel;
+  final Color accent;
+  const _SectionMeta({
+    required this.label,
+    required this.sublabel,
+    required this.accent,
+  });
+}
+
+class _SectionHeader extends StatelessWidget {
+  final _SectionMeta meta;
+  final int count;
+  const _SectionHeader({required this.meta, required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: AppColors.surfaceAlt,
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(
+            width: 3,
+            height: 24,
+            color: meta.accent,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      meta.label,
+                      style: TextStyle(
+                        color: meta.accent,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 1.4,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '· $count',
+                      style: const TextStyle(
+                        color: AppColors.textTertiary,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        fontFeatures: [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  meta.sublabel,
+                  style: const TextStyle(
+                    color: AppColors.textTertiary,
+                    fontSize: 10,
+                    height: 1.4,
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),

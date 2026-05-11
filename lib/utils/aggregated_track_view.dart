@@ -1,6 +1,35 @@
 import '../models/track.dart';
 import 'file_format.dart';
 import 'key_normalizer.dart';
+import 'song_identity.dart' show basenameForIdentity;
+
+/// How a multi-variant song-identity bucket got paired. Drives the
+/// duplicates audit's "trust" sectioning — the user expects to focus
+/// on the questionable pairs, not the obviously-correct ones.
+enum BucketMatchReason {
+  /// Every variant agrees on every matching field (basename minus
+  /// extension and minus macOS Cmd+D " copy" suffix, title, artist,
+  /// duration in seconds). The auto-matcher's strict 4-field rule
+  /// applies cleanly. Highest confidence — system trusted, user can
+  /// generally ignore.
+  exactMatch,
+
+  /// Two or more variants share a non-empty `identityOverride` set
+  /// by the right-click "Link with another song" action. User-vetted
+  /// pairing that bypasses the auto-matcher. High confidence from
+  /// the user's perspective (they did it on purpose) but worth
+  /// surfacing in audit so they can review their own decisions.
+  manualLink,
+
+  /// Variants pair because their file-content fingerprint matches
+  /// (byte-equivalent audio) BUT they disagree on at least one of
+  /// the 4 matching fields (title, artist, duration, basename).
+  /// The most questionable category: the file content is the same,
+  /// the metadata isn't — usually tag drift, sometimes a sign two
+  /// genuinely different songs collided on filename+size+duration.
+  /// Surface these first for review.
+  fingerprintWithTagDrift,
+}
 
 /// Pure value object that derives the display values for a single
 /// collapsed row in the table when grouping by song identity is on.
@@ -37,6 +66,47 @@ class AggregatedTrackView {
   bool get hasSiblings => variants.length > 1;
 
   int get variantCount => variants.length;
+
+  /// Classify why this bucket's variants ended up paired. Mirrors
+  /// the rule priority in `sameSongIdentity` but inspects each
+  /// variant directly to detect when the auto-matcher's 4-field
+  /// rule held cleanly vs when fingerprint-fallback / manual
+  /// override had to step in.
+  ///
+  /// Priority (least to most questionable):
+  ///   1. `exactMatch` — every variant agrees on every field.
+  ///   2. `manualLink` — at least two variants share a non-empty
+  ///      override (and the bucket isn't an exact match without it).
+  ///   3. `fingerprintWithTagDrift` — otherwise. Variants paired
+  ///      because of fingerprint equivalence despite drifted tags.
+  BucketMatchReason get matchReason {
+    if (variants.length < 2) return BucketMatchReason.exactMatch;
+    if (_allFieldsAgree) return BucketMatchReason.exactMatch;
+    // Not exact. Check for a shared manual override on ≥2 variants.
+    final overrideCounts = <String, int>{};
+    for (final t in variants) {
+      final ov = t.identityOverride;
+      if (ov == null || ov.isEmpty) continue;
+      overrideCounts[ov] = (overrideCounts[ov] ?? 0) + 1;
+    }
+    for (final n in overrideCounts.values) {
+      if (n >= 2) return BucketMatchReason.manualLink;
+    }
+    return BucketMatchReason.fingerprintWithTagDrift;
+  }
+
+  bool get _allFieldsAgree {
+    final first = variants.first;
+    final firstBase = basenameForIdentity(first.filename);
+    final firstDurSec = first.duration.inSeconds;
+    for (final t in variants) {
+      if (t.title != first.title) return false;
+      if (t.artist != first.artist) return false;
+      if (t.duration.inSeconds != firstDurSec) return false;
+      if (basenameForIdentity(t.filename) != firstBase) return false;
+    }
+    return true;
+  }
 
   /// Sum of plays across all variants. Until per-song stats land in
   /// slice 3, this is a display-only aggregation — the underlying

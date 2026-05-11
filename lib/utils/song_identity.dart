@@ -138,6 +138,15 @@ String? songIdentityKey(Track t) {
       '${t.duration.inSeconds}';
 }
 
+/// Public mirror of the basename normalization the matcher applies
+/// (extension strip + macOS Cmd+D suffix strip). Exposed so other
+/// modules — e.g. the duplicates-audit classifier — can ask "would
+/// the matcher see these two filenames as the same?" without
+/// re-implementing the rule. Keep this in sync with `_basenameNoExt`
+/// below; right now it's just a wrapper so the matcher is the
+/// single source of truth.
+String basenameForIdentity(String filename) => _basenameNoExt(filename);
+
 String _basenameNoExt(String filename) {
   // Strip the last extension only. `track.tar.gz` → `track.tar`,
   // which matches how Dart's `path.withoutExtension` behaves and is

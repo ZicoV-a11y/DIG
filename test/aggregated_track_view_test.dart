@@ -14,10 +14,13 @@ Track _t({
   bool favorite = false,
   DateTime? lastPlayedAt,
   String? uid,
+  String? identityOverride,
+  String? fingerprint,
 }) {
   return Track(
     uid: uid ?? 'uid-$filename',
-    fingerprint: 'fp-$filename',
+    fingerprint: fingerprint ?? 'fp-$filename',
+    identityOverride: identityOverride,
     path: '/lib/$filename',
     filename: filename,
     sourceId: 'src',
@@ -279,6 +282,132 @@ void main() {
         _t(filename: '.hidden'),
       ]);
       expect(v.formatLabel, '');
+    });
+  });
+
+  group('matchReason — bucket classification', () {
+    test('singleton bucket → exactMatch (trivially)', () {
+      final v = AggregatedTrackView([_t(filename: 'a.mp3')]);
+      expect(v.matchReason, BucketMatchReason.exactMatch);
+    });
+
+    test('all fields agree across formats → exactMatch', () {
+      final v = AggregatedTrackView([
+        _t(
+          filename: 'song.mp3',
+          title: 'T',
+          artist: 'A',
+          duration: const Duration(seconds: 300),
+        ),
+        _t(
+          filename: 'song.aiff',
+          title: 'T',
+          artist: 'A',
+          duration: const Duration(seconds: 300),
+        ),
+      ]);
+      expect(v.matchReason, BucketMatchReason.exactMatch);
+    });
+
+    test('macOS " copy" suffix still classifies as exactMatch', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'song.mp3', title: 'T', artist: 'A'),
+        _t(filename: 'song copy.mp3', title: 'T', artist: 'A'),
+      ]);
+      expect(v.matchReason, BucketMatchReason.exactMatch);
+    });
+
+    test('different titles → fingerprintWithTagDrift', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'song.mp3', title: 'Title A', artist: 'X'),
+        _t(filename: 'song.mp3', title: 'Title B', artist: 'X'),
+      ]);
+      expect(v.matchReason, BucketMatchReason.fingerprintWithTagDrift);
+    });
+
+    test('different artists → fingerprintWithTagDrift', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'song.mp3', title: 'T', artist: 'A1'),
+        _t(filename: 'song.mp3', title: 'T', artist: 'A2'),
+      ]);
+      expect(v.matchReason, BucketMatchReason.fingerprintWithTagDrift);
+    });
+
+    test('different durations (whole seconds) → fingerprintWithTagDrift',
+        () {
+      final v = AggregatedTrackView([
+        _t(
+          filename: 'song.mp3',
+          title: 'T',
+          artist: 'A',
+          duration: const Duration(seconds: 300),
+        ),
+        _t(
+          filename: 'song.mp3',
+          title: 'T',
+          artist: 'A',
+          duration: const Duration(seconds: 305),
+        ),
+      ]);
+      expect(v.matchReason, BucketMatchReason.fingerprintWithTagDrift);
+    });
+
+    test('two variants sharing an override (not exact) → manualLink', () {
+      final v = AggregatedTrackView([
+        _t(
+          filename: 'one.mp3',
+          title: 'Track A',
+          artist: 'Artist X',
+          identityOverride: 'shared',
+        ),
+        _t(
+          filename: 'two.aiff',
+          title: 'Track B',
+          artist: 'Artist Y',
+          identityOverride: 'shared',
+        ),
+      ]);
+      expect(v.matchReason, BucketMatchReason.manualLink);
+    });
+
+    test('override present but bucket still all-fields-agree → exactMatch',
+        () {
+      // User manually linked two tracks that the auto-matcher would
+      // have paired anyway. Classify by the simpler explanation.
+      final v = AggregatedTrackView([
+        _t(
+          filename: 'song.mp3',
+          title: 'T',
+          artist: 'A',
+          identityOverride: 'redundant',
+        ),
+        _t(
+          filename: 'song.aiff',
+          title: 'T',
+          artist: 'A',
+          identityOverride: 'redundant',
+        ),
+      ]);
+      expect(v.matchReason, BucketMatchReason.exactMatch);
+    });
+
+    test('only one variant has override → not enough to manualLink', () {
+      // Asymmetric override means the auto-matcher must have paired
+      // them another way (fingerprint). Classify by that.
+      final v = AggregatedTrackView([
+        _t(
+          filename: 'one.mp3',
+          title: 'Track A',
+          artist: 'X',
+          identityOverride: 'group-x',
+        ),
+        _t(
+          filename: 'two.mp3',
+          title: 'Track B',
+          artist: 'Y',
+        ),
+      ]);
+      expect(v.matchReason, BucketMatchReason.fingerprintWithTagDrift);
     });
   });
 

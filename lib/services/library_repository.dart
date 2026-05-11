@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -10,6 +11,34 @@ import 'content_hash.dart';
 import 'database.dart';
 import 'metadata_extractor.dart';
 import 'track_uid.dart';
+
+/// Outcome of a `moveTrackFile` / `copyTrackFile` operation.
+/// Either succeeded (and we know the new path + how the move was
+/// physically performed) or failed cleanly (no half-state — the
+/// FS and DB are both back to where they were).
+class MoveCopyResult {
+  final bool success;
+  final String? newPath;
+
+  /// How the FS leg of a move was performed. `'rename'` for
+  /// single-volume atomic rename, `'copy_then_delete'` for the
+  /// cross-volume fallback path, `'copy'` for a copy operation.
+  /// `null` on failures.
+  final String? via;
+
+  /// Human-readable reason. Surfaces to the user via a SnackBar
+  /// or dialog so they can fix the underlying problem (collision,
+  /// permission denied, source gone, etc).
+  final String? errorReason;
+
+  const MoveCopyResult.success({required this.newPath, required this.via})
+      : success = true,
+        errorReason = null;
+  const MoveCopyResult.failure(this.errorReason)
+      : success = false,
+        newPath = null,
+        via = null;
+}
 
 /// Per-file scan upsert payload.
 ///
@@ -811,6 +840,267 @@ class LibraryRepository {
   }
 
   // ---------------------------------------------------------------------------
+  // App-initiated file movement (Move/Copy)
+  //
+  // Repo-level primitives that atomically perform a filesystem
+  // operation (rename or copy) AND the corresponding indexed_files
+  // row update, plus an `app_initiated_*` activity event. These
+  // are the building blocks of the "app as orchestrator of
+  // filesystem truth" architecture; the controller wraps them with
+  // pre-flight + reload logic in sub-slice B.
+  // ---------------------------------------------------------------------------
+
+  /// Move the file at [sourcePath] into [destSource]'s folder root.
+  /// Filename stays the same. Atomic where the filesystem allows
+  /// (single-volume rename); falls back to copy + delete for
+  /// cross-volume moves with rollback if the delete fails.
+  ///
+  /// The old indexed_files row is removed and a new one is
+  /// inserted at the destination path inside a single transaction.
+  /// intel_uid / content_hash / fingerprint carry over unchanged
+  /// — same bytes, same identity, just a new physical location.
+  ///
+  /// Records an [EventType.appInitiatedMove] event on success.
+  /// On failure (source missing, destination collision, FS error)
+  /// returns a [MoveCopyResult] with a human-readable reason; the
+  /// DB and FS are guaranteed to be in their pre-call state.
+  Future<MoveCopyResult> moveTrackFile({
+    required String sourcePath,
+    required Source destSource,
+  }) async {
+    final basename = _basenameOf(sourcePath);
+    final destPath = '${destSource.folderPath}'
+        '${Platform.pathSeparator}'
+        '$basename';
+
+    // Pre-flight ─────────────────────────────────────────────
+    if (sourcePath == destPath) {
+      return const MoveCopyResult.failure(
+        'Source and destination are the same path.',
+      );
+    }
+    final srcFile = File(sourcePath);
+    if (!srcFile.existsSync()) {
+      return MoveCopyResult.failure(
+        'Source file no longer exists on disk: $sourcePath',
+      );
+    }
+    if (File(destPath).existsSync()) {
+      return MoveCopyResult.failure(
+        'A file already exists at the destination: $destPath',
+      );
+    }
+    final srcRow = await _db.query(
+      'indexed_files',
+      where: 'path = ?',
+      whereArgs: [sourcePath],
+      limit: 1,
+    );
+    if (srcRow.isEmpty) {
+      return MoveCopyResult.failure(
+        'No indexed_files row found for $sourcePath',
+      );
+    }
+    final row = Map<String, Object?>.from(srcRow.first);
+
+    // Filesystem op ──────────────────────────────────────────
+    String via;
+    try {
+      srcFile.renameSync(destPath);
+      via = 'rename';
+    } on FileSystemException {
+      // Cross-volume rename throws (EXDEV on POSIX). Fall back
+      // to copy + delete with rollback if the delete leg fails.
+      try {
+        srcFile.copySync(destPath);
+      } on FileSystemException catch (e) {
+        return MoveCopyResult.failure(
+          'Filesystem copy failed: ${e.message}',
+        );
+      }
+      try {
+        srcFile.deleteSync();
+      } on FileSystemException catch (e) {
+        // Source delete failed AFTER copy succeeded — roll back
+        // by removing the destination copy so we don't end up
+        // with a phantom duplicate.
+        try {
+          File(destPath).deleteSync();
+        } catch (_) {/* best-effort rollback */}
+        return MoveCopyResult.failure(
+          'Cross-volume move rolled back — source delete failed: '
+          '${e.message}',
+        );
+      }
+      via = 'copy_then_delete';
+    }
+
+    // DB update + event ──────────────────────────────────────
+    try {
+      await _db.transaction((txn) async {
+        // Insert the new row first (path is the PK, no collision
+        // because pre-flight verified destPath doesn't exist in
+        // indexed_files via the dest-file check + uniqueness of
+        // path). Then delete the source row.
+        final newRow = Map<String, Object?>.from(row);
+        newRow['path'] = destPath;
+        newRow['source_id'] = destSource.id;
+        newRow['filename'] = basename;
+        // last_seen_at bumped to NOW — the file was just observed
+        // at the new path by us, not by a scan, so this counts as
+        // a fresh sighting.
+        newRow['last_seen_at'] = DateTime.now().millisecondsSinceEpoch;
+        // is_available + availability_state: file IS available now,
+        // ensure both reflect that even if the source row was
+        // somehow in a non-available state (which shouldn't happen
+        // since pre-flight verified the source file exists).
+        newRow['is_available'] = 1;
+        newRow['availability_state'] = 'available';
+        await txn.insert('indexed_files', newRow);
+        await txn.delete(
+          'indexed_files',
+          where: 'path = ?',
+          whereArgs: [sourcePath],
+        );
+        await recordEvent(
+          type: EventType.appInitiatedMove,
+          path: sourcePath,
+          sourceId: row['source_id'] as String?,
+          payload: {
+            'dest_path': destPath,
+            'dest_source_id': destSource.id,
+            'via': via,
+          },
+          txn: txn,
+        );
+      });
+    } catch (e) {
+      // Atypical — FS already moved but DB write failed. Try to
+      // undo the FS rename so the next scan re-discovers the
+      // file at its original path with the original row intact.
+      try {
+        final destFile = File(destPath);
+        if (destFile.existsSync()) {
+          destFile.renameSync(sourcePath);
+        }
+      } catch (_) {/* best-effort */}
+      return MoveCopyResult.failure(
+        'Database update failed; rolled back filesystem move: $e',
+      );
+    }
+    return MoveCopyResult.success(newPath: destPath, via: via);
+  }
+
+  /// Copy the file at [sourcePath] into [destSource]'s folder root.
+  /// Same basename. A new indexed_files row is inserted at the
+  /// destination, sharing the source's `intel_uid` so favorites /
+  /// plays / review state live at the song-identity layer and
+  /// both rows reflect them.
+  ///
+  /// `content_hash` and `fingerprint` are copied from the source
+  /// row unchanged — same audio bytes, same basename, same
+  /// duration. The `uid` is RE-COMPUTED because uid hashes mtime
+  /// in addition to the file-identity inputs, and the fresh copy
+  /// has a new mtime.
+  ///
+  /// Records an [EventType.appInitiatedCopy] event on success.
+  Future<MoveCopyResult> copyTrackFile({
+    required String sourcePath,
+    required Source destSource,
+  }) async {
+    final basename = _basenameOf(sourcePath);
+    final destPath = '${destSource.folderPath}'
+        '${Platform.pathSeparator}'
+        '$basename';
+
+    if (sourcePath == destPath) {
+      return const MoveCopyResult.failure(
+        'Source and destination are the same path — use Move instead, or '
+        'rename one side first.',
+      );
+    }
+    final srcFile = File(sourcePath);
+    if (!srcFile.existsSync()) {
+      return MoveCopyResult.failure(
+        'Source file no longer exists on disk: $sourcePath',
+      );
+    }
+    if (File(destPath).existsSync()) {
+      return MoveCopyResult.failure(
+        'A file already exists at the destination: $destPath',
+      );
+    }
+    final srcRow = await _db.query(
+      'indexed_files',
+      where: 'path = ?',
+      whereArgs: [sourcePath],
+      limit: 1,
+    );
+    if (srcRow.isEmpty) {
+      return MoveCopyResult.failure(
+        'No indexed_files row found for $sourcePath',
+      );
+    }
+    final row = Map<String, Object?>.from(srcRow.first);
+
+    try {
+      srcFile.copySync(destPath);
+    } on FileSystemException catch (e) {
+      return MoveCopyResult.failure(
+        'Filesystem copy failed: ${e.message}',
+      );
+    }
+
+    // Re-stat to capture the fresh copy's mtime (mtime drives uid).
+    final destStat = File(destPath).statSync();
+    final newMtime = destStat.modified.millisecondsSinceEpoch;
+    final newUid = computeTrackUid(
+      basename: basename,
+      filesize: destStat.size,
+      durationMs: (row['duration_ms'] as int?) ?? 0,
+      mtimeMs: newMtime,
+    ).uid;
+
+    try {
+      await _db.transaction((txn) async {
+        final newRow = Map<String, Object?>.from(row);
+        newRow['path'] = destPath;
+        newRow['source_id'] = destSource.id;
+        newRow['filename'] = basename;
+        newRow['filesize'] = destStat.size;
+        newRow['modified_at'] = newMtime;
+        newRow['uid'] = newUid;
+        // intel_uid carried over unchanged → both file rows share
+        // intel at the song-identity layer.
+        newRow['is_available'] = 1;
+        newRow['availability_state'] = 'available';
+        newRow['last_seen_at'] = DateTime.now().millisecondsSinceEpoch;
+        await txn.insert('indexed_files', newRow);
+        await recordEvent(
+          type: EventType.appInitiatedCopy,
+          path: sourcePath,
+          sourceId: row['source_id'] as String?,
+          payload: {
+            'dest_path': destPath,
+            'dest_source_id': destSource.id,
+          },
+          txn: txn,
+        );
+      });
+    } catch (e) {
+      // FS copy succeeded but DB insert failed. Roll back the FS
+      // side so we don't leave an orphan file.
+      try {
+        File(destPath).deleteSync();
+      } catch (_) {/* best-effort */}
+      return MoveCopyResult.failure(
+        'Database update failed; rolled back filesystem copy: $e',
+      );
+    }
+    return MoveCopyResult.success(newPath: destPath, via: 'copy');
+  }
+
+  // ---------------------------------------------------------------------------
   // Activity log (cross-cutting — see lib/models/activity_event.dart)
   // ---------------------------------------------------------------------------
 
@@ -1547,4 +1837,12 @@ Track _trackFromJoinedRow(Map<String, Object?> r) {
         ? null
         : DateTime.fromMillisecondsSinceEpoch(lastPlayedAt),
   );
+}
+
+/// Extract the trailing path component (filename). Cheap, no
+/// `package:path` dependency required.
+String _basenameOf(String path) {
+  final sep = Platform.pathSeparator;
+  final idx = path.lastIndexOf(sep);
+  return idx < 0 ? path : path.substring(idx + 1);
 }

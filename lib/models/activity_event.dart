@@ -41,6 +41,22 @@ abstract class EventType {
   /// "Link with another song" action. Payload:
   /// `{"linked_to": "/path/of/sibling"}`.
   static const manualRelink = 'manual_relink';
+
+  /// App-initiated move: user picked "Move to..." in the right-
+  /// click menu and the app performed the FS rename + DB update
+  /// itself. Distinct from the auto-detect events because the
+  /// app KNOWS the move happened — no inference required.
+  /// Payload: `{"dest_path": "/new/path",
+  ///            "dest_source_id": "...",
+  ///            "via": "rename"|"copy_then_delete"}`.
+  static const appInitiatedMove = 'app_initiated_move';
+
+  /// App-initiated copy: user picked "Copy to..." in the right-
+  /// click menu. New indexed_files row lands at dest_path,
+  /// sharing intel_uid with the source so favorites/plays live
+  /// at the song-identity layer rather than per-file. Payload:
+  /// `{"dest_path": "/new/path", "dest_source_id": "..."}`.
+  static const appInitiatedCopy = 'app_initiated_copy';
 }
 
 /// Hydrated event row. Constructed by [LibraryRepository.loadRecentEvents]

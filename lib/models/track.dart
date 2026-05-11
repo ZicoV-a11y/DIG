@@ -21,14 +21,31 @@ class Track {
   // From indexed_files (file identity + location):
   final String uid;
 
-  /// File-content equivalence hash — same physical file at any path
-  /// collapses to the same value. **Not** a song-identity hash:
-  /// re-encodes of the same song (MP3 vs AIFF) get *different*
-  /// fingerprints because the extension and filesize change. Use
-  /// `sameSongIdentity` / `groupBySongIdentity` in `lib/utils/song_identity.dart`
-  /// for cross-format identity. See `project_track_identity_vs_file_variants.md`
-  /// in project memory.
+  /// **Heuristic** similarity hash — sha256 of basename + filesize
+  /// + duration. Stable across path moves IFF the basename is
+  /// unchanged. Breaks on rename / Cmd+D's `… copy.mp3` suffix /
+  /// extension change. Originally named "fingerprint" because it
+  /// was the only identity primitive; kept under the old name for
+  /// migration continuity even though [contentHash] is the
+  /// authoritative byte-identity now (Slice 5 swaps relocation
+  /// matching over). For cross-format song identity, use
+  /// `sameSongIdentity` / `groupBySongIdentity` in
+  /// `lib/utils/song_identity.dart`. See
+  /// `project_track_identity_vs_file_variants.md` and
+  /// `project_content_hash_separation.md` in project memory.
   final String fingerprint;
+
+  /// True physical-file identity — sha256 of the first 256KB plus
+  /// the last 256KB of audio bytes. Survives rename, folder move,
+  /// Cmd+D copy. Distinguishes re-encodes / transcodes / different
+  /// masters. Populated lazily: scan-time write path fills it for
+  /// new + changed files, the background backfill worker walks
+  /// the rest. May be `null` on legacy rows that haven't been
+  /// re-scanned and haven't been visited by the worker yet.
+  ///
+  /// Not consumed by any state-mutation path in Slice 2/3 — only
+  /// in Slice 5 does cross-source relocation matching switch over.
+  final String? contentHash;
 
   String? intelUid;
 
@@ -79,6 +96,7 @@ class Track {
   Track({
     required this.uid,
     required this.fingerprint,
+    this.contentHash,
     this.intelUid,
     this.identityOverride,
     required this.path,

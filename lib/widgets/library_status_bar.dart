@@ -96,6 +96,17 @@ _OperationState? _resolveOperation(LibraryController c) {
       subject: c.currentTrack?.filename,
     );
   }
+  // content_hash backfill — background, lowest priority. Surfaces
+  // only when no other foreground operation is active. The total
+  // is unknown (just a count of NULL-hash candidates that drains
+  // over time); show the running session count as "done" with no
+  // total so the progress bar stays indeterminate.
+  if (c.isBackfillingContentHashes) {
+    return _OperationState(
+      label: 'Hashing audio',
+      done: c.backfillHashedThisSession,
+    );
+  }
   return null;
 }
 
@@ -190,6 +201,19 @@ class _OperationCluster extends StatelessWidget {
             const SizedBox(width: 8),
             Text(
               '${state.done} / ${state.total}',
+              style: const TextStyle(
+                fontSize: 11,
+                color: AppColors.textSecondary,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+          ] else if (state.done != null) ...[
+            // Backfill case — no total to show alongside; count by
+            // itself is still useful as a "work is progressing"
+            // signal.
+            const SizedBox(width: 8),
+            Text(
+              '${state.done}',
               style: const TextStyle(
                 fontSize: 11,
                 color: AppColors.textSecondary,

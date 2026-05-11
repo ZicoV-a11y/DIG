@@ -14,6 +14,7 @@ import '../models/intelligence_record.dart';
 import '../models/source.dart';
 import '../models/track.dart';
 import '../services/audio_scanner.dart';
+import '../services/content_hash.dart';
 import '../services/content_hash_backfill.dart';
 import '../services/intelligence_export.dart';
 import '../services/library_repository.dart';
@@ -1704,6 +1705,9 @@ class LibraryController extends ChangeNotifier {
     // scan finishes, picking up wherever it left off (the
     // candidates query is stateless).
     _backfillWorker.cancel();
+    // Reset the hashing instrumentation so the per-scan summary
+    // log at the end of this call reflects only THIS scan's work.
+    ContentHashStats.reset();
     notifyListeners();
     try {
       // Snapshot the in-memory unavailable count BEFORE the rescan
@@ -1866,6 +1870,13 @@ class LibraryController extends ChangeNotifier {
       debugPrint('$st');
     } finally {
       _isScanning = false;
+      // Per-scan hashing summary. One line per scan boundary
+      // makes performance regressions and pathological files
+      // (slow Dropbox reads, AIFFs on slow NAS) visible without
+      // needing a full UI.
+      debugPrint(
+        '[scan] ${source.displayName}: ${ContentHashStats.summary()}',
+      );
       // Resume the content_hash backfill now that foreground
       // scanning is done. Picks up any newly-null rows the scan
       // just inserted as well as legacy rows the migration left

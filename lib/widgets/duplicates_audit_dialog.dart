@@ -662,6 +662,8 @@ class _VariantRow extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                   ),
                 ],
+                const SizedBox(height: 2),
+                _ContentHashLabel(track: track),
               ],
             ),
           ),
@@ -692,6 +694,53 @@ class _VariantRow extends StatelessWidget {
             constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// One-line content_hash hint for an audit variant row.
+///
+/// Three states (each visually distinct so the user can scan a
+/// bucket and immediately see why the matcher paired things):
+///   - hash present → first 12 hex chars in monospace + a tooltip
+///     with the full 64-char value. Two variants in the same
+///     bucket with identical prefixes ARE byte-identical files;
+///     differing prefixes mean the song-identity matcher (not
+///     content_hash) is what linked them.
+///   - hash null    → faint "sha: pending" placeholder. Means
+///     the row was created before v10 and the backfill worker
+///     hasn't reached it yet. Slice 5's relocation match will
+///     skip these.
+class _ContentHashLabel extends StatelessWidget {
+  final Track track;
+  const _ContentHashLabel({required this.track});
+
+  @override
+  Widget build(BuildContext context) {
+    final hash = track.contentHash;
+    if (hash == null || hash.isEmpty) {
+      return const Text(
+        'sha: pending',
+        style: TextStyle(
+          color: AppColors.textTertiary,
+          fontSize: 9,
+          fontStyle: FontStyle.italic,
+        ),
+      );
+    }
+    final prefix = hash.length >= 12 ? hash.substring(0, 12) : hash;
+    return Tooltip(
+      message: 'content_hash: $hash',
+      waitDuration: const Duration(milliseconds: 300),
+      child: Text(
+        'sha: $prefix…',
+        style: const TextStyle(
+          color: AppColors.textTertiary,
+          fontSize: 9,
+          fontFeatures: [FontFeature.tabularFigures()],
+          letterSpacing: 0.3,
+        ),
       ),
     );
   }

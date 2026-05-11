@@ -1234,6 +1234,7 @@ Track _trackFromJoinedRow(Map<String, Object?> r) {
   return Track(
     uid: r['uid'] as String,
     fingerprint: r['fingerprint'] as String,
+    contentHash: r['content_hash'] as String?,
     intelUid: r['intel_uid'] as String?,
     identityOverride: r['identity_override'] as String?,
     path: r['path'] as String,

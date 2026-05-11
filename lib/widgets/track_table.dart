@@ -3,12 +3,12 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 
-import '../models/source.dart';
 import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
 import 'link_track_dialog.dart';
+import 'move_copy_dialog.dart';
 import 'track_artwork.dart';
 
 class TrackTable extends StatefulWidget {
@@ -922,30 +922,21 @@ class _TrackRow extends StatelessWidget {
     if (aggView != null && aggView.hasSiblings) {
       items.add(_unlinkMenuItem(variantCount: aggView.variantCount));
     }
-    // Move/Copy destinations — every non-sub-view source EXCEPT
-    // the one this track already lives in. For multi-variant
-    // rows the menu operates on the row's primary track (the
-    // playback-preferred one); per-variant move/copy is a future
-    // refinement. The repo's pre-flight catches the rest of the
-    // failure modes (filename collision, file missing, etc.) and
-    // surfaces them via SnackBar after the menu closes.
+    // Move/Copy entry — single item that opens a modal picker.
+    // The old flat-list approach (one item per destination per
+    // action) didn't scale past 3-4 sources; this single entry
+    // routes to a dialog where the user picks the action (Copy
+    // or Move) and one or more destinations from a checkbox list.
+    // For multi-variant rows the dialog operates on the row's
+    // primary track; per-variant move/copy is a future refinement.
     final destinations = controller.moveCopyDestinationsFor(track);
     if (destinations.isNotEmpty) {
       items.add(const PopupMenuDivider(height: 1));
-      for (final dest in destinations) {
-        items.add(_moveCopyMenuItem(
-          value: 'move:${dest.id}',
-          label: 'Move to ${dest.displayName}',
-          icon: Icons.drive_file_move_rounded,
-        ));
-      }
-      for (final dest in destinations) {
-        items.add(_moveCopyMenuItem(
-          value: 'copy:${dest.id}',
-          label: 'Copy to ${dest.displayName}',
-          icon: Icons.content_copy_rounded,
-        ));
-      }
+      items.add(_moveCopyMenuItem(
+        value: 'move-copy',
+        label: 'Move or copy…',
+        icon: Icons.drive_file_move_rounded,
+      ));
     }
 
     final result = await showMenu<String>(
@@ -995,49 +986,66 @@ class _TrackRow extends StatelessWidget {
       if (confirmed == true) {
         await controller.unlinkBucket(track);
       }
-    } else if ((result.startsWith('move:') || result.startsWith('copy:')) &&
-        context.mounted) {
-      // Parse the destination source id off the result string and
-      // dispatch the corresponding controller method. The SnackBar
-      // narrates outcome — success surfaces the new path basename;
-      // failure surfaces the repo's errorReason verbatim so the
-      // user knows exactly which pre-flight tripped.
-      final isMove = result.startsWith('move:');
-      final destId = result.substring(isMove ? 'move:'.length : 'copy:'.length);
-      Source? destSource;
-      for (final s in controller.sources) {
-        if (s.id == destId) {
-          destSource = s;
-          break;
-        }
-      }
-      if (destSource == null) return;
-      final outcome = isMove
-          ? await controller.moveTrack(track: track, destSource: destSource)
-          : await controller.copyTrack(track: track, destSource: destSource);
+    } else if (result == 'move-copy' && context.mounted) {
+      // Open the modal picker. It owns the action toggle (Copy /
+      // Move) and the destination checkbox list, and runs the
+      // controller calls itself. We only summarise the outcome
+      // here via SnackBar so the result is visible after the
+      // dialog dismisses.
+      final outcome = await showMoveCopyDialog(
+        context: context,
+        controller: controller,
+        track: track,
+      );
       if (!context.mounted) return;
+      if (outcome == null || !outcome.hasAnyResult) return;
       final messenger = ScaffoldMessenger.maybeOf(context);
-      if (outcome.success) {
-        final basename = (outcome.newPath ?? '').split('/').last;
+      if (outcome.failures.isEmpty) {
         messenger?.showSnackBar(
           SnackBar(
             content: Text(
-              isMove
-                  ? 'Moved $basename → ${destSource.displayName}'
-                  : 'Copied $basename → ${destSource.displayName}',
+              outcome.wasMove
+                  ? 'Moved → ${outcome.succeededDestNames.first}'
+                  : outcome.succeededDestNames.length == 1
+                      ? 'Copied → ${outcome.succeededDestNames.first}'
+                      : 'Copied → '
+                          '${outcome.succeededDestNames.length} folders',
             ),
             duration: const Duration(seconds: 3),
           ),
         );
-      } else {
+      } else if (outcome.succeededDestNames.isEmpty) {
+        // Everything failed — show the first failure reason. If
+        // the user wants to see all failures, the History panel
+        // surfaces nothing (failed ops don't write events) but a
+        // future enhancement could collect them in a side panel.
+        final f = outcome.failures.first;
         messenger?.showSnackBar(
           SnackBar(
             content: Text(
-              outcome.errorReason ??
-                  (isMove ? 'Move failed' : 'Copy failed'),
+              outcome.failures.length == 1
+                  ? '${outcome.wasMove ? "Move" : "Copy"} failed: '
+                      '${f.reason}'
+                  : '${outcome.wasMove ? "Move" : "Copy"} failed '
+                      'for all ${outcome.failures.length} '
+                      'destinations. First: ${f.reason}',
             ),
             backgroundColor: AppColors.favorite,
-            duration: const Duration(seconds: 4),
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      } else {
+        // Mixed: some destinations succeeded, others didn't.
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              '${outcome.wasMove ? "Moved" : "Copied"} to '
+              '${outcome.succeededDestNames.length}, failed '
+              '${outcome.failures.length}: '
+              '${outcome.failures.first.reason}',
+            ),
+            backgroundColor: AppColors.favorite,
+            duration: const Duration(seconds: 5),
           ),
         );
       }

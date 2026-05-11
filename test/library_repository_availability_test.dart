@@ -56,12 +56,16 @@ void main() {
     String state = 'available',
     int filesize = 1024,
     int durationMs = 300000,
+    String? contentHash,
   }) async {
     // Default to non-degenerate stat inputs so tests against
     // markCrossSourceMoves (which guards against filesize <= 0 /
     // duration_ms <= 0) can match by default. Tests that
     // specifically want to probe the junk-fingerprint guard
     // override filesize/durationMs to 0.
+    //
+    // contentHash defaults to null (legacy / pre-v10 row); tests
+    // that exercise the Slice 5 strong path override.
     await raw.insert('indexed_files', {
       'path': path,
       'source_id': sourceId,
@@ -70,6 +74,7 @@ void main() {
       'modified_at': 0,
       'duration_ms': durationMs,
       'fingerprint': fingerprint,
+      'content_hash': contentHash,
       'uid': uid,
       'intel_uid': intelUid,
       'is_available': state == 'available' ? 1 : 0,
@@ -405,6 +410,138 @@ void main() {
           durationMs: 0);
       await repo.markCrossSourceMoves();
       expect(await stateOf('/srcA/lost.mp3'), 'missing');
+    });
+
+    // ──────────────────────────────────────────────────────────────
+    // Slice 5: content_hash matching takes precedence over
+    // fingerprint when both rows have it. Catches the case the
+    // tactical (fingerprint-only) path missed: rename-during-move.
+    // ──────────────────────────────────────────────────────────────
+
+    test(
+        'cross-source move via content_hash — different fingerprint (rename across folders)',
+        () async {
+      // The case Slice 5 specifically exists to handle. User
+      // copied a file, renamed it during the move, ended up in
+      // a different watched source. Fingerprint (basename-based)
+      // can't link them. content_hash (byte-based) can.
+      await seedFile(
+          path: '/srcA/old name.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-old-basename',
+          contentHash: 'ch-bytes-1',
+          uid: 'u-old',
+          state: 'missing');
+      await seedFile(
+          path: '/srcB/cleaner name.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp-new-basename',
+          contentHash: 'ch-bytes-1',
+          uid: 'u-new');
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/old name.mp3'), 'superseded');
+      expect(await stateOf('/srcB/cleaner name.mp3'), 'available');
+    });
+
+    test(
+        'content_hash governs: matching fingerprint but DIFFERENT content_hash does NOT supersede',
+        () async {
+      // Two unrelated files happen to share a basename (and
+      // therefore fingerprint, since fingerprint is basename-
+      // based). content_hashes prove they are different byte
+      // sequences. Don't auto-merge.
+      await seedFile(
+          path: '/srcA/song.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-collision',
+          contentHash: 'ch-bytes-A',
+          uid: 'u-old',
+          state: 'missing');
+      await seedFile(
+          path: '/srcB/song.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp-collision',
+          contentHash: 'ch-bytes-B',
+          uid: 'u-other');
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/song.mp3'), 'missing',
+          reason:
+              'content_hash mismatch must block auto-merge even when fingerprints align');
+    });
+
+    test(
+        'uniqueness rule on content_hash: 2+ same-content_hash available rows blocks supersession',
+        () async {
+      await seedFile(
+          path: '/srcA/missing.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp1',
+          contentHash: 'ch-dupes',
+          uid: 'u-old',
+          state: 'missing');
+      await seedFile(
+          path: '/srcB/copy1.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp2',
+          contentHash: 'ch-dupes',
+          uid: 'u-c1');
+      await seedFile(
+          path: '/srcB/copy2.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp3',
+          contentHash: 'ch-dupes',
+          uid: 'u-c2');
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/missing.mp3'), 'missing');
+    });
+
+    test(
+        'asymmetric NULL: missing row HAS content_hash, available is NULL — no fingerprint fallback',
+        () async {
+      // When the missing row has a content_hash, we trust ONLY
+      // content_hash. A NULL on the available side means we don't
+      // know its bytes yet → can't be sure it's the same file →
+      // do not auto-merge even if fingerprint matches. Backfill
+      // worker will fill the available row's content_hash in
+      // shortly; if it matches, the next call will supersede.
+      await seedFile(
+          path: '/srcA/old.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp1',
+          contentHash: 'ch-bytes',
+          uid: 'u-old',
+          state: 'missing');
+      await seedFile(
+          path: '/srcB/new.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp1',
+          // contentHash explicitly null — backfill hasn't run.
+          uid: 'u-new');
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/old.mp3'), 'missing');
+    });
+
+    test(
+        'asymmetric NULL: missing row NULL, available has content_hash — fingerprint fallback fires',
+        () async {
+      // Legacy missing row (pre-v10) hasn't been visited by
+      // backfill yet. Available row is freshly scanned with
+      // content_hash. Fall back to fingerprint matching.
+      await seedFile(
+          path: '/srcA/old.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp1',
+          // contentHash null on the missing row (legacy).
+          uid: 'u-old',
+          state: 'missing');
+      await seedFile(
+          path: '/srcB/new.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp1',
+          contentHash: 'ch-bytes',
+          uid: 'u-new');
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/old.mp3'), 'superseded');
     });
 
     test('markCrossSourceMoves is idempotent across repeated calls', () async {

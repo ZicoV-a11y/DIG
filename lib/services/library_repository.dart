@@ -584,6 +584,37 @@ class LibraryRepository {
 
   /// Idempotent — safe to call after every scan.
   ///
+  /// **Slice 5 upgrade — content_hash takes precedence.**
+  ///
+  /// The matching signal is chosen per missing row based on what
+  /// evidence we have:
+  ///
+  ///   • Missing row has a `content_hash`
+  ///       → require a UNIQUE same-content_hash available match.
+  ///       Fingerprint matches don't count even if they exist
+  ///       (content_hash is the more authoritative signal — same
+  ///       fingerprint can mean different bytes when basenames
+  ///       collide). This is also the path that catches a move
+  ///       across folders that involved a rename: same bytes,
+  ///       different basename → different fingerprint, same
+  ///       content_hash → supersede.
+  ///
+  ///   • Missing row has NULL content_hash (legacy / pre-v10 /
+  ///     scan-time hash failed)
+  ///       → fall back to a UNIQUE same-fingerprint available
+  ///       match. Same rule the slice-3 tactical version
+  ///       shipped with, just gated so it only runs on the
+  ///       rows still missing content_hash. The backfill worker
+  ///       upgrades these over time, after which subsequent
+  ///       calls take the strong path.
+  ///
+  /// Both paths share the rest of the rules from project memory:
+  ///   - missing row + matching row both must have filesize > 0
+  ///     AND duration_ms > 0 (junk fingerprint protection)
+  ///   - EXACTLY ONE matching available row (uniqueness — multiple
+  ///     same-content rows are coexisting duplicates, never a
+  ///     relocation event)
+  ///
   /// Returns the number of rows upgraded from missing → superseded.
   Future<int> markCrossSourceMoves() async {
     return await _db.rawUpdate('''
@@ -593,12 +624,33 @@ class LibraryRepository {
         AND filesize > 0
         AND duration_ms > 0
         AND (
-          SELECT COUNT(*) FROM indexed_files a
-          WHERE a.fingerprint = indexed_files.fingerprint
-            AND a.availability_state = 'available'
-            AND a.filesize > 0
-            AND a.duration_ms > 0
-        ) = 1
+          -- Strong path: match by content_hash when present.
+          (
+            content_hash IS NOT NULL
+            AND (
+              SELECT COUNT(*) FROM indexed_files a
+              WHERE a.content_hash = indexed_files.content_hash
+                AND a.availability_state = 'available'
+                AND a.filesize > 0
+                AND a.duration_ms > 0
+            ) = 1
+          )
+          OR
+          -- Fallback path: legacy rows still NULL on content_hash
+          -- fall back to the slice-3 fingerprint rule. Upgrades
+          -- to the strong path automatically as backfill fills
+          -- the column.
+          (
+            content_hash IS NULL
+            AND (
+              SELECT COUNT(*) FROM indexed_files a
+              WHERE a.fingerprint = indexed_files.fingerprint
+                AND a.availability_state = 'available'
+                AND a.filesize > 0
+                AND a.duration_ms > 0
+            ) = 1
+          )
+        )
     ''');
   }
 

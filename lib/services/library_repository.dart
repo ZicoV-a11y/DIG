@@ -3,6 +3,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import '../models/intelligence_record.dart';
 import '../models/source.dart';
 import '../models/track.dart';
+import 'content_hash.dart';
 import 'database.dart';
 import 'metadata_extractor.dart';
 import 'track_uid.dart';
@@ -312,13 +313,24 @@ class LibraryRepository {
     await _db.transaction((txn) async {
       final existing = await txn.query(
         'indexed_files',
-        columns: ['uid', 'intel_uid'],
+        columns: ['uid', 'intel_uid', 'filesize', 'modified_at', 'content_hash'],
         where: 'path = ?',
         whereArgs: [file.path],
         limit: 1,
       );
 
+      // content_hash policy (file-bytes identity, separate from
+      // fingerprint heuristic):
+      //   INSERT path → always compute fresh.
+      //   UPDATE path → reuse the existing hash IFF the stat
+      //     signature is unchanged AND the existing hash is non-null.
+      //     filesize OR mtime change (re-encode, retag, in-place
+      //     rewrite) → recompute. Null existing → backfill.
+      //   Hash failure (file gone, perm) leaves content_hash as
+      //     whatever was there before; never overwrite a real hash
+      //     with null just because a single read happened to fail.
       if (existing.isEmpty) {
+        final hash = computeContentHashSync(file.path);
         await txn.insert('indexed_files', {
           'path': file.path,
           'source_id': sourceId,
@@ -327,6 +339,7 @@ class LibraryRepository {
           'modified_at': file.modifiedAt,
           'duration_ms': durationMs,
           'fingerprint': ids.fingerprint,
+          'content_hash': hash,
           'uid': ids.uid,
           'intel_uid': null,
           'is_available': 1,
@@ -338,6 +351,9 @@ class LibraryRepository {
 
       final oldUid = existing.first['uid'] as String;
       final oldIntelUid = existing.first['intel_uid'] as String?;
+      final oldFilesize = (existing.first['filesize'] as int?) ?? 0;
+      final oldModifiedAt = (existing.first['modified_at'] as int?) ?? 0;
+      final oldContentHash = existing.first['content_hash'] as String?;
 
       // Re-tag at same path: fingerprint shifted. If this row owned
       // intelligence (intel_uid == old uid), migrate the tracks row
@@ -358,6 +374,21 @@ class LibraryRepository {
         );
       }
 
+      // Decide content_hash: keep stale value if stat looks
+      // unchanged AND we already had a real hash; otherwise compute.
+      final statUnchanged =
+          oldFilesize == file.filesize && oldModifiedAt == file.modifiedAt;
+      final String? newContentHash;
+      if (statUnchanged && oldContentHash != null) {
+        newContentHash = oldContentHash;
+      } else {
+        final computed = computeContentHashSync(file.path);
+        // Guardrail: a transient read failure must not erase a
+        // previously-good hash. Only overwrite with non-null OR if
+        // there was nothing there to begin with.
+        newContentHash = computed ?? oldContentHash;
+      }
+
       await txn.update(
         'indexed_files',
         {
@@ -367,6 +398,7 @@ class LibraryRepository {
           'modified_at': file.modifiedAt,
           'duration_ms': durationMs,
           'fingerprint': ids.fingerprint,
+          'content_hash': newContentHash,
           'uid': ids.uid,
           'is_available': 1,
           'last_seen_at': now,

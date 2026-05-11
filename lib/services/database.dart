@@ -16,7 +16,7 @@ class AppDatabase {
   // v7 adds `sources.parent_source_id` + `sources.path_prefix` so a
   // folder picked inside an already-watched source becomes a virtual
   // "sub-view" instead of a duplicate scanning source.
-  static const _schemaVersion = 9;
+  static const _schemaVersion = 10;
 
   late final Database _db;
 
@@ -118,6 +118,7 @@ class AppDatabase {
         modified_at INTEGER NOT NULL DEFAULT 0,
         duration_ms INTEGER NOT NULL DEFAULT 0,
         fingerprint TEXT NOT NULL,
+        content_hash TEXT,
         uid TEXT NOT NULL,
         intel_uid TEXT,
         identity_override TEXT,
@@ -136,6 +137,7 @@ class AppDatabase {
       )
     ''');
     batch.execute('CREATE INDEX idx_idx_fingerprint ON indexed_files(fingerprint)');
+    batch.execute('CREATE INDEX idx_idx_content_hash ON indexed_files(content_hash)');
     batch.execute('CREATE INDEX idx_idx_uid ON indexed_files(uid)');
     batch.execute('CREATE INDEX idx_idx_intel ON indexed_files(intel_uid)');
     batch.execute('CREATE INDEX idx_idx_source ON indexed_files(source_id)');
@@ -202,6 +204,51 @@ class AppDatabase {
     if (oldVersion < 9) {
       await _migrateV8toV9(db);
     }
+    if (oldVersion < 10) {
+      await _migrateV9toV10(db);
+    }
+  }
+
+  /// Add `indexed_files.content_hash` (nullable TEXT) + an index on
+  /// the column. content_hash is true physical-file identity — sha256
+  /// of the first 256KB plus the last 256KB of audio bytes. Survives
+  /// rename / Cmd+D / folder move; distinguishes re-encodes /
+  /// transcodes / different masters.
+  ///
+  /// Migration adds the column only; existing rows are left with
+  /// `content_hash = NULL`. They are filled in two ways post-migration:
+  ///   1. Any rescan touches them (filesize/mtime change → recompute,
+  ///      filesize/mtime unchanged + null → backfill on next upsert).
+  ///   2. A background backfill worker (Slice 3) trickles through
+  ///      every NULL row at idle time.
+  ///
+  /// content_hash is NOT yet consumed by any state-mutation path in
+  /// this slice; Slice 5 swaps cross-source supersession over from
+  /// fingerprint → content_hash once enough rows are populated for
+  /// the swap to be safe.
+  ///
+  /// Idempotent — safe to retry after a partial migration.
+  static Future<void> _migrateV9toV10(Database db) async {
+    debugPrint(
+      '[db] starting v9 → v10 migration (indexed_files.content_hash)',
+    );
+    final stopwatch = Stopwatch()..start();
+    final columns = await db.rawQuery('PRAGMA table_info(indexed_files)');
+    final hasContentHash =
+        columns.any((c) => c['name'] == 'content_hash');
+    if (!hasContentHash) {
+      await db.execute(
+        'ALTER TABLE indexed_files ADD COLUMN content_hash TEXT',
+      );
+    }
+    // Index creation is also idempotent via IF NOT EXISTS.
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_idx_content_hash '
+      'ON indexed_files(content_hash)',
+    );
+    debugPrint(
+      '[db] v9 → v10 done in ${stopwatch.elapsedMilliseconds}ms.',
+    );
   }
 
   /// Add `indexed_files.availability_state` (TEXT) — a finer-grained

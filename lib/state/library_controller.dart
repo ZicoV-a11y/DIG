@@ -2671,11 +2671,17 @@ class LibraryController extends ChangeNotifier {
           '[play] engine.setTrack failed for ${candidate.path}: $e — '
           'trying next variant',
         );
-        // Engine errors can be transient (codec hiccup) or terminal
-        // (file truly gone). Mark unavailable so the next pipeline
-        // run drops it; a real rescan will reaffirm if the file
-        // came back.
-        candidate.isAvailable = false;
+        // Engine errors can be transient — a Dropbox CloudStorage
+        // file being materialised, a codec stall, a momentary
+        // lock by another process, the engine still tearing down
+        // a prior track. Previously we flipped `isAvailable=false`
+        // here, which broke retries: after one transient failure
+        // the row would silently fail on every subsequent click
+        // until a rescan re-synced in-memory from DB. The terminal
+        // case ("file actually gone") is already caught by the
+        // `File.existsSync()` pre-flight above, so engine errors
+        // get treated as "try the next variant this attempt" and
+        // leave the in-memory flag alone.
       }
     }
     return null;

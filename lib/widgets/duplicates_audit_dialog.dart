@@ -105,6 +105,7 @@ class _DuplicatesAuditDialogState extends State<_DuplicatesAuditDialog> {
   Widget _buildSectionedList(List<AggregatedTrackView> buckets) {
     final byReason = <BucketMatchReason, List<AggregatedTrackView>>{
       BucketMatchReason.fingerprintWithTagDrift: [],
+      BucketMatchReason.crossFormat: [],
       BucketMatchReason.manualLink: [],
       BucketMatchReason.exactMatch: [],
     };
@@ -146,7 +147,7 @@ class _DuplicatesAuditDialogState extends State<_DuplicatesAuditDialog> {
         ));
       }
     }
-    // Order: questionable → user-vetted → trust-the-system.
+    // Order: questionable → worth-a-glance → user-vetted → trust.
     addSection(
       BucketMatchReason.fingerprintWithTagDrift,
       const _SectionMeta(
@@ -155,6 +156,16 @@ class _DuplicatesAuditDialogState extends State<_DuplicatesAuditDialog> {
             'Same audio fingerprint, but title / artist / duration '
             'drifted — confirm these are really the same song.',
         accent: AppColors.favorite,
+      ),
+    );
+    addSection(
+      BucketMatchReason.crossFormat,
+      const _SectionMeta(
+        label: 'CROSS-FORMAT',
+        sublabel:
+            'Same metadata, different file formats (MP3 + AIFF etc.). '
+            'Almost always intentional alternates — browse to confirm.',
+        accent: AppColors.reviewed,
       ),
     );
     addSection(
@@ -171,8 +182,8 @@ class _DuplicatesAuditDialogState extends State<_DuplicatesAuditDialog> {
       const _SectionMeta(
         label: 'EXACT MATCHES',
         sublabel:
-            'Every field agrees. The auto-matcher is confident; '
-            'review only if something looks off.',
+            'Every field agrees, same format. Confident auto-match — '
+            'usually macOS Cmd+D copies or literal file duplicates.',
         accent: AppColors.textTertiary,
       ),
     );

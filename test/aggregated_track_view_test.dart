@@ -291,7 +291,18 @@ void main() {
       expect(v.matchReason, BucketMatchReason.exactMatch);
     });
 
-    test('all fields agree across formats → exactMatch', () {
+    test('all fields agree, same format → exactMatch', () {
+      // macOS Cmd+D copies — both MP3 in same folder.
+      final v = AggregatedTrackView([
+        _t(filename: 'song.mp3', title: 'T', artist: 'A'),
+        _t(filename: 'song copy.mp3', title: 'T', artist: 'A'),
+      ]);
+      expect(v.matchReason, BucketMatchReason.exactMatch);
+    });
+
+    test('all fields agree but multiple formats → crossFormat', () {
+      // MP3 + AIFF of the same song — intentional alternates the
+      // user is encouraged to verify.
       final v = AggregatedTrackView([
         _t(
           filename: 'song.mp3',
@@ -305,6 +316,27 @@ void main() {
           artist: 'A',
           duration: const Duration(seconds: 300),
         ),
+      ]);
+      expect(v.matchReason, BucketMatchReason.crossFormat);
+    });
+
+    test('three formats with matching tags → crossFormat', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'song.mp3', title: 'T', artist: 'A'),
+        _t(filename: 'song.aiff', title: 'T', artist: 'A'),
+        _t(filename: 'song.wav', title: 'T', artist: 'A'),
+      ]);
+      expect(v.matchReason, BucketMatchReason.crossFormat);
+    });
+
+    test('extensionless variant doesn\'t falsely trigger crossFormat',
+        () {
+      // A `noext` file has an empty format label; pair it with an
+      // MP3 having matching tags. Empty formats are ignored when
+      // counting distinct formats, so this stays exactMatch.
+      final v = AggregatedTrackView([
+        _t(filename: 'song.mp3', title: 'T', artist: 'A'),
+        _t(filename: 'song', title: 'T', artist: 'A'),
       ]);
       expect(v.matchReason, BucketMatchReason.exactMatch);
     });
@@ -370,10 +402,11 @@ void main() {
       expect(v.matchReason, BucketMatchReason.manualLink);
     });
 
-    test('override present but bucket still all-fields-agree → exactMatch',
+    test('override on cross-format pair → crossFormat (override redundant)',
         () {
-      // User manually linked two tracks that the auto-matcher would
-      // have paired anyway. Classify by the simpler explanation.
+      // User manually linked an MP3 + AIFF pair the auto-matcher
+      // would have paired anyway via the 4-field rule. Cross-format
+      // classification still applies.
       final v = AggregatedTrackView([
         _t(
           filename: 'song.mp3',
@@ -388,7 +421,7 @@ void main() {
           identityOverride: 'redundant',
         ),
       ]);
-      expect(v.matchReason, BucketMatchReason.exactMatch);
+      expect(v.matchReason, BucketMatchReason.crossFormat);
     });
 
     test('only one variant has override → not enough to manualLink', () {

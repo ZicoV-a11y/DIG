@@ -9,10 +9,17 @@ import 'song_identity.dart' show basenameForIdentity;
 enum BucketMatchReason {
   /// Every variant agrees on every matching field (basename minus
   /// extension and minus macOS Cmd+D " copy" suffix, title, artist,
-  /// duration in seconds). The auto-matcher's strict 4-field rule
-  /// applies cleanly. Highest confidence — system trusted, user can
-  /// generally ignore.
+  /// duration in seconds) AND every variant shares the same file
+  /// format. Truly same-file class: literal duplicates, macOS
+  /// Cmd+D copies. Highest confidence — system trusted.
   exactMatch,
+
+  /// Every variant agrees on the metadata fields but the bucket
+  /// spans multiple file formats (e.g., MP3 + AIFF, MP3 + WAV).
+  /// Almost certainly intentional alternates of the same song, but
+  /// worth browsing because different containers could legitimately
+  /// hold different masters with matching tags.
+  crossFormat,
 
   /// Two or more variants share a non-empty `identityOverride` set
   /// by the right-click "Link with another song" action. User-vetted
@@ -74,15 +81,31 @@ class AggregatedTrackView {
   /// override had to step in.
   ///
   /// Priority (least to most questionable):
-  ///   1. `exactMatch` — every variant agrees on every field.
-  ///   2. `manualLink` — at least two variants share a non-empty
-  ///      override (and the bucket isn't an exact match without it).
-  ///   3. `fingerprintWithTagDrift` — otherwise. Variants paired
+  ///   1. `exactMatch` — every variant agrees on every field AND
+  ///      shares the same file format.
+  ///   2. `crossFormat` — every variant agrees on every field but
+  ///      the bucket spans multiple file formats.
+  ///   3. `manualLink` — at least two variants share a non-empty
+  ///      override (and the bucket isn't a metadata match without it).
+  ///   4. `fingerprintWithTagDrift` — otherwise. Variants paired
   ///      because of fingerprint equivalence despite drifted tags.
   BucketMatchReason get matchReason {
     if (variants.length < 2) return BucketMatchReason.exactMatch;
-    if (_allFieldsAgree) return BucketMatchReason.exactMatch;
-    // Not exact. Check for a shared manual override on ≥2 variants.
+    if (_allFieldsAgree) {
+      // Metadata agrees. Single format → confident; multi-format →
+      // worth a glance to confirm both encodes are the same source.
+      final formats = <String>{
+        for (final t in variants) fileFormatLabel(t.filename),
+      };
+      // Treat empty / unrecognised formats as a single bucket among
+      // themselves so a single weird file doesn't bump the whole
+      // bucket into crossFormat. The "do we span formats?" decision
+      // only fires when there are 2+ known formats.
+      formats.removeWhere((f) => f.isEmpty);
+      if (formats.length <= 1) return BucketMatchReason.exactMatch;
+      return BucketMatchReason.crossFormat;
+    }
+    // Not a metadata match. Check for a shared manual override.
     final overrideCounts = <String, int>{};
     for (final t in variants) {
       final ov = t.identityOverride;

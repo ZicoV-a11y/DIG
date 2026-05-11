@@ -1502,11 +1502,27 @@ class LibraryController extends ChangeNotifier {
   /// Re-scan an existing source. Existing rows for this source whose
   /// files are still present are preserved (intelligence intact); rows
   /// not seen this scan are flagged unavailable, never deleted.
+  ///
+  /// Concurrent requests for the same source dedupe: a second caller
+  /// while a scan is in flight gets the same Future as the first.
+  /// Without this guard, the FS watcher + focus-rescan + manual
+  /// REFRESH could all kick off overlapping scans of the same source
+  /// at the same time and race on a shared SQLite transaction —
+  /// `txnSynchronized` would then throw mid-batch and the whole
+  /// rescan would abort before `markUnseenAvailability` ever ran.
   Future<void> rescanSource(String sourceId) async {
+    final inFlight = _scansInFlight[sourceId];
+    if (inFlight != null) return inFlight;
     final idx = _sources.indexWhere((s) => s.id == sourceId);
     if (idx < 0) return;
-    await _scanIntoSource(_sources[idx]);
+    final future = _scanIntoSource(_sources[idx])
+        .whenComplete(() => _scansInFlight.remove(sourceId));
+    _scansInFlight[sourceId] = future;
+    return future;
   }
+
+  // Per-source scan dedup map. See `rescanSource`.
+  final Map<String, Future<void>> _scansInFlight = {};
 
   Future<void> _scanIntoSource(Source source) async {
     _isScanning = true;
@@ -1556,15 +1572,27 @@ class LibraryController extends ChangeNotifier {
         ));
       }
 
+      // Upsert can throw (UNIQUE constraint, SQLite lock, schema
+      // mismatch); we want the rescan to keep going so deleted files
+      // still get marked unavailable downstream. Otherwise an upsert
+      // failure mid-scan leaves the in-memory state stale forever.
       final upsertStart = Stopwatch()..start();
-      final inserted = await repo.upsertIndexedFilesBatch(
-        sourceId: source.id,
-        files: batch,
-      );
-      debugPrint(
-        '[scan] upsert batch: ${batch.length} files '
-        '($inserted new) in ${upsertStart.elapsedMilliseconds}ms',
-      );
+      try {
+        final inserted = await repo.upsertIndexedFilesBatch(
+          sourceId: source.id,
+          files: batch,
+        );
+        debugPrint(
+          '[scan] upsert batch: ${batch.length} files '
+          '($inserted new) in ${upsertStart.elapsedMilliseconds}ms',
+        );
+      } catch (e, st) {
+        debugPrint(
+          '[scan] upsert FAILED for ${source.displayName} '
+          '(continuing with availability sweep): $e',
+        );
+        debugPrint('$st');
+      }
 
       await repo.markUnseenAvailability(
         source.id,

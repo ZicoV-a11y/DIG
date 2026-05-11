@@ -36,8 +36,19 @@ class LibraryStatusBar extends StatelessWidget {
                 _OperationCluster(state: op),
               ] else
                 const _IdleIndicator(),
-              const Spacer(),
-              _LibraryTally(controller: controller),
+              const SizedBox(width: 16),
+              // Tally takes whatever's left and scrolls horizontally
+              // if it can't all fit (large libraries → long file
+              // counts). `reverse: true` anchors the scroll to the
+              // right edge so the latest chunks are always visible.
+              Flexible(
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  reverse: true,
+                  physics: const BouncingScrollPhysics(),
+                  child: _LibraryTally(controller: controller),
+                ),
+              ),
             ],
           ),
         );
@@ -146,13 +157,18 @@ class _OperationCluster extends StatelessWidget {
                   ),
           ),
           const SizedBox(width: 10),
-          Text(
-            state.label,
-            style: const TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 0.6,
-              color: AppColors.textPrimary,
+          Flexible(
+            child: Text(
+              state.label,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+              softWrap: false,
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.6,
+                color: AppColors.textPrimary,
+              ),
             ),
           ),
           if (state.subject != null && state.subject!.isNotEmpty) ...[

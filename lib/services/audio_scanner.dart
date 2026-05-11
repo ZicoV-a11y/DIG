@@ -107,10 +107,18 @@ List<ScannedEntry> _scanInIsolate(_ScanRequest req) {
 
       // Stat each file here, in the isolate. Per-file stat on
       // Dropbox paths can be slow; running it on the main isolate
-      // would freeze the UI for 9k+ files. Stat failures are
-      // tolerated — we still emit the entry with size=0/mtime=0
-      // so the path becomes part of the index (with degenerate
-      // hash inputs).
+      // would freeze the UI for 9k+ files.
+      //
+      // Stat failures (Dropbox/iCloud sync races, the file being
+      // moved or deleted between the listSync and statSync, perm
+      // hiccups) used to emit the entry with size=0 / mtime=0,
+      // which then got persisted as an indexed_files row with a
+      // junk fingerprint computed from degenerate inputs. Those
+      // ghost rows then stuck around forever as "missing" with
+      // unmatchable fingerprints. Treat a stat failure as a
+      // transient I/O error: skip the entry entirely, let the
+      // next scan retry. Better to be temporarily blind to a file
+      // than to persist corrupted identity for it.
       int size = 0;
       int mtimeMs = 0;
       try {
@@ -120,6 +128,7 @@ List<ScannedEntry> _scanInIsolate(_ScanRequest req) {
       } catch (_) {
         // best-effort
       }
+      if (size <= 0 || mtimeMs == 0) continue;
       out.add(ScannedEntry(
         path: p,
         filename: name,

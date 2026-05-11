@@ -1766,6 +1766,23 @@ class LibraryController extends ChangeNotifier {
         );
       }
 
+      // Cross-source relocation pass. Handles the intake → prep
+      // → crate workflow: a file moved from one watched source
+      // into another should auto-resolve instead of lingering as
+      // missing. Strict uniqueness rule (see repo doc) — only
+      // fires when exactly one valid same-fingerprint available
+      // candidate exists across all sources. Idempotent; we run
+      // it on every scan so any source-scan order produces the
+      // same final state.
+      final crossSourceCount = await repo.markCrossSourceMoves();
+      if (crossSourceCount > 0) {
+        debugPrint(
+          '[scan] cross-source relocation: $crossSourceCount '
+          'missing row(s) auto-resolved against a unique '
+          'available copy in another watched source',
+        );
+      }
+
       // Re-link any new indexed_files row to its existing tracks
       // row by fingerprint. This is what makes "remove → re-add"
       // preserve favorites / play counts visibly: without this,

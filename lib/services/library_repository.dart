@@ -286,6 +286,21 @@ class LibraryRepository {
     required ScannedFile file,
     required int durationMs,
   }) async {
+    // Belt-and-suspenders alongside the scanner's stat-failure
+    // skip: refuse to persist a row whose stat inputs are
+    // degenerate. A row with filesize <= 0 or mtime <= 0 would
+    // get a junk fingerprint (the hash inputs are basename +
+    // filesize + duration) and would never be matchable to a
+    // real available copy of the same file. Treat it as a no-op
+    // and let the next scan try again with valid inputs.
+    if (file.filesize <= 0 || file.modifiedAt <= 0) {
+      return computeTrackUid(
+        basename: file.filename,
+        filesize: file.filesize,
+        durationMs: durationMs,
+        mtimeMs: file.modifiedAt,
+      );
+    }
     final ids = computeTrackUid(
       basename: file.filename,
       filesize: file.filesize,
@@ -454,6 +469,49 @@ class LibraryRepository {
       "  )",
       [sourceId, sourceId],
     );
+  }
+
+  /// Cross-source relocation detection. Auto-resolves the
+  /// intake → prep → crate workflow case: a file the user moved
+  /// from one watched source to another should not linger as
+  /// "missing" forever just because per-source supersession
+  /// can't see across sources.
+  ///
+  /// Rule (uniqueness only — the strict 4-condition rule lives
+  /// in project memory, the temporal/overlap pieces ship in a
+  /// later phase once `first_seen_at` and `content_hash` are
+  /// available):
+  ///
+  ///   For each `missing` row whose stat inputs are valid
+  ///   (filesize > 0 AND duration_ms > 0), if EXACTLY ONE row
+  ///   in any source carries the same fingerprint, is currently
+  ///   `available`, and also has valid stat inputs → mark the
+  ///   missing row as `superseded`.
+  ///
+  /// Multiple candidates → ambiguous, do not auto-link. Zero
+  /// candidates → genuinely missing, leave it. Junk fingerprints
+  /// (filesize <= 0 / duration_ms <= 0) on either side are
+  /// excluded so the scanner's transient I/O glitches never
+  /// trigger cascading false supersessions.
+  ///
+  /// Idempotent — safe to call after every scan.
+  ///
+  /// Returns the number of rows upgraded from missing → superseded.
+  Future<int> markCrossSourceMoves() async {
+    return await _db.rawUpdate('''
+      UPDATE indexed_files
+      SET availability_state = 'superseded'
+      WHERE availability_state = 'missing'
+        AND filesize > 0
+        AND duration_ms > 0
+        AND (
+          SELECT COUNT(*) FROM indexed_files a
+          WHERE a.fingerprint = indexed_files.fingerprint
+            AND a.availability_state = 'available'
+            AND a.filesize > 0
+            AND a.duration_ms > 0
+        ) = 1
+    ''');
   }
 
   /// Number of indexed files (any availability) under [sourceId].

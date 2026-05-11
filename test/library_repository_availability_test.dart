@@ -54,14 +54,21 @@ void main() {
     required String uid,
     String? intelUid,
     String state = 'available',
+    int filesize = 1024,
+    int durationMs = 300000,
   }) async {
+    // Default to non-degenerate stat inputs so tests against
+    // markCrossSourceMoves (which guards against filesize <= 0 /
+    // duration_ms <= 0) can match by default. Tests that
+    // specifically want to probe the junk-fingerprint guard
+    // override filesize/durationMs to 0.
     await raw.insert('indexed_files', {
       'path': path,
       'source_id': sourceId,
       'filename': path.split('/').last,
-      'filesize': 0,
+      'filesize': filesize,
       'modified_at': 0,
-      'duration_ms': 300000,
+      'duration_ms': durationMs,
       'fingerprint': fingerprint,
       'uid': uid,
       'intel_uid': intelUid,
@@ -90,11 +97,16 @@ void main() {
 
   /// One full scan pass on a source — mirrors the order in
   /// `LibraryController._scanIntoSource`:
-  ///   1. markUnseenAvailability  (paths not in seenPaths → missing)
-  ///   2. markMovedSupersessions  (missing + same-fp-as-available → superseded)
+  ///   1. markUnseenAvailability   (paths not in seenPaths → missing)
+  ///   2. markMovedSupersessions   (missing + same-fp-as-available
+  ///                                 in same source → superseded)
+  ///   3. markCrossSourceMoves     (missing + EXACTLY ONE same-fp
+  ///                                 available across ALL sources →
+  ///                                 superseded; junk-fp rows excluded)
   Future<void> simulateScan(String sourceId, Set<String> seenPaths) async {
     await repo.markUnseenAvailability(sourceId, seenPaths);
     await repo.markMovedSupersessions(sourceId);
+    await repo.markCrossSourceMoves();
   }
 
   // ───────────────────────────────────────────────────────────────────
@@ -287,22 +299,17 @@ void main() {
     });
 
     test(
-        'RED: cross-source move (file relocated srcA → srcB, same fp) — old row stays MISSING, never superseded',
+        'cross-source move (file relocated srcA → srcB, same fp) → old row SUPERSEDED via uniqueness rule',
         () async {
-      // DESIGN QUESTION: This test is GREEN against current
-      // behavior. It's tagged RED because the *user-facing
-      // semantics* are ambiguous: a file that physically moved
-      // between watched sources looks identical to a file that
-      // was truly deleted. Possible resolutions:
-      //   (a) Accept current behavior — sources are isolation
-      //       boundaries by design.
-      //   (b) Extend markMovedSupersessions to scan across all
-      //       sources (cross-source same-fp match).
-      //   (c) Introduce a 'relocated' state that distinguishes
-      //       cross-source moves from same-source moves.
-      // Until decided, the row sits in 'missing' and surfaces in
-      // the Review-missing dialog — manageable, but loses move
-      // lineage. Pin this test so the decision is conscious.
+      // Resolution of the earlier RED test. Once
+      // markCrossSourceMoves shipped (uniqueness rule only,
+      // strict on valid stat inputs), a file moved between
+      // watched sources stops lingering as missing and gets
+      // auto-resolved as the intake → prep → crate workflow
+      // expects. The 4-condition rule (also temporal + small
+      // overlap window) lives in project memory and ships in
+      // a later phase once `first_seen_at` and `content_hash`
+      // are in place.
       await seedFile(
           path: '/srcA/x.mp3',
           sourceId: 'srcA',
@@ -315,8 +322,112 @@ void main() {
           uid: 'u-new');
       await simulateScan('srcA', {});
       await simulateScan('srcB', {'/srcB/x.mp3'});
-      expect(await stateOf('/srcA/x.mp3'), 'missing');
+      expect(await stateOf('/srcA/x.mp3'), 'superseded');
       expect(await stateOf('/srcB/x.mp3'), 'available');
+    });
+
+    test(
+        'uniqueness rule: cross-source supersession blocked when 2+ available rows match',
+        () async {
+      // Critical safety valve. If the same fingerprint exists on
+      // more than one available row globally, the relocation is
+      // ambiguous — could be any of N candidates, or could be a
+      // legitimate Cmd+D coexistence. Leave it missing; user can
+      // manually relink via the Review dialog.
+      //
+      // Seed the missing row directly so the per-source
+      // markMovedSupersessions pass (which has no uniqueness
+      // guard yet) doesn't interfere with the test.
+      await seedFile(
+          path: '/srcA/missing.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp1',
+          uid: 'u-old',
+          state: 'missing');
+      await seedFile(
+          path: '/srcB/copy1.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp1',
+          uid: 'u-c1');
+      await seedFile(
+          path: '/srcB/copy2.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp1',
+          uid: 'u-c2');
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/missing.mp3'), 'missing');
+    });
+
+    test(
+        'junk fingerprint (filesize=0) on the missing row blocks supersession',
+        () async {
+      // The Surfeando-ghost scenario from the V2 DB: a row born
+      // from a Dropbox-sync mid-scan glitch with filesize=-1 /
+      // duration_ms=0 → junk fingerprint. Even if a same-fp
+      // available row existed somewhere, the missing side must
+      // not auto-supersede — its fingerprint is corrupted scan
+      // state, not real identity evidence.
+      await seedFile(
+          path: '/srcA/ghost.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-junk',
+          uid: 'u-ghost',
+          state: 'missing',
+          filesize: 0,
+          durationMs: 0);
+      await seedFile(
+          path: '/srcB/real.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp-junk',
+          uid: 'u-real');
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/ghost.mp3'), 'missing');
+    });
+
+    test(
+        'junk fingerprint on the available row blocks supersession',
+        () async {
+      // Symmetric guard — if the candidate "available" row was
+      // born from a stat-failure, it doesn't count as evidence
+      // for the missing row's relocation either.
+      await seedFile(
+          path: '/srcA/lost.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-junk',
+          uid: 'u-lost',
+          state: 'missing');
+      await seedFile(
+          path: '/srcB/garbage.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp-junk',
+          uid: 'u-garbage',
+          filesize: 0,
+          durationMs: 0);
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/lost.mp3'), 'missing');
+    });
+
+    test('markCrossSourceMoves is idempotent across repeated calls', () async {
+      await seedFile(
+          path: '/srcA/x.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp1',
+          uid: 'u-old');
+      await seedFile(
+          path: '/srcB/x.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp1',
+          uid: 'u-new');
+      await simulateScan('srcA', {});
+      // First call resolves it.
+      expect(await stateOf('/srcA/x.mp3'), 'superseded');
+      // Subsequent calls are no-ops; state stays superseded
+      // (does NOT churn back to missing).
+      for (var i = 0; i < 3; i++) {
+        final n = await repo.markCrossSourceMoves();
+        expect(n, 0);
+        expect(await stateOf('/srcA/x.mp3'), 'superseded');
+      }
     });
   });
 

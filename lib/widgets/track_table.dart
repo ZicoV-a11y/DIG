@@ -888,19 +888,25 @@ class _TrackRow extends StatelessWidget {
     if (variants.isEmpty) {
       items.add(_revealMenuItem(value: 'reveal', label: 'Show in Finder'));
     } else {
-      // Multi-variant rows: every reveal item gets a parent-folder
+      // Multi-variant rows: every reveal item gets a per-file
       // disambiguator so two `Show MP3 in Finder` items don't read
-      // identically (the common case after Cmd+D, where the
-      // original and the " copy" live in different folders).
+      // identically. Default disambiguator is the parent folder
+      // name (covers the typical cross-folder duplicate). When two
+      // variants of the SAME format share a parent folder (two MP3
+      // copies in one directory, original + Cmd+D " copy" side by
+      // side), fall back to the filename — guaranteed unique
+      // within a single directory.
+      final disambiguators =
+          _buildRevealDisambiguators(variants);
       for (var i = 0; i < variants.length; i++) {
         final v = variants[i];
         final format = fileFormatLabel(v.filename);
         final formatLabel =
             format.isEmpty ? 'variant ${i + 1}' : format;
-        final parent = _parentDirName(v.path);
-        final label = parent.isEmpty
+        final disamb = disambiguators[i];
+        final label = disamb == null
             ? 'Show $formatLabel in Finder'
-            : 'Show $formatLabel in Finder — $parent/';
+            : 'Show $formatLabel in Finder — $disamb';
         items.add(_revealMenuItem(value: 'reveal:$i', label: label));
       }
     }
@@ -1010,10 +1016,54 @@ class _TrackRow extends StatelessWidget {
     );
   }
 
-  /// Return the immediate parent folder of [path], used to
-  /// disambiguate multi-variant `Show <FORMAT> in Finder` menu
-  /// items. Returns `''` when the path has no parent component
-  /// (e.g. a bare filename with no separators).
+  /// Per-variant disambiguator strings for the right-click reveal
+  /// submenu. Each non-null entry is appended to its variant's menu
+  /// label so two `Show MP3 in Finder` items can't read identically.
+  ///
+  /// Rule, applied independently per format group:
+  ///   - default: parent folder name (covers the typical
+  ///     cross-folder duplicate, e.g. original in `House - MP3/`
+  ///     and copy in `Z CRATE/`).
+  ///   - if two variants of the same format share a parent folder,
+  ///     fall back to filename for all of that format's variants —
+  ///     filenames are guaranteed unique within a directory, so the
+  ///     menu items always end up distinct. Mixing parent-dir and
+  ///     filename within one format group would be jarring, so the
+  ///     fallback applies group-wide.
+  ///
+  /// Returns `null` for a variant when even the filename + parent
+  /// path produces no useful disambiguator (degenerate case).
+  Map<int, String?> _buildRevealDisambiguators(List<Track> variants) {
+    final formatGroups = <String, List<int>>{};
+    for (var i = 0; i < variants.length; i++) {
+      final fmt = fileFormatLabel(variants[i].filename);
+      formatGroups.putIfAbsent(fmt, () => []).add(i);
+    }
+
+    final out = <int, String?>{};
+    for (final indices in formatGroups.values) {
+      final parents = [
+        for (final i in indices) _parentDirName(variants[i].path),
+      ];
+      final hasParentCollision =
+          parents.toSet().length < parents.length;
+      for (var j = 0; j < indices.length; j++) {
+        final i = indices[j];
+        if (hasParentCollision) {
+          // Filenames are unique within a folder; use them.
+          out[i] = variants[i].filename;
+        } else {
+          final p = parents[j];
+          out[i] = p.isEmpty ? null : '$p/';
+        }
+      }
+    }
+    return out;
+  }
+
+  /// Return the immediate parent folder of [path]. Returns `''`
+  /// when the path has no parent component (bare filename or
+  /// a root-level entry).
   ///
   /// `/Users/me/Music/House - MP3/song.mp3` → `House - MP3`
   String _parentDirName(String path) {

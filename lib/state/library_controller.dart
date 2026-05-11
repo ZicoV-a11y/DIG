@@ -2260,6 +2260,63 @@ class LibraryController extends ChangeNotifier {
     }
   }
 
+  /// Try to play [origin]'s bucket, falling back through sibling
+  /// variants when the chosen file is missing or the engine rejects
+  /// it. Returns the Track whose file was actually loaded into the
+  /// engine, or `null` if every variant failed.
+  ///
+  /// Order: requested track first (the user's explicit preference,
+  /// e.g. clicking the AIFF row plays the AIFF), then the rest of
+  /// the bucket in playback-preference order. Each candidate that
+  /// fails has its in-memory `isAvailable` flipped to false so the
+  /// table redraws without it on the next pipeline run; persistence
+  /// will catch up on the next rescan.
+  Future<Track?> _tryPlayBucket(Track origin) async {
+    final bucket = variantsFor(origin);
+    final ordered = orderBucketByPlaybackPreference(bucket);
+    // Move origin to the front if it's in the bucket (user explicit
+    // preference wins over the playback-preference default).
+    final candidates = <Track>[origin];
+    for (final v in ordered) {
+      if (v.uid != origin.uid) candidates.add(v);
+    }
+    for (final candidate in candidates) {
+      if (!candidate.isAvailable) {
+        debugPrint(
+          '[play] skipping unavailable variant: ${candidate.path}',
+        );
+        continue;
+      }
+      // Defensive pre-flight: if the file was marked available but
+      // is actually gone from disk (rescan hasn't fired yet), avoid
+      // the slower engine.setTrack failure and flip the in-memory
+      // flag immediately so the row drops from the table.
+      if (!File(candidate.path).existsSync()) {
+        debugPrint(
+          '[play] file missing on disk, marking unavailable: '
+          '${candidate.path}',
+        );
+        candidate.isAvailable = false;
+        continue;
+      }
+      try {
+        await engine.setTrack(candidate.path);
+        return candidate;
+      } catch (e) {
+        debugPrint(
+          '[play] engine.setTrack failed for ${candidate.path}: $e — '
+          'trying next variant',
+        );
+        // Engine errors can be transient (codec hiccup) or terminal
+        // (file truly gone). Mark unavailable so the next pipeline
+        // run drops it; a real rescan will reaffirm if the file
+        // came back.
+        candidate.isAvailable = false;
+      }
+    }
+    return null;
+  }
+
   Future<void> play(String uid, {bool reveal = false}) async {
     // Per-step millisecond timing of the play path. Each `tick` call
     // logs the cumulative + delta against the last tick. Goal: the
@@ -2281,10 +2338,6 @@ class LibraryController extends ChangeNotifier {
       debugPrint('[play] unknown uid: $uid');
       return;
     }
-    if (!track.isAvailable) {
-      debugPrint('[play] file unavailable: ${track.path}');
-      return;
-    }
     final isNewTrack = _currentTrackUid != uid;
     if (isNewTrack) {
       await _flushCurrentTrack();
@@ -2304,24 +2357,31 @@ class LibraryController extends ChangeNotifier {
       _markLibraryDirty();
       notifyListeners();
       tick('notifyListeners (loading state)');
-      try {
-        await engine.setTrack(track.path);
-      } catch (e) {
-        debugPrint('[play] engine.setTrack failed: $e');
+      // Resolve the actual file to play. The bucket-level fallback
+      // tries the requested track first; if its file is missing or
+      // the engine refuses it (codec error, corrupt header, etc),
+      // walks siblings in playback-preference order until one
+      // works. This is how the user expects a song to keep playing
+      // even after one of its variants gets deleted in Finder.
+      final played = await _tryPlayBucket(track);
+      if (played == null) {
+        debugPrint(
+          '[play] all variants in bucket failed for ${track.path}',
+        );
         _currentTrackUid = null;
         _currentTrackPath = null;
         _isLoadingTrack = false;
         notifyListeners();
         return;
       }
-      tick('engine.setTrack returned');
+      tick('engine.setTrack returned (path=${played.path})');
       _isLoadingTrack = false;
-      _currentTrackPath = track.path;
-      enrichOnDemand(track.path);
+      _currentTrackPath = played.path;
+      enrichOnDemand(played.path);
       tick('enrichOnDemand queued');
 
       final now = DateTime.now();
-      await _writeBucketIntelligence(track, (canonical) async {
+      await _writeBucketIntelligence(played, (canonical) async {
         await repo.updateIntelligence(
           intelUid: canonical,
           lastPlayedAt: now.millisecondsSinceEpoch,

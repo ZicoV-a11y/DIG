@@ -930,6 +930,11 @@ class _TrackRow extends StatelessWidget {
         borderRadius: BorderRadius.zero,
         side: const BorderSide(color: AppColors.border),
       ),
+      // Cap the menu width so long filename disambiguators truncate
+      // with ellipsis inside the item instead of expanding the menu
+      // to absurd widths. The tooltip on each item still surfaces
+      // the full label on hover.
+      constraints: const BoxConstraints(maxWidth: 480),
       items: items,
     );
 
@@ -1089,10 +1094,16 @@ class _TrackRow extends StatelessWidget {
             color: AppColors.textSecondary,
           ),
           const SizedBox(width: 8),
-          Text(
-            'Unlink $variantCount variants…',
-            style:
-                const TextStyle(color: AppColors.textPrimary, fontSize: 12),
+          Flexible(
+            child: Text(
+              'Unlink $variantCount variants…',
+              style: const TextStyle(
+                color: AppColors.textPrimary,
+                fontSize: 12,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
           ),
         ],
       ),
@@ -1111,9 +1122,13 @@ class _TrackRow extends StatelessWidget {
             color: AppColors.textSecondary,
           ),
           SizedBox(width: 8),
-          Text(
-            'Link with another song…',
-            style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
+          Flexible(
+            child: Text(
+              'Link with another song…',
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
           ),
         ],
       ),
@@ -1127,20 +1142,30 @@ class _TrackRow extends StatelessWidget {
     return PopupMenuItem<String>(
       value: value,
       height: 32,
-      child: Row(
-        children: [
-          const Icon(
-            Icons.folder_open_rounded,
-            size: 14,
-            color: AppColors.textSecondary,
-          ),
-          const SizedBox(width: 8),
-          Text(
-            label,
-            style:
-                const TextStyle(color: AppColors.textPrimary, fontSize: 12),
-          ),
-        ],
+      child: Tooltip(
+        message: label,
+        waitDuration: const Duration(milliseconds: 600),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.folder_open_rounded,
+              size: 14,
+              color: AppColors.textSecondary,
+            ),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                label,
+                style: const TextStyle(
+                  color: AppColors.textPrimary,
+                  fontSize: 12,
+                ),
+                overflow: TextOverflow.ellipsis,
+                maxLines: 1,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

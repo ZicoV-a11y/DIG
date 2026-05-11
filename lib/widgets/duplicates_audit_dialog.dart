@@ -35,6 +35,13 @@ class _DuplicatesAuditDialog extends StatefulWidget {
 class _DuplicatesAuditDialogState extends State<_DuplicatesAuditDialog> {
   final Set<String> _expanded = <String>{};
 
+  // Sections collapse independently. EXACT MATCHES starts collapsed
+  // because it's the big noisy pile the user generally doesn't need
+  // to read through; the actionable sections start open.
+  final Set<BucketMatchReason> _collapsedSections = {
+    BucketMatchReason.exactMatch,
+  };
+
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
@@ -108,7 +115,20 @@ class _DuplicatesAuditDialogState extends State<_DuplicatesAuditDialog> {
     void addSection(BucketMatchReason reason, _SectionMeta meta) {
       final list = byReason[reason]!;
       if (list.isEmpty) return;
-      entries.add(_SectionHeader(meta: meta, count: list.length));
+      final isCollapsed = _collapsedSections.contains(reason);
+      entries.add(_SectionHeader(
+        meta: meta,
+        count: list.length,
+        collapsed: isCollapsed,
+        onToggle: () {
+          setState(() {
+            if (!_collapsedSections.remove(reason)) {
+              _collapsedSections.add(reason);
+            }
+          });
+        },
+      ));
+      if (isCollapsed) return; // skip rows when section is collapsed
       for (final view in list) {
         final key = view.primary.uid;
         entries.add(_BucketRow(
@@ -298,63 +318,81 @@ class _SectionMeta {
 class _SectionHeader extends StatelessWidget {
   final _SectionMeta meta;
   final int count;
-  const _SectionHeader({required this.meta, required this.count});
+  final bool collapsed;
+  final VoidCallback onToggle;
+  const _SectionHeader({
+    required this.meta,
+    required this.count,
+    required this.collapsed,
+    required this.onToggle,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return Material(
       color: AppColors.surfaceAlt,
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          Container(
-            width: 3,
-            height: 24,
-            color: meta.accent,
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
+      child: InkWell(
+        onTap: onToggle,
+        hoverColor: AppColors.hoverRow,
+        focusColor: AppColors.focusOverlay,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Container(width: 3, height: 24, color: meta.accent),
+              const SizedBox(width: 10),
+              Icon(
+                collapsed
+                    ? Icons.keyboard_arrow_right_rounded
+                    : Icons.keyboard_arrow_down_rounded,
+                size: 18,
+                color: meta.accent,
+              ),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    Text(
-                      meta.label,
-                      style: TextStyle(
-                        color: meta.accent,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: 1.4,
-                      ),
+                    Row(
+                      children: [
+                        Text(
+                          meta.label,
+                          style: TextStyle(
+                            color: meta.accent,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 1.4,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          '· $count',
+                          style: const TextStyle(
+                            color: AppColors.textTertiary,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            fontFeatures: [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(width: 8),
+                    const SizedBox(height: 2),
                     Text(
-                      '· $count',
+                      meta.sublabel,
                       style: const TextStyle(
                         color: AppColors.textTertiary,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        fontFeatures: [FontFeature.tabularFigures()],
+                        fontSize: 10,
+                        height: 1.4,
                       ),
                     ),
                   ],
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  meta.sublabel,
-                  style: const TextStyle(
-                    color: AppColors.textTertiary,
-                    fontSize: 10,
-                    height: 1.4,
-                  ),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }

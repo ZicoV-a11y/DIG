@@ -51,6 +51,8 @@ class UtilityRail extends StatelessWidget {
                   const _RailDivider(),
                   _ModeModule(controller: controller),
                   const _RailDivider(),
+                  _RescanModule(controller: controller),
+                  const _RailDivider(),
                   _ShowInFinderModule(controller: controller),
                   const _RailDivider(),
                   _DataModule(controller: controller),
@@ -283,6 +285,40 @@ class _ModeModule extends StatelessWidget {
               letterSpacing: 1.0,
               color: AppColors.textPrimary,
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- RESCAN ----------
+
+class _RescanModule extends StatelessWidget {
+  final LibraryController controller;
+  const _RescanModule({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final scanning = controller.isScanning;
+    return _RailButton(
+      tooltip: scanning
+          ? 'Rescanning library…'
+          : 'Rescan all sources (⌘R)',
+      // Disable while a scan is in flight so back-to-back clicks
+      // don't pile up redundant rescans on top of each other.
+      onPressed: scanning ? null : controller.rescanAllSources,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const _SectionLabel('REFRESH'),
+          const SizedBox(height: 6),
+          Icon(
+            Icons.refresh_rounded,
+            size: 22,
+            color: scanning
+                ? AppColors.accent
+                : AppColors.textSecondary,
           ),
         ],
       ),

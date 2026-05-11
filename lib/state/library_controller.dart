@@ -836,6 +836,72 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ── App-initiated Move / Copy orchestration ─────────────────
+  //
+  // Thin wrappers around `repo.moveTrackFile` / `repo.copyTrackFile`
+  // that take care of post-success housekeeping (reload tracks,
+  // mark library dirty, notify) while leaving the FS + DB heavy
+  // lifting to the repo. Right-click "Move to..." / "Copy to..."
+  // wires up to these from sub-slice C; tests cover the repo
+  // primitives directly so we don't need a controller-level
+  // mock-engine harness here.
+  //
+  // Both return the raw [MoveCopyResult] so the UI can render the
+  // failure reason verbatim in a SnackBar — they don't try to
+  // pretty-print or swallow errors at this layer.
+
+  /// Move the file backing [track] into [destSource]'s folder root.
+  /// On success: track list reloads from DB so the row appears at
+  /// the new path and the old row's gone. On failure: nothing
+  /// changes in DB / FS / memory; UI shows the reason.
+  Future<MoveCopyResult> moveTrack({
+    required Track track,
+    required Source destSource,
+  }) async {
+    final result = await repo.moveTrackFile(
+      sourcePath: track.path,
+      destSource: destSource,
+    );
+    if (result.success) {
+      final allTracks = await repo.loadTracks();
+      _replaceTracks(allTracks);
+      _markLibraryDirty();
+      notifyListeners();
+    }
+    return result;
+  }
+
+  /// Copy the file backing [track] into [destSource]'s folder root.
+  /// On success: new row appears in the track list sharing
+  /// intel_uid with the original (favorites / plays / review state
+  /// reflect for both). On failure: nothing changes.
+  Future<MoveCopyResult> copyTrack({
+    required Track track,
+    required Source destSource,
+  }) async {
+    final result = await repo.copyTrackFile(
+      sourcePath: track.path,
+      destSource: destSource,
+    );
+    if (result.success) {
+      final allTracks = await repo.loadTracks();
+      _replaceTracks(allTracks);
+      _markLibraryDirty();
+      notifyListeners();
+    }
+    return result;
+  }
+
+  /// Watched sources that can be a Move/Copy destination — every
+  /// non-sub-view source except the one the [track] currently
+  /// lives in. Used to populate the right-click menu's source
+  /// picker (sub-slice C).
+  List<Source> moveCopyDestinationsFor(Track track) {
+    return _sources
+        .where((s) => !s.isSubView && s.id != track.sourceId)
+        .toList(growable: false);
+  }
+
   /// Distinct song-identity count — same buckets the variant
   /// collapse uses. Tracks with empty title/artist (no identity to
   /// group on) each count as their own song.

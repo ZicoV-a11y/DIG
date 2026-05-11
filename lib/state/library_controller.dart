@@ -3,6 +3,10 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart' show
+    AppLifecycleState,
+    WidgetsBinding,
+    WidgetsBindingObserver;
 import 'package:just_audio/just_audio.dart' show ProcessingState;
 import 'package:uuid/uuid.dart';
 
@@ -231,6 +235,20 @@ class LibraryController extends ChangeNotifier {
   final Map<String, Timer> _watcherDebounce = {};
   static const _watcherDebounceWindow = Duration(milliseconds: 500);
 
+  // App-lifecycle observer. macOS sends `resumed` when the user
+  // brings the app to foreground (e.g., Cmd+Tab back from Finder).
+  // Belt-and-suspenders rescan covers the case where the per-source
+  // filesystem watcher missed an event — Finder's "Move to Trash"
+  // sometimes produces atypical FSEvents that `Directory.watch`
+  // doesn't always surface reliably.
+  late final _LifecycleObserver _lifecycleObserver = _LifecycleObserver(
+    (state) {
+      if (state == AppLifecycleState.resumed) _rescanAllOnFocus();
+    },
+  );
+  bool _lifecycleObserverRegistered = false;
+  bool _focusRescanInFlight = false;
+
   // Throttle notifyListeners() during phase-2 metadata enrichment.
   // Without this, each 100-file batch triggered a full UI rebuild +
   // visible-cache invalidation + 12k-element re-sort. With ~25
@@ -375,6 +393,16 @@ class LibraryController extends ChangeNotifier {
       // don't want to gate hydrate completion on per-source
       // watcher setup, especially over slow cloud volumes.
       unawaited(_startWatcher(source));
+    }
+
+    // Belt-and-suspenders: also rescan every source when the app
+    // is brought back to foreground (Cmd+Tab from Finder, etc).
+    // Catches the cases where `Directory.watch` missed an event —
+    // especially Finder's "Move to Trash" flow, which sometimes
+    // produces FSEvents that don't surface cleanly.
+    if (!_lifecycleObserverRegistered) {
+      WidgetsBinding.instance.addObserver(_lifecycleObserver);
+      _lifecycleObserverRegistered = true;
     }
 
     final unenriched =
@@ -1611,6 +1639,11 @@ class LibraryController extends ChangeNotifier {
   }
 
   void _onWatcherEvent(String sourceId, FileSystemEvent event) {
+    // Useful when diagnosing "I deleted a file but it didn't update":
+    // the absence of this log means FSEvents never delivered the
+    // change. The lifecycle-resumed rescan covers that case.
+    debugPrint('[watcher] $sourceId ${_eventTypeName(event)} '
+        '${event.path}${event.isDirectory ? " (dir)" : ""}');
     // Coalesce bursts. A single file save can fire create + modify
     // events in quick succession; a folder move can fire dozens.
     _watcherDebounce[sourceId]?.cancel();
@@ -1618,6 +1651,49 @@ class LibraryController extends ChangeNotifier {
       _watcherDebounce.remove(sourceId);
       rescanSource(sourceId);
     });
+  }
+
+  String _eventTypeName(FileSystemEvent e) {
+    switch (e.type) {
+      case FileSystemEvent.create:
+        return 'create';
+      case FileSystemEvent.modify:
+        return 'modify';
+      case FileSystemEvent.delete:
+        return 'delete';
+      case FileSystemEvent.move:
+        return 'move';
+      default:
+        return '?(${e.type})';
+    }
+  }
+
+  /// Sequential rescan of every non-sub-view source. Triggered when
+  /// the app comes back to foreground; covers the case where the
+  /// per-source filesystem watcher missed an event. Guarded against
+  /// re-entry so rapid focus toggles don't pile rescans on each other.
+  Future<void> _rescanAllOnFocus() async {
+    if (_focusRescanInFlight) return;
+    _focusRescanInFlight = true;
+    try {
+      debugPrint(
+        '[focus] resumed → rescanning ${_sources.length} sources',
+      );
+      // Snapshot the list — rescanSource awaits and the sources
+      // list could mutate (e.g., user removes one mid-rescan).
+      for (final source in _sources.toList()) {
+        if (source.isSubView) continue;
+        try {
+          await rescanSource(source.id);
+        } catch (e) {
+          debugPrint(
+            '[focus] rescan failed for ${source.displayName}: $e',
+          );
+        }
+      }
+    } finally {
+      _focusRescanInFlight = false;
+    }
   }
 
   Future<void> _stopWatcher(String sourceId) async {
@@ -2445,6 +2521,10 @@ class LibraryController extends ChangeNotifier {
     _positionNotifier.dispose();
     _revealTick.dispose();
     unawaited(_stopAllWatchers());
+    if (_lifecycleObserverRegistered) {
+      WidgetsBinding.instance.removeObserver(_lifecycleObserver);
+      _lifecycleObserverRegistered = false;
+    }
     super.dispose();
   }
 }
@@ -2455,4 +2535,19 @@ String _displayNameFor(String path) {
     if (segs[i].isNotEmpty) return segs[i];
   }
   return path;
+}
+
+/// Thin shim around `WidgetsBindingObserver` so the controller can
+/// listen for app lifecycle changes without itself mixing in
+/// WidgetsBindingObserver (which isn't declared as a Dart mixin in
+/// the current Flutter SDK). The controller registers an instance of
+/// this with `WidgetsBinding.instance.addObserver(...)` and forwards
+/// the lifecycle-state callback to a closure.
+class _LifecycleObserver extends WidgetsBindingObserver {
+  final void Function(AppLifecycleState) onChange;
+  _LifecycleObserver(this.onChange);
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    onChange(state);
+  }
 }

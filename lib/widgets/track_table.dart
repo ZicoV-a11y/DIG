@@ -3,6 +3,7 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 
+import '../models/source.dart';
 import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
@@ -921,6 +922,31 @@ class _TrackRow extends StatelessWidget {
     if (aggView != null && aggView.hasSiblings) {
       items.add(_unlinkMenuItem(variantCount: aggView.variantCount));
     }
+    // Move/Copy destinations — every non-sub-view source EXCEPT
+    // the one this track already lives in. For multi-variant
+    // rows the menu operates on the row's primary track (the
+    // playback-preferred one); per-variant move/copy is a future
+    // refinement. The repo's pre-flight catches the rest of the
+    // failure modes (filename collision, file missing, etc.) and
+    // surfaces them via SnackBar after the menu closes.
+    final destinations = controller.moveCopyDestinationsFor(track);
+    if (destinations.isNotEmpty) {
+      items.add(const PopupMenuDivider(height: 1));
+      for (final dest in destinations) {
+        items.add(_moveCopyMenuItem(
+          value: 'move:${dest.id}',
+          label: 'Move to ${dest.displayName}',
+          icon: Icons.drive_file_move_rounded,
+        ));
+      }
+      for (final dest in destinations) {
+        items.add(_moveCopyMenuItem(
+          value: 'copy:${dest.id}',
+          label: 'Copy to ${dest.displayName}',
+          icon: Icons.content_copy_rounded,
+        ));
+      }
+    }
 
     final result = await showMenu<String>(
       context: context,
@@ -968,6 +994,52 @@ class _TrackRow extends StatelessWidget {
       );
       if (confirmed == true) {
         await controller.unlinkBucket(track);
+      }
+    } else if ((result.startsWith('move:') || result.startsWith('copy:')) &&
+        context.mounted) {
+      // Parse the destination source id off the result string and
+      // dispatch the corresponding controller method. The SnackBar
+      // narrates outcome — success surfaces the new path basename;
+      // failure surfaces the repo's errorReason verbatim so the
+      // user knows exactly which pre-flight tripped.
+      final isMove = result.startsWith('move:');
+      final destId = result.substring(isMove ? 'move:'.length : 'copy:'.length);
+      Source? destSource;
+      for (final s in controller.sources) {
+        if (s.id == destId) {
+          destSource = s;
+          break;
+        }
+      }
+      if (destSource == null) return;
+      final outcome = isMove
+          ? await controller.moveTrack(track: track, destSource: destSource)
+          : await controller.copyTrack(track: track, destSource: destSource);
+      if (!context.mounted) return;
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      if (outcome.success) {
+        final basename = (outcome.newPath ?? '').split('/').last;
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              isMove
+                  ? 'Moved $basename → ${destSource.displayName}'
+                  : 'Copied $basename → ${destSource.displayName}',
+            ),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      } else {
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              outcome.errorReason ??
+                  (isMove ? 'Move failed' : 'Copy failed'),
+            ),
+            backgroundColor: AppColors.favorite,
+            duration: const Duration(seconds: 4),
+          ),
+        );
       }
     }
   }
@@ -1084,6 +1156,34 @@ class _TrackRow extends StatelessWidget {
     return prevSep < 0
         ? parentPath
         : parentPath.substring(prevSep + 1);
+  }
+
+  PopupMenuItem<String> _moveCopyMenuItem({
+    required String value,
+    required String label,
+    required IconData icon,
+  }) {
+    return PopupMenuItem<String>(
+      value: value,
+      height: 32,
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: AppColors.textSecondary),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: AppColors.textPrimary,
+                fontSize: 12,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   PopupMenuItem<String> _unlinkMenuItem({required int variantCount}) {

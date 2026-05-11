@@ -7,6 +7,7 @@ import '../services/intelligence_export.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
+import 'activity_log_dialog.dart';
 import 'duplicates_audit_dialog.dart';
 import 'import_confirm_dialog.dart';
 
@@ -55,6 +56,8 @@ class UtilityRail extends StatelessWidget {
                   _RescanModule(controller: controller),
                   const _RailDivider(),
                   _AuditModule(controller: controller),
+                  const _RailDivider(),
+                  _HistoryModule(controller: controller),
                   const _RailDivider(),
                   _ShowInFinderModule(controller: controller),
                   const _RailDivider(),
@@ -345,6 +348,43 @@ class _AuditModule extends StatelessWidget {
               fontFeatures: [FontFeature.tabularFigures()],
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- HISTORY ----------
+
+class _HistoryModule extends StatelessWidget {
+  final LibraryController controller;
+  const _HistoryModule({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    // No live count badge — events accumulate forever, so "N events"
+    // would just grow unboundedly without giving the user
+    // actionable info. The dialog itself surfaces the total.
+    return _RailButton(
+      tooltip: 'Activity log — lifecycle events the system has recorded',
+      onPressed: () => showActivityLogDialog(
+        context: context,
+        controller: controller,
+      ),
+      child: const Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _SectionLabel('HISTORY'),
+          SizedBox(height: 6),
+          Icon(
+            Icons.history_rounded,
+            size: 22,
+            color: AppColors.textSecondary,
+          ),
+          SizedBox(height: 4),
+          // Spacer matching the height of count badges in adjacent
+          // modules (AUDIT, etc.) so the rail items align.
+          SizedBox(height: 14),
         ],
       ),
     );

@@ -12,6 +12,7 @@ import 'package:uuid/uuid.dart';
 
 import '../models/intelligence_record.dart';
 import '../models/source.dart';
+import '../models/activity_event.dart';
 import '../models/track.dart';
 import '../services/audio_scanner.dart';
 import '../services/content_hash.dart';
@@ -943,6 +944,31 @@ class LibraryController extends ChangeNotifier {
   /// haven't been lost. The DB state stays `'missing'` because
   /// uniqueness fails (≥ 2 byte-twins available); only the user
   /// can pick a single successor manually.
+  // ── Activity log proxies (Sub-slice C) ─────────────────────────
+  //
+  // Thin pass-throughs to LibraryRepository so the History panel
+  // widget doesn't need a direct repo handle. Not cached — the
+  // panel does a single load on open / refresh, not on every
+  // controller notify; query cost is small (LIMIT 250) and the
+  // events index covers it.
+
+  /// Paginated activity feed for the History panel. Newest first.
+  Future<List<ActivityEvent>> loadActivityFeed({
+    int limit = 250,
+    int offset = 0,
+    List<String>? eventTypes,
+  }) {
+    return repo.loadRecentEvents(
+      limit: limit,
+      offset: offset,
+      eventTypes: eventTypes,
+    );
+  }
+
+  /// Lifetime event count — for "X of Y" tally text in the panel
+  /// header.
+  Future<int> activityEventCount() => repo.eventCount();
+
   Set<String> get coexistingMissingPaths {
     _ensureLibraryStats();
     return _coexistingMissingPathsCache ?? const <String>{};

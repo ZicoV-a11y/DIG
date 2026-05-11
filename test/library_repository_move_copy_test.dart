@@ -322,6 +322,144 @@ void main() {
     });
   });
 
+  group('copyTrackFile — stale row at dest', () {
+    test(
+        'superseded row at destPath gets auto-purged inside the copy txn',
+        () async {
+      // Real-world scenario: user copied A→B earlier, then deleted
+      // the file at B in Finder. Scan marked the B row 'superseded'
+      // (cross-source supersession matched the A original by
+      // content_hash). The path-PK row at B still exists. Now the
+      // user copies A→B again. Without the auto-purge fix this
+      // would fail with UNIQUE constraint failed: indexed_files.path.
+      final src = await writeFile('reuse.mp3', 800 * 1024, seed: 41);
+      await seedIndexedRow(file: src, sourceId: srcA.id);
+      // Seed a stale superseded row at the destination path
+      // (file no longer on disk — represents the leftover from a
+      // prior copy + delete-in-Finder cycle).
+      await raw.insert('indexed_files', {
+        'path': '${srcB.folderPath}/reuse.mp3',
+        'source_id': srcB.id,
+        'filename': 'reuse.mp3',
+        'filesize': 800 * 1024,
+        'modified_at': 0,
+        'duration_ms': 300000,
+        'fingerprint': 'fp-stale',
+        'uid': 'u-stale_dup1',
+        'intel_uid': null,
+        'is_available': 0,
+        'availability_state': 'superseded',
+        'last_seen_at': 0,
+        'title': 'T',
+      });
+
+      final result = await repo.copyTrackFile(
+        sourcePath: src.path,
+        destSource: srcB,
+      );
+
+      expect(result.success, isTrue,
+          reason: 'stale row at dest must not block re-copy');
+
+      // New row replaced the stale one — same path, different uid
+      // (fresh copy with bumped mtime).
+      final destRow = await rowAt('${srcB.folderPath}/reuse.mp3');
+      expect(destRow, isNotNull);
+      expect(destRow!['availability_state'], 'available');
+      expect(destRow['uid'], isNot('u-stale_dup1'));
+
+      // Audit trail: implicit purge event recorded with the
+      // auto_purge_reason set so a future History panel can
+      // narrate "stale row replaced by copy" honestly.
+      final purgeEvents = await repo.loadRecentEvents(
+        eventTypes: [EventType.purged],
+      );
+      expect(purgeEvents, hasLength(1));
+      expect(purgeEvents.first.path,
+          '${srcB.folderPath}/reuse.mp3');
+      expect(purgeEvents.first.payload['auto_purge_reason'],
+          'replaced_by_app_initiated_copy');
+      expect(purgeEvents.first.payload['prior_state'], 'superseded');
+    });
+
+    test(
+        'missing row at destPath also gets auto-purged (legacy pre-supersession case)',
+        () async {
+      // Same flow, but the leftover row never advanced past
+      // 'missing' (e.g. cross-source supersession blocked by the
+      // uniqueness rule because >1 byte-twins existed).
+      final src = await writeFile('reuse2.mp3', 800 * 1024, seed: 43);
+      await seedIndexedRow(file: src, sourceId: srcA.id);
+      await raw.insert('indexed_files', {
+        'path': '${srcB.folderPath}/reuse2.mp3',
+        'source_id': srcB.id,
+        'filename': 'reuse2.mp3',
+        'filesize': 800 * 1024,
+        'modified_at': 0,
+        'duration_ms': 300000,
+        'fingerprint': 'fp-stale2',
+        'uid': 'u-stale2',
+        'intel_uid': null,
+        'is_available': 0,
+        'availability_state': 'missing',
+        'last_seen_at': 0,
+        'title': 'T',
+      });
+
+      final result = await repo.copyTrackFile(
+        sourcePath: src.path,
+        destSource: srcB,
+      );
+      expect(result.success, isTrue);
+      final destRow = await rowAt('${srcB.folderPath}/reuse2.mp3');
+      expect(destRow!['availability_state'], 'available');
+    });
+  });
+
+  group('moveTrackFile — stale row at dest', () {
+    test(
+        'superseded row at destPath gets auto-purged inside the move txn',
+        () async {
+      final src = await writeFile('mv.mp3', 800 * 1024, seed: 47);
+      await seedIndexedRow(file: src, sourceId: srcA.id);
+      // Stale row at the move destination path.
+      await raw.insert('indexed_files', {
+        'path': '${srcB.folderPath}/mv.mp3',
+        'source_id': srcB.id,
+        'filename': 'mv.mp3',
+        'filesize': 800 * 1024,
+        'modified_at': 0,
+        'duration_ms': 300000,
+        'fingerprint': 'fp-stale-mv',
+        'uid': 'u-stale-mv',
+        'intel_uid': null,
+        'is_available': 0,
+        'availability_state': 'superseded',
+        'last_seen_at': 0,
+        'title': 'T',
+      });
+
+      final result = await repo.moveTrackFile(
+        sourcePath: src.path,
+        destSource: srcB,
+      );
+
+      expect(result.success, isTrue);
+      expect(await rowAt(src.path), isNull,
+          reason: 'source row gone after move');
+      final destRow = await rowAt('${srcB.folderPath}/mv.mp3');
+      expect(destRow!['availability_state'], 'available');
+      expect(destRow['uid'], isNot('u-stale-mv'));
+
+      final purgeEvents = await repo.loadRecentEvents(
+        eventTypes: [EventType.purged],
+      );
+      expect(purgeEvents, hasLength(1));
+      expect(purgeEvents.first.payload['auto_purge_reason'],
+          'replaced_by_app_initiated_move');
+    });
+  });
+
   group('copyTrackFile — failure paths', () {
     test('destination collision → no FS change, source row preserved',
         () async {

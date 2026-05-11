@@ -938,10 +938,40 @@ class LibraryRepository {
     // DB update + event ──────────────────────────────────────
     try {
       await _db.transaction((txn) async {
-        // Insert the new row first (path is the PK, no collision
-        // because pre-flight verified destPath doesn't exist in
-        // indexed_files via the dest-file check + uniqueness of
-        // path). Then delete the source row.
+        // Clean up any stale indexed_files row at destPath
+        // (typically left over from a previous move/copy that the
+        // user later undid in Finder, leaving a 'superseded' or
+        // 'missing' row behind). Pre-flight already confirmed no
+        // FILE exists at destPath, so any row here is by
+        // definition stale. Without this cleanup the INSERT below
+        // would trip `UNIQUE constraint failed: indexed_files.path`
+        // and roll back the whole move.
+        final stale = await txn.query(
+          'indexed_files',
+          columns: ['availability_state', 'source_id'],
+          where: 'path = ? AND path != ?',
+          whereArgs: [destPath, sourcePath],
+          limit: 1,
+        );
+        if (stale.isNotEmpty) {
+          await txn.delete(
+            'indexed_files',
+            where: 'path = ? AND path != ?',
+            whereArgs: [destPath, sourcePath],
+          );
+          await recordEvent(
+            type: EventType.purged,
+            path: destPath,
+            sourceId: stale.first['source_id'] as String?,
+            payload: {
+              'prior_state':
+                  stale.first['availability_state'] as String?,
+              'auto_purge_reason': 'replaced_by_app_initiated_move',
+            },
+            txn: txn,
+          );
+        }
+        // Insert the new row, then delete the source row.
         final newRow = Map<String, Object?>.from(row);
         newRow['path'] = destPath;
         newRow['source_id'] = destSource.id;
@@ -1082,6 +1112,41 @@ class LibraryRepository {
 
     try {
       await _db.transaction((txn) async {
+        // Clean up any stale indexed_files row at destPath. This
+        // happens when a previous Copy/Move to this same path was
+        // later undone in Finder — the row got marked
+        // 'superseded' or 'missing' but never explicitly purged,
+        // so it still occupies the path PK. Without this cleanup,
+        // the INSERT below would fail with
+        // `UNIQUE constraint failed: indexed_files.path` and the
+        // whole copy operation would roll back. Pre-flight already
+        // confirmed no FILE exists at destPath, so any row here is
+        // by definition stale.
+        final stale = await txn.query(
+          'indexed_files',
+          columns: ['availability_state', 'source_id'],
+          where: 'path = ?',
+          whereArgs: [destPath],
+          limit: 1,
+        );
+        if (stale.isNotEmpty) {
+          await txn.delete(
+            'indexed_files',
+            where: 'path = ?',
+            whereArgs: [destPath],
+          );
+          await recordEvent(
+            type: EventType.purged,
+            path: destPath,
+            sourceId: stale.first['source_id'] as String?,
+            payload: {
+              'prior_state':
+                  stale.first['availability_state'] as String?,
+              'auto_purge_reason': 'replaced_by_app_initiated_copy',
+            },
+            txn: txn,
+          );
+        }
         final newRow = Map<String, Object?>.from(row);
         newRow['path'] = destPath;
         newRow['source_id'] = destSource.id;

@@ -852,6 +852,47 @@ class LibraryController extends ChangeNotifier {
   AggregatedTrackView? aggregatedViewForPrimary(Track primary) =>
       _bucketsByPrimaryUid[primary.uid];
 
+  /// Every multi-variant bucket the matcher has assembled across the
+  /// whole library (manual link, auto 4-field, fingerprint
+  /// equivalence — any rule that paired two files), independent of
+  /// the current source / search filters. Sorted by total filesize
+  /// descending so the biggest-impact duplicates surface first.
+  ///
+  /// Used by the duplicates audit dialog; recomputed each call so a
+  /// rescan or a fresh link / unlink immediately reflects in the
+  /// dialog without needing a `visibleTracks` round-trip.
+  List<AggregatedTrackView> get multiVariantBuckets {
+    final out = <AggregatedTrackView>[];
+    for (final bucket in groupBySongIdentity(_tracks)) {
+      // Only count available variants. A bucket with one available
+      // + one unavailable variant has no actual duplicate problem
+      // to audit (the unavailable one is already going away).
+      final ordered = orderBucketByPlaybackPreference(
+        bucket.where((t) => t.isAvailable).toList(growable: false),
+      );
+      if (ordered.length < 2) continue;
+      out.add(AggregatedTrackView(ordered));
+    }
+    out.sort((a, b) {
+      final sa = _bucketFilesize(a);
+      final sb = _bucketFilesize(b);
+      return sb.compareTo(sa); // desc
+    });
+    return out;
+  }
+
+  /// Sum of the on-disk filesizes for every variant in [view].
+  /// Helper for the audit dialog header + per-row total. Filesize is
+  /// per-file (lives on `indexed_files`) so it's always at the
+  /// variant level, not aggregated by slice 3.
+  int _bucketFilesize(AggregatedTrackView view) {
+    var total = 0;
+    for (final t in view.variants) {
+      total += t.filesize;
+    }
+    return total;
+  }
+
   /// `true` when [primary] is the displayed primary of a multi-
   /// variant bucket — used by the right-click handler to decide
   /// whether to surface a per-format "Show in Finder" submenu.

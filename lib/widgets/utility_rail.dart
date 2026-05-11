@@ -7,6 +7,7 @@ import '../services/intelligence_export.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
+import 'duplicates_audit_dialog.dart';
 import 'import_confirm_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
@@ -52,6 +53,8 @@ class UtilityRail extends StatelessWidget {
                   _ModeModule(controller: controller),
                   const _RailDivider(),
                   _RescanModule(controller: controller),
+                  const _RailDivider(),
+                  _AuditModule(controller: controller),
                   const _RailDivider(),
                   _ShowInFinderModule(controller: controller),
                   const _RailDivider(),
@@ -284,6 +287,57 @@ class _ModeModule extends StatelessWidget {
               fontWeight: FontWeight.w700,
               letterSpacing: 1.0,
               color: AppColors.textPrimary,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------- AUDIT ----------
+
+class _AuditModule extends StatelessWidget {
+  final LibraryController controller;
+  const _AuditModule({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final count = controller.multiVariantBuckets.length;
+    final hasAny = count > 0;
+    return _RailButton(
+      tooltip: hasAny
+          ? 'Audit $count multi-variant songs'
+          : 'No multi-variant songs to audit',
+      // Always clickable — even with zero variants, the dialog gives
+      // a "you're clean" confirmation. Surfaces the count badge
+      // either way so the user always sees the system's current
+      // matching state at a glance.
+      onPressed: () => showDuplicatesAuditDialog(
+        context: context,
+        controller: controller,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const _SectionLabel('AUDIT'),
+          const SizedBox(height: 6),
+          Icon(
+            Icons.layers_rounded,
+            size: 22,
+            color: hasAny
+                ? AppColors.textSecondary
+                : AppColors.textTertiary,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '$count',
+            style: const TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.0,
+              color: AppColors.textPrimary,
+              fontFeatures: [FontFeature.tabularFigures()],
             ),
           ),
         ],

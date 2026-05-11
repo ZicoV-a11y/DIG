@@ -1512,6 +1512,12 @@ class LibraryController extends ChangeNotifier {
     _isScanning = true;
     notifyListeners();
     try {
+      // Snapshot the in-memory unavailable count BEFORE the rescan
+      // so we can log how many rows changed availability. Quick
+      // diagnostic — exposes whether the scan is actually marking
+      // deleted files as gone.
+      final preUnavailable =
+          _tracks.where((t) => t.sourceId == source.id && !t.isAvailable).length;
       final scanStart = Stopwatch()..start();
       // Disk walk + per-file stat now happen inside the scanner
       // isolate; the UI thread stays responsive even on huge cloud
@@ -1521,8 +1527,8 @@ class LibraryController extends ChangeNotifier {
         recursive: source.scanMode == ScanMode.recursive,
       );
       debugPrint(
-        '[scan] walked ${entries.length} files in '
-        '${scanStart.elapsedMilliseconds}ms',
+        '[scan] ${source.displayName}: walked ${entries.length} files in '
+        '${scanStart.elapsedMilliseconds}ms (pre-unavailable=$preUnavailable)',
       );
 
       // Build the batch payload. Carry forward already-known durations
@@ -1578,6 +1584,20 @@ class LibraryController extends ChangeNotifier {
       // newly-discovered rows become visible.
       final allTracks = await repo.loadTracks();
       _replaceTracks(allTracks);
+
+      // Diagnostic: how many rows in this source are now unavailable?
+      // If preUnavailable < postUnavailable, the scan correctly
+      // marked some files as gone. If unchanged after deleting a
+      // file, something is broken — most likely the scanner isn't
+      // detecting the file as missing (different source_id? trash
+      // folder inside the source root? path normalization?).
+      final postUnavailable = allTracks
+          .where((t) => t.sourceId == source.id && !t.isAvailable)
+          .length;
+      debugPrint(
+        '[scan] ${source.displayName}: rows for this source '
+        'now unavailable=$postUnavailable (was $preUnavailable, delta=${postUnavailable - preUnavailable})',
+      );
 
       final count = await repo.countIndexedFiles(source.id);
       final now = DateTime.now().millisecondsSinceEpoch;

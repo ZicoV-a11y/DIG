@@ -79,7 +79,20 @@ List<ScannedEntry> _scanInIsolate(_ScanRequest req) {
     }
     for (final entity in entries) {
       if (entity is Directory) {
-        if (req.recursive) stack.add(entity);
+        if (!req.recursive) continue;
+        // Skip hidden directories. The big one is macOS `.Trashes/`
+        // (per-volume Trash on external drives) — if the source
+        // folder lives at the root of an external drive, recursing
+        // into `.Trashes/` makes deleted files come back as "still
+        // present" at the new in-Trash path, so the scan can never
+        // mark them gone. Also skips `.Spotlight-V100`,
+        // `.fseventsd`, `.DS_Store` directories, etc. — none of
+        // which a user organises music into.
+        final p = entity.path;
+        final sepIdx = p.lastIndexOf(Platform.pathSeparator);
+        final dirName = sepIdx < 0 ? p : p.substring(sepIdx + 1);
+        if (dirName.startsWith('.')) continue;
+        stack.add(entity);
         continue;
       }
       if (entity is! File) continue;

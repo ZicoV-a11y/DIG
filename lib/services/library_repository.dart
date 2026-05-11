@@ -437,6 +437,21 @@ class LibraryRepository {
     Set<String> seenPaths,
   ) async {
     await _db.transaction((txn) async {
+      // Snapshot the rows that are about to transition from
+      // 'available' to 'missing'. We pull them BEFORE the update
+      // so we can emit one `removed_external` event per row.
+      // Filtering against [seenPaths] is done in Dart rather than
+      // SQL — a NOT IN clause with a 12k-element bind list is
+      // both ugly and at the edge of SQLite's parameter limit.
+      final wasAvailable = await txn.rawQuery(
+        "SELECT path FROM indexed_files "
+        "WHERE source_id = ? AND availability_state = 'available'",
+        [sourceId],
+      );
+      final transitioningToMissing = wasAvailable
+          .map((r) => r['path'] as String)
+          .where((p) => !seenPaths.contains(p))
+          .toList();
       // Pass 1: reset everything in this source to missing. Both
       // `is_available` (legacy boolean) and `availability_state`
       // (richer state machine) move together: the state machine
@@ -451,6 +466,17 @@ class LibraryRepository {
         where: 'source_id = ?',
         whereArgs: [sourceId],
       );
+      // Record removal events. Done inside the transaction so the
+      // event row and the state change land atomically — no
+      // "ghost event for a state change that rolled back" case.
+      for (final path in transitioningToMissing) {
+        await recordEvent(
+          type: EventType.removedExternal,
+          path: path,
+          sourceId: sourceId,
+          txn: txn,
+        );
+      }
       if (seenPaths.isEmpty) return;
 
       // Pass 2: chunked update to flip seen paths back to available.
@@ -482,11 +508,30 @@ class LibraryRepository {
   Future<int> purgeIndexedFiles(List<String> paths) async {
     if (paths.isEmpty) return 0;
     final placeholders = List.filled(paths.length, '?').join(',');
-    return await _db.delete(
+    // Capture the rows' prior state for the activity log BEFORE
+    // the delete. The DELETE is fire-and-forget audit-wise; if
+    // the events fail to record afterward we'd lose the trail.
+    final priorRows = await _db.rawQuery(
+      'SELECT path, source_id, availability_state '
+      'FROM indexed_files WHERE path IN ($placeholders)',
+      paths,
+    );
+    final deleted = await _db.delete(
       'indexed_files',
       where: 'path IN ($placeholders)',
       whereArgs: paths,
     );
+    for (final row in priorRows) {
+      await recordEvent(
+        type: EventType.purged,
+        path: row['path'] as String,
+        sourceId: row['source_id'] as String?,
+        payload: {
+          'prior_state': row['availability_state'] as String?,
+        },
+      );
+    }
+    return deleted;
   }
 
   /// Auto-detect "moved file" supersession after a scan: any row in
@@ -501,7 +546,29 @@ class LibraryRepository {
   ///
   /// Returns the number of rows upgraded from missing → superseded.
   Future<int> markMovedSupersessions(String sourceId) async {
-    return await _db.rawUpdate(
+    // Pre-query the rows that will be superseded, along with one
+    // candidate successor path each (for the event payload). The
+    // current rule has no uniqueness guard, so multiple successors
+    // could exist — we record the first per `LIMIT 1`; the event
+    // is informational, not the authoritative decision.
+    final affected = await _db.rawQuery('''
+      SELECT
+        m.path AS missing_path,
+        (SELECT a.path FROM indexed_files a
+         WHERE a.source_id = m.source_id
+           AND a.availability_state = 'available'
+           AND a.fingerprint = m.fingerprint
+         LIMIT 1) AS successor_path
+      FROM indexed_files m
+      WHERE m.source_id = ?
+        AND m.availability_state = 'missing'
+        AND m.fingerprint IN (
+          SELECT fingerprint FROM indexed_files
+          WHERE source_id = ? AND availability_state = 'available'
+        )
+    ''', [sourceId, sourceId]);
+
+    final count = await _db.rawUpdate(
       "UPDATE indexed_files "
       "SET availability_state = 'superseded' "
       "WHERE source_id = ? "
@@ -512,6 +579,18 @@ class LibraryRepository {
       "  )",
       [sourceId, sourceId],
     );
+
+    for (final row in affected) {
+      await recordEvent(
+        type: EventType.autoMoveSameSource,
+        path: row['missing_path'] as String,
+        sourceId: sourceId,
+        payload: {
+          'successor_path': row['successor_path'] as String?,
+        },
+      );
+    }
+    return count;
   }
 
   /// Cross-source relocation detection. Auto-resolves the
@@ -628,7 +707,60 @@ class LibraryRepository {
   ///
   /// Returns the number of rows upgraded from missing → superseded.
   Future<int> markCrossSourceMoves() async {
-    return await _db.rawUpdate('''
+    // Pre-query the rows that the UPDATE below will supersede,
+    // along with the matched_on signal and successor path. Mirrors
+    // the UPDATE's WHERE clause exactly so the event log records
+    // every state change and nothing else.
+    final affected = await _db.rawQuery('''
+      SELECT
+        m.path AS missing_path,
+        m.source_id,
+        CASE
+          WHEN m.content_hash IS NOT NULL THEN 'content_hash'
+          ELSE 'fingerprint'
+        END AS matched_on,
+        CASE
+          WHEN m.content_hash IS NOT NULL THEN (
+            SELECT a.path FROM indexed_files a
+            WHERE a.content_hash = m.content_hash
+              AND a.availability_state = 'available'
+              AND a.filesize > 0
+              AND a.duration_ms > 0
+            LIMIT 1
+          )
+          ELSE (
+            SELECT a.path FROM indexed_files a
+            WHERE a.fingerprint = m.fingerprint
+              AND a.availability_state = 'available'
+              AND a.filesize > 0
+              AND a.duration_ms > 0
+            LIMIT 1
+          )
+        END AS successor_path
+      FROM indexed_files m
+      WHERE m.availability_state = 'missing'
+        AND m.filesize > 0
+        AND m.duration_ms > 0
+        AND (
+          (m.content_hash IS NOT NULL AND (
+            SELECT COUNT(*) FROM indexed_files a
+            WHERE a.content_hash = m.content_hash
+              AND a.availability_state = 'available'
+              AND a.filesize > 0
+              AND a.duration_ms > 0
+          ) = 1)
+          OR
+          (m.content_hash IS NULL AND (
+            SELECT COUNT(*) FROM indexed_files a
+            WHERE a.fingerprint = m.fingerprint
+              AND a.availability_state = 'available'
+              AND a.filesize > 0
+              AND a.duration_ms > 0
+          ) = 1)
+        )
+    ''');
+
+    final count = await _db.rawUpdate('''
       UPDATE indexed_files
       SET availability_state = 'superseded'
       WHERE availability_state = 'missing'
@@ -663,6 +795,19 @@ class LibraryRepository {
           )
         )
     ''');
+
+    for (final row in affected) {
+      await recordEvent(
+        type: EventType.autoMoveCrossSource,
+        path: row['missing_path'] as String,
+        sourceId: row['source_id'] as String?,
+        payload: {
+          'successor_path': row['successor_path'] as String?,
+          'matched_on': row['matched_on'] as String,
+        },
+      );
+    }
+    return count;
   }
 
   // ---------------------------------------------------------------------------

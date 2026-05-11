@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
+import 'review_missing_dialog.dart';
 
 /// Always-on status strip pinned to the bottom of the workspace.
 ///
@@ -228,6 +229,7 @@ class _LibraryTally extends StatelessWidget {
     final variants = controller.variantFileCount;
     final enriched = controller.enrichedCount;
     final missing = controller.missingCount;
+    final moved = controller.movedCount;
     final reviewed = controller.reviewedSongCount;
     final unreviewed = controller.unreviewedSongCount;
     return Row(
@@ -277,9 +279,32 @@ class _LibraryTally extends StatelessWidget {
             value: missing,
             warning: true,
             tooltip:
-                'Files that were on disk during a previous scan '
-                'but were not found on the last scan. Intelligence '
-                '(favorite, plays, reviews) is preserved.',
+                'Files that were on disk during a previous scan but '
+                'were not found on the last scan, with no successor '
+                'auto-detected. Intelligence (favorite, plays, '
+                'reviews) is preserved on the row even though the '
+                "file is gone. Click to review and purge.",
+            onTap: () => showReviewMissingDialog(
+              context: context,
+              controller: controller,
+            ),
+          ),
+        ],
+        if (moved > 0) ...[
+          const SizedBox(width: 12),
+          _TallyChunk(
+            label: 'moved',
+            value: moved,
+            tooltip:
+                'Files the scan detected as moved within their '
+                'source — a same-fingerprint file now lives at a '
+                'different path, so intel transferred and the old '
+                'path was retired. Click to review or purge the '
+                'retired rows.',
+            onTap: () => showReviewMissingDialog(
+              context: context,
+              controller: controller,
+            ),
           ),
         ],
         const SizedBox(width: 12),
@@ -310,11 +335,17 @@ class _TallyChunk extends StatelessWidget {
   final int value;
   final bool warning;
   final String? tooltip;
+  /// When non-null, the chunk renders as an InkWell and fires this
+  /// callback on tap. Used for the `missing` / `moved` chunks that
+  /// open the Review-missing dialog. Other chunks pass null and
+  /// remain non-interactive labels.
+  final VoidCallback? onTap;
   const _TallyChunk({
     required this.label,
     required this.value,
     this.warning = false,
     this.tooltip,
+    this.onTap,
   });
 
   @override
@@ -341,11 +372,26 @@ class _TallyChunk extends StatelessWidget {
         ),
       ],
     );
-    if (tooltip == null) return row;
+    Widget body = row;
+    if (onTap != null) {
+      body = Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          hoverColor: AppColors.hoverRow,
+          focusColor: AppColors.focusOverlay,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 1),
+            child: row,
+          ),
+        ),
+      );
+    }
+    if (tooltip == null) return body;
     return Tooltip(
       message: tooltip!,
       waitDuration: const Duration(milliseconds: 400),
-      child: row,
+      child: body,
     );
   }
 }

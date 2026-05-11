@@ -16,7 +16,7 @@ class AppDatabase {
   // v7 adds `sources.parent_source_id` + `sources.path_prefix` so a
   // folder picked inside an already-watched source becomes a virtual
   // "sub-view" instead of a duplicate scanning source.
-  static const _schemaVersion = 8;
+  static const _schemaVersion = 9;
 
   late final Database _db;
 
@@ -122,6 +122,7 @@ class AppDatabase {
         intel_uid TEXT,
         identity_override TEXT,
         is_available INTEGER NOT NULL DEFAULT 1,
+        availability_state TEXT NOT NULL DEFAULT 'available',
         last_seen_at INTEGER NOT NULL,
         title TEXT NOT NULL,
         artist TEXT NOT NULL DEFAULT '',
@@ -198,6 +199,41 @@ class AppDatabase {
     if (oldVersion < 8) {
       await _migrateV7toV8(db);
     }
+    if (oldVersion < 9) {
+      await _migrateV8toV9(db);
+    }
+  }
+
+  /// Add `indexed_files.availability_state` (TEXT) — a finer-grained
+  /// availability state machine than the boolean `is_available`.
+  /// Values: 'available' (file on disk), 'missing' (was indexed, gone
+  /// from disk, no successor known), 'superseded' (auto-detected as
+  /// moved — another row in the same source shares the fingerprint
+  /// and is available). Existing rows are backfilled: `is_available=0`
+  /// becomes 'missing', everything else 'available'.
+  /// Idempotent — safe to retry after a partial migration.
+  static Future<void> _migrateV8toV9(Database db) async {
+    debugPrint(
+      '[db] starting v8 → v9 migration (indexed_files.availability_state)',
+    );
+    final stopwatch = Stopwatch()..start();
+    final columns = await db.rawQuery('PRAGMA table_info(indexed_files)');
+    final hasState =
+        columns.any((c) => c['name'] == 'availability_state');
+    if (!hasState) {
+      await db.execute(
+        "ALTER TABLE indexed_files ADD COLUMN availability_state TEXT "
+        "NOT NULL DEFAULT 'available'",
+      );
+      // Backfill missing state from the legacy boolean.
+      await db.rawUpdate(
+        "UPDATE indexed_files SET availability_state = 'missing' "
+        "WHERE is_available = 0",
+      );
+    }
+    debugPrint(
+      '[db] v8 → v9 done in ${stopwatch.elapsedMilliseconds}ms.',
+    );
   }
 
   /// Add `indexed_files.identity_override` — a nullable user-set

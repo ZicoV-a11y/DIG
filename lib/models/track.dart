@@ -45,7 +45,18 @@ class Track {
   int modifiedAt;
 
   final String sourceId;
+  /// Legacy boolean kept for backward compatibility — derived from
+  /// [availability]. Most call-sites check `isAvailable`; the
+  /// state field carries the finer distinction.
   bool isAvailable;
+  /// Finer-grained availability state. `'available'` files are on
+  /// disk and play. `'missing'` files vanished from a scan with no
+  /// known replacement. `'superseded'` files were auto-detected as
+  /// moved — another row in the same source has the same
+  /// fingerprint and is available, so the intel transfers and the
+  /// old row is hidden from the main table but kept for the
+  /// "Review missing files" UI.
+  String availability;
   int lastSeenAt;
 
   // Displayable metadata (lightweight index — populated by extractor):
@@ -76,6 +87,7 @@ class Track {
     this.filesize = 0,
     this.modifiedAt = 0,
     this.isAvailable = true,
+    this.availability = 'available',
     this.lastSeenAt = 0,
     required this.title,
     this.artist = '',

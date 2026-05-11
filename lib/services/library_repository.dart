@@ -167,6 +167,7 @@ class LibraryRepository {
             'uid': ids.uid,
             'intel_uid': null,
             'is_available': 1,
+            'availability_state': 'available',
             'last_seen_at': now,
             'title': f.fallbackTitle,
           });
@@ -204,6 +205,7 @@ class LibraryRepository {
               'fingerprint': ids.fingerprint,
               'uid': ids.uid,
               'is_available': 1,
+            'availability_state': 'available',
               'last_seen_at': now,
             },
             where: 'path = ?',
@@ -377,18 +379,23 @@ class LibraryRepository {
     Set<String> seenPaths,
   ) async {
     await _db.transaction((txn) async {
-      // Pass 1: reset everything in this source to unavailable.
+      // Pass 1: reset everything in this source to missing. Both
+      // `is_available` (legacy boolean) and `availability_state`
+      // (richer state machine) move together: the state machine
+      // is the source of truth, `is_available` mirrors it for
+      // back-compat with code paths that haven't migrated yet.
       await txn.update(
         'indexed_files',
-        {'is_available': 0},
+        {
+          'is_available': 0,
+          'availability_state': 'missing',
+        },
         where: 'source_id = ?',
         whereArgs: [sourceId],
       );
       if (seenPaths.isEmpty) return;
 
-      // Pass 2: chunked update to set is_available=1 for all seen
-      // paths. Each chunk only flips its own slice — never touches
-      // the other chunks.
+      // Pass 2: chunked update to flip seen paths back to available.
       const chunkSize = 400;
       final list = seenPaths.toList(growable: false);
       for (var i = 0; i < list.length; i += chunkSize) {
@@ -396,12 +403,57 @@ class LibraryRepository {
         final slice = list.sublist(i, end);
         final placeholders = List.filled(slice.length, '?').join(',');
         await txn.rawUpdate(
-          'UPDATE indexed_files SET is_available = 1 '
-          'WHERE source_id = ? AND path IN ($placeholders)',
+          "UPDATE indexed_files SET is_available = 1, "
+          "availability_state = 'available' "
+          "WHERE source_id = ? AND path IN ($placeholders)",
           [sourceId, ...slice],
         );
       }
     });
+  }
+
+  /// Permanently remove `indexed_files` rows for the given paths.
+  /// Used by the "Review missing files" dialog's purge action when
+  /// the user is sure the row no longer represents a useful file
+  /// (truly deleted or moved out of scope and they don't want the
+  /// ghost lingering). `tracks` rows are not touched — intel
+  /// preservation guardrail #5 still applies; orphan intel survives
+  /// for the next time the file reconnects by fingerprint.
+  ///
+  /// Returns the number of rows deleted.
+  Future<int> purgeIndexedFiles(List<String> paths) async {
+    if (paths.isEmpty) return 0;
+    final placeholders = List.filled(paths.length, '?').join(',');
+    return await _db.delete(
+      'indexed_files',
+      where: 'path IN ($placeholders)',
+      whereArgs: paths,
+    );
+  }
+
+  /// Auto-detect "moved file" supersession after a scan: any row in
+  /// [sourceId] currently `availability_state = 'missing'` whose
+  /// fingerprint also appears on an `'available'` row in the same
+  /// source gets re-marked as `'superseded'`. The intel link via
+  /// fingerprint is already established by
+  /// `reconnectIntelligenceBySource`; this step's job is to tell
+  /// the UI which "missing" rows are actually moved (and should be
+  /// hidden by default) vs truly gone (and should still show in
+  /// the missing tally).
+  ///
+  /// Returns the number of rows upgraded from missing → superseded.
+  Future<int> markMovedSupersessions(String sourceId) async {
+    return await _db.rawUpdate(
+      "UPDATE indexed_files "
+      "SET availability_state = 'superseded' "
+      "WHERE source_id = ? "
+      "  AND availability_state = 'missing' "
+      "  AND fingerprint IN ("
+      "    SELECT fingerprint FROM indexed_files "
+      "    WHERE source_id = ? AND availability_state = 'available'"
+      "  )",
+      [sourceId, sourceId],
+    );
   }
 
   /// Number of indexed files (any availability) under [sourceId].
@@ -1044,6 +1096,8 @@ Track _trackFromJoinedRow(Map<String, Object?> r) {
     filesize: (r['filesize'] as int?) ?? 0,
     modifiedAt: (r['modified_at'] as int?) ?? 0,
     isAvailable: ((r['is_available'] as int?) ?? 1) != 0,
+    availability:
+        (r['availability_state'] as String?) ?? 'available',
     lastSeenAt: (r['last_seen_at'] as int?) ?? 0,
     title: r['title'] as String,
     artist: (r['artist'] as String?) ?? '',

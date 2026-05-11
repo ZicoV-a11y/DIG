@@ -209,6 +209,7 @@ class LibraryController extends ChangeNotifier {
   // `_libraryVersion` change.
   int? _enrichedCountCache;
   int? _missingCountCache;
+  int? _movedCountCache;
   int? _songCountCache;
   int? _reviewedSongCountCache;
   int _libraryStatsVersion = -1;
@@ -755,10 +756,49 @@ class LibraryController extends ChangeNotifier {
     return _enrichedCountCache ?? 0;
   }
 
-  /// Library-wide missing tally (`isAvailable == false`).
+  /// Library-wide missing tally — truly-gone files only. Auto-
+  /// detected moves are excluded (they live in `movedCount`).
   int get missingCount {
     _ensureLibraryStats();
     return _missingCountCache ?? 0;
+  }
+
+  /// Library-wide count of `superseded` rows — files the scan
+  /// detected as moved within their source (old DB path no longer
+  /// on disk, but a same-fingerprint file exists at a new path).
+  /// Surfaced separately from `missing` so the user can see "I
+  /// reorganised these" vs "these are actually gone".
+  int get movedCount {
+    _ensureLibraryStats();
+    return _movedCountCache ?? 0;
+  }
+
+  /// Snapshot of every track currently in the `missing` or
+  /// `superseded` state, regardless of source. The Review-missing
+  /// dialog reads this directly to populate its two sections.
+  /// Linear scan, called only when the dialog opens.
+  List<Track> get tracksNeedingReview {
+    return [
+      for (final t in _tracks)
+        if (t.availability == 'missing' || t.availability == 'superseded') t,
+    ];
+  }
+
+  /// Permanently delete `indexed_files` rows by path. Used by the
+  /// Review-missing dialog when the user confirms purge. Intel
+  /// rows in `tracks` survive (guardrail #5: never destroy user
+  /// work — the intel reconnects on fingerprint match if the file
+  /// ever returns).
+  Future<void> purgeMissingTracks(List<String> paths) async {
+    if (paths.isEmpty) return;
+    await repo.purgeIndexedFiles(paths);
+    // Reload — bulk delete is easier to express than incremental
+    // in-memory pruning, and this only fires from the dialog
+    // (rare user action), not during normal browsing.
+    final allTracks = await repo.loadTracks();
+    _replaceTracks(allTracks);
+    _markLibraryDirty();
+    notifyListeners();
   }
 
   /// Distinct song-identity count — same buckets the variant
@@ -795,6 +835,7 @@ class LibraryController extends ChangeNotifier {
     if (_libraryStatsVersion == _dataVersion) return;
     var enriched = 0;
     var missing = 0;
+    var moved = 0;
     // Song-identity bucketing in the same pass. Tracks with empty
     // title/artist (songIdentityKey returns null) can't bucket and
     // each count as a singleton song. Other tracks are deduped by
@@ -804,7 +845,16 @@ class LibraryController extends ChangeNotifier {
     final reviewedByBucket = <String, bool>{};
     for (final t in _tracks) {
       if (t.metadataReadAt != null) enriched++;
-      if (!t.isAvailable) missing++;
+      // Split the legacy "missing" tally into truly-gone vs
+      // moved-within-source so the status bar can show them
+      // separately. Pre-migration rows that haven't been re-scanned
+      // since v9 may still show as `missing` even when they're
+      // moved — they'll re-classify next scan.
+      if (t.availability == 'missing') {
+        missing++;
+      } else if (t.availability == 'superseded') {
+        moved++;
+      }
       final key = songIdentityKey(t);
       if (key == null) {
         singletonSongs++;
@@ -824,6 +874,7 @@ class LibraryController extends ChangeNotifier {
     }
     _enrichedCountCache = enriched;
     _missingCountCache = missing;
+    _movedCountCache = moved;
     _songCountCache = singletonSongs + reviewedByBucket.length;
     _reviewedSongCountCache = singletonReviewed + reviewedBucketed;
     _libraryStatsVersion = _dataVersion;
@@ -1699,6 +1750,21 @@ class LibraryController extends ChangeNotifier {
         source.id,
         {for (final e in entries) e.path},
       );
+
+      // Auto-detect moved files: any row left in `missing` state
+      // whose fingerprint matches an `available` row in the same
+      // source is almost certainly a file the user moved within
+      // the source. Upgrade those rows to `superseded` so they
+      // drop out of the "missing" tally and out of the table —
+      // but stay around for the Review-missing dialog.
+      final supersededCount =
+          await repo.markMovedSupersessions(source.id);
+      if (supersededCount > 0) {
+        debugPrint(
+          '[scan] ${source.displayName}: $supersededCount moved '
+          'file(s) auto-detected via fingerprint match',
+        );
+      }
 
       // Re-link any new indexed_files row to its existing tracks
       // row by fingerprint. This is what makes "remove → re-add"

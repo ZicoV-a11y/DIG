@@ -408,6 +408,23 @@ class LibraryController extends ChangeNotifier {
         if (host.isNotEmpty) _machineId = host;
       } catch (_) {/* keep default */}
     }
+    // Sync the filesystem-level identity (`machine_id.txt`) with
+    // the DB setting. The bootstrap reads `machine_id.txt` BEFORE
+    // opening the DB (so boot routing doesn't depend on DB
+    // introspection), but after hydrate we know what the user
+    // wants; mirror it to the filesystem so next boot uses the
+    // current setting. Idempotent — writing the same value is a
+    // no-op effect.
+    final root = libraryRoot;
+    if (root != null) {
+      try {
+        await root.writeMachineId(_machineId);
+      } catch (e) {
+        debugPrint(
+          '[hydrate] failed to sync machine_id.txt: $e',
+        );
+      }
+    }
     final savedAutosaveEnabled = settings['autosave_enabled'];
     if (savedAutosaveEnabled != null) {
       _autosaveEnabled = savedAutosaveEnabled != '0';
@@ -546,12 +563,12 @@ class LibraryController extends ChangeNotifier {
     final mgr = saveManager;
     final root = libraryRoot;
     if (mgr == null || root == null) return;
-    final dbFile = File(root.currentDbPath);
+    final dbFile = File(root.deviceLiveDbPath(_machineId));
     if (!dbFile.existsSync()) return;
     final mtime = dbFile.statSync().modified;
     if (_lastSnapshotDbMtime != null &&
         !mtime.isAfter(_lastSnapshotDbMtime!)) {
-      // DB unchanged since the last snapshot — nothing to save.
+      // Live DB unchanged since the last snapshot — nothing to save.
       return;
     }
     await _snapshotNow();
@@ -562,39 +579,40 @@ class LibraryController extends ChangeNotifier {
   /// point at a meaningful moment even if the tick hasn't fired.
   /// No-op when `saveManager` is null.
   ///
-  /// Two writes per call:
+  /// Two writes per call (post 2026-05-12 boot transition):
   ///   1. Rolling timestamped snapshot in `Saves/` — historical
-  ///      lineage / crash recovery / rollback (still the primary
-  ///      durability guarantee).
-  ///   2. Always-overwritten device channel at
-  ///      `Systems/{MACHINE_ID}.library` — this device's
-  ///      operational truth, latest only. Not yet authoritative
-  ///      for startup; the resolver + boot switchover ship in a
-  ///      later slice. A failure here is logged but doesn't abort
-  ///      the call: the Saves/ snapshot is what matters for
-  ///      recovery, the Systems/ mirror is parallel validation.
+  ///      lineage / crash recovery / rollback. Source is the live
+  ///      device DB at `Systems/{MACHINE}.library`.
+  ///   2. Compatibility mirror to `Current/CURRENT.library` — keeps
+  ///      a stable filename for manual Finder-swap rollback and
+  ///      external inspection. Transitional; long-term fate of
+  ///      Current/ is deferred. A failure here is logged but
+  ///      doesn't abort the call: the Saves/ snapshot is the
+  ///      primary durability guarantee.
   Future<void> _snapshotNow() async {
     final mgr = saveManager;
     final root = libraryRoot;
     if (mgr == null || root == null) return;
+    final liveDbPath = root.deviceLiveDbPath(_machineId);
     try {
       final file = await mgr.snapshot(
         libraryName: _libraryName,
         machineId: _machineId,
+        sourceDbPath: liveDbPath,
       );
       if (file != null) {
-        _lastSnapshotDbMtime = File(root.currentDbPath).statSync().modified;
+        _lastSnapshotDbMtime = File(liveDbPath).statSync().modified;
       }
     } catch (e) {
       debugPrint('[autosave] snapshot failed: $e');
     }
     try {
-      await mgr.writeDeviceChannel(
+      await mgr.mirrorToCurrent(
         libraryName: _libraryName,
         machineId: _machineId,
       );
     } catch (e) {
-      debugPrint('[autosave] device channel write failed: $e');
+      debugPrint('[autosave] compatibility mirror failed: $e');
     }
   }
 

@@ -18,16 +18,25 @@ Future<void> main() async {
   await root.ensureLayout();
   final saveManager = LibrarySaveManager(root: root);
 
-  // Copy-first migration from the legacy Application Support DB.
-  // Runs only when Current/CURRENT.library doesn't exist yet,
-  // never mutates the legacy file in place (per project decision
-  // — legacy file stays as an emergency fallback until the user
-  // deletes it manually). If Current/ is missing but Saves/ has
-  // files, fall through to restore-newest instead.
-  await _bootstrapCurrentDb(root: root, saveManager: saveManager);
+  // Filesystem-level device identity. Resolved BEFORE any SQLite
+  // open so the bootstrap doesn't depend on reading the DB to
+  // decide which DB to open — otherwise Current/ remains secretly
+  // authoritative (see §1c Core Architectural Principles in
+  // `project_library_knowledge_graph_direction.md`).
+  final machineId = await root.readMachineId();
+  final liveDbPath = root.deviceLiveDbPath(machineId);
+
+  // Locate / migrate / bootstrap the live device DB at
+  // `Systems/{machine_id}.library`. After this returns, the live
+  // file is in place ready for sqflite to open.
+  await _bootstrapLiveDb(
+    root: root,
+    saveManager: saveManager,
+    liveDbPath: liveDbPath,
+  );
 
   final db = AppDatabase();
-  await db.open(dbPath: root.currentDbPath);
+  await db.open(dbPath: liveDbPath);
   final repo = LibraryRepository(db);
   final engine = PlaybackEngine();
   final controller = LibraryController(
@@ -46,49 +55,79 @@ Future<LibraryRoot> _resolveLibraryRoot() async {
   return LibraryRoot('${docs.path}/Music Tracker');
 }
 
-Future<void> _bootstrapCurrentDb({
+Future<void> _bootstrapLiveDb({
   required LibraryRoot root,
   required LibrarySaveManager saveManager,
+  required String liveDbPath,
 }) async {
-  final currentDb = File(root.currentDbPath);
-  if (currentDb.existsSync()) return;
+  final liveDb = File(liveDbPath);
 
-  // Priority 0: one-shot rename from the prior canonical name
-  // (`Current/db.sqlite`) to the new one (`Current/CURRENT.library`).
-  // Anyone who picked up the LibraryRoot commit before this rename
-  // has the live DB sitting at `db.sqlite`. The same SQLite bytes
-  // are valid under any filename, so an in-place rename is enough
-  // — no copy, no schema migration, no risk to the data. Guarded
-  // against the both-present edge case (shouldn't happen, but if
-  // it does, leave both alone so the user can investigate).
-  final priorCurrent = File('${root.currentDir}/db.sqlite');
-  if (priorCurrent.existsSync()) {
+  // Priority 0: live DB already exists — most common case once
+  // the boot transition has taken effect. Operational continuity
+  // outranks any other consideration; Systems/ wins.
+  if (liveDb.existsSync()) {
+    debugPrint('[bootstrap] live DB present at $liveDbPath — opening directly');
+    return;
+  }
+
+  // Priority 1: one-shot migration from `Current/CURRENT.library`.
+  // First launch after the boot-transition slice — the existing
+  // live DB is at Current/CURRENT.library (where it lived before
+  // this slice flipped authority to Systems/). Copy (NOT move)
+  // into Systems/ so Current/ stays as the compatibility mirror
+  // per the transition safety contract.
+  final currentDb = File(root.currentDbPath);
+  if (currentDb.existsSync()) {
     try {
-      await Directory(root.currentDir).create(recursive: true);
-      await priorCurrent.rename(root.currentDbPath);
+      await Directory(root.systemsDir).create(recursive: true);
+      await currentDb.copy(liveDbPath);
       debugPrint(
-        '[bootstrap] renamed Current/db.sqlite → Current/CURRENT.library',
+        '[bootstrap] migrated Current/CURRENT.library → $liveDbPath '
+        '(Current/ preserved as compatibility mirror)',
       );
       return;
     } catch (e) {
       debugPrint(
-        '[bootstrap] rename db.sqlite → CURRENT.library failed: $e '
-        '— falling through to legacy / snapshot restore',
+        '[bootstrap] Current/ → Systems/ migration failed: $e '
+        '— falling through',
       );
     }
   }
 
-  // Priority 1: copy-first migration from the legacy Application
-  // Support DB. The user already has 12k+ tracks there; first
-  // launch with the new code should land them on the same data
-  // inside the new layout without any prompt.
+  // Priority 2: in-place rename of prior `Current/db.sqlite`
+  // (legacy filename from before the CURRENT.library naming
+  // unification). Same SQLite bytes are valid under any name;
+  // rename + copy to Systems/.
+  final priorCurrent = File('${root.currentDir}/db.sqlite');
+  if (priorCurrent.existsSync()) {
+    try {
+      await Directory(root.systemsDir).create(recursive: true);
+      await priorCurrent.copy(liveDbPath);
+      // Also rename to CURRENT.library so the compatibility
+      // mirror has the right filename for future swaps.
+      try {
+        await priorCurrent.rename(root.currentDbPath);
+      } catch (_) {/* best-effort */}
+      debugPrint(
+        '[bootstrap] migrated legacy Current/db.sqlite → $liveDbPath',
+      );
+      return;
+    } catch (e) {
+      debugPrint('[bootstrap] db.sqlite migration failed: $e — falling through');
+    }
+  }
+
+  // Priority 3: copy-first migration from the legacy macOS
+  // Application Support DB. First launch on a machine that had
+  // the app before LibraryRoot existed at all. Legacy file stays
+  // as emergency fallback until the user deletes it manually.
   final legacyDb = await _legacyDbFile();
   if (legacyDb != null && legacyDb.existsSync()) {
     try {
-      await Directory(root.currentDir).create(recursive: true);
-      await legacyDb.copy(root.currentDbPath);
+      await Directory(root.systemsDir).create(recursive: true);
+      await legacyDb.copy(liveDbPath);
       debugPrint(
-        '[bootstrap] copied legacy DB → ${root.currentDbPath} '
+        '[bootstrap] copied legacy DB → $liveDbPath '
         '(legacy file preserved at ${legacyDb.path})',
       );
       return;
@@ -97,22 +136,28 @@ Future<void> _bootstrapCurrentDb({
     }
   }
 
-  // Priority 2: restore from the newest snapshot in Saves/.
-  // Happens after a clean install on a machine where the user
-  // dropped saves into the library root manually (or after the
-  // user deleted Current/CURRENT.library intentionally to roll
-  // back).
-  final restored = await saveManager.restoreFromNewest();
-  if (restored != null) {
-    debugPrint(
-      '[bootstrap] restored newest snapshot ${restored.filename}',
-    );
-    return;
+  // Priority 4: restore from the newest snapshot in Saves/.
+  // Clean install on a machine where the user dropped saves into
+  // the library root manually, or deleted both the live + mirror
+  // files to roll back.
+  final newest = await saveManager.newestSnapshot();
+  if (newest != null) {
+    try {
+      final src = File('${root.savesDir}/${newest.filename}');
+      await Directory(root.systemsDir).create(recursive: true);
+      await src.copy(liveDbPath);
+      debugPrint(
+        '[bootstrap] restored newest snapshot ${newest.filename} → $liveDbPath',
+      );
+      return;
+    } catch (e) {
+      debugPrint('[bootstrap] snapshot restore failed: $e — falling through');
+    }
   }
 
-  // Otherwise leave Current/ empty — AppDatabase.open will create
-  // a fresh DB at that path with the latest schema.
-  debugPrint('[bootstrap] fresh DB will be created at ${root.currentDbPath}');
+  // Otherwise leave the Systems/ path empty — AppDatabase.open
+  // will create a fresh DB at that path with the latest schema.
+  debugPrint('[bootstrap] fresh DB will be created at $liveDbPath');
 }
 
 /// Path to the macOS Application Support DB used before the

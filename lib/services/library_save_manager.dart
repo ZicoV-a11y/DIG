@@ -15,12 +15,13 @@ class LibraryRoot {
 
   const LibraryRoot(this.path);
 
-  /// Live working DB lives here. The app reads/writes from this
-  /// file. Snapshots in `Saves/` are immutable copies of it.
-  /// Filename intentionally matches the `.library` extension used
-  /// by snapshots — one canonical live identity per library, same
-  /// container format, so the user opening the folder in Finder
-  /// sees one consistent naming convention.
+  /// Compatibility-mirror DB path. After the 2026-05-12 boot
+  /// transition, the live working DB lives at [deviceLiveDbPath]
+  /// (Systems/{MACHINE}.library); `Current/CURRENT.library` is
+  /// kept as a transitional mirror so manual rollback / external
+  /// inspection / paranoia recovery still have a stable
+  /// filename. Long-term fate (keep / cache / remove) is
+  /// deliberately deferred — see `feedback_save_trust_cycle.md`.
   String get currentDbPath => '$path/Current/CURRENT.library';
 
   String get currentDir => '$path/Current';
@@ -28,11 +29,88 @@ class LibraryRoot {
   String get cacheDir => '$path/Cache';
   String get logsDir => '$path/Logs';
 
-  /// Per-device state channel files (`{MACHINE_ID}.library`).
-  /// Each device writes ONE always-overwritten file here per
-  /// autosave — the operational truth for that device. Saves/
-  /// holds the rolling lineage; Systems/ holds latest-only state.
+  /// Per-device contribution channel files
+  /// (`{MACHINE_ID}.library`). As of the 2026-05-12 boot transition
+  /// this IS the live DB the running app opens — sqflite writes
+  /// here directly. One file per device, always overwritten, no
+  /// rolling history at this layer (Saves/ holds the lineage).
+  ///
+  /// Critical framing: each `{MACHINE_ID}.library` is a CONTRIBUTION
+  /// SOURCE — this device's perspective on the user's library — NOT
+  /// the ultimate library authority. Single-device today means
+  /// contribution ≈ global, but the conceptual distinction is
+  /// preserved so future resolver / composed-graph work
+  /// (§1a + §1b of `project_library_knowledge_graph_direction.md`)
+  /// can compose authority from multiple contributions without
+  /// re-litigating the model.
   String get systemsDir => '$path/Systems';
+
+  /// Per-device live DB path. Resolves to
+  /// `Systems/{sanitised(machineId)}.library`. Sanitisation shared
+  /// with the Saves/ filename builder via
+  /// [SaveSnapshot.sanitiseFilesystemLabel] so a single source of
+  /// truth governs both filenames.
+  String deviceLiveDbPath(String machineId) {
+    final mach = SaveSnapshot.sanitiseFilesystemLabel(
+      machineId,
+      emptyFallback: 'MACHINE',
+    );
+    return '$systemsDir/$mach.library';
+  }
+
+  /// Filesystem-level device identity. Read BEFORE any SQLite
+  /// open so the bootstrap doesn't need to open a DB to decide
+  /// which DB to open (the chicken-and-egg that would keep
+  /// `Current/` secretly authoritative). Plain text file, one
+  /// line, sanitised on write — inspectable, editable, manually
+  /// operable in Finder. The DB still mirrors `machine_id` in
+  /// `app_settings` for UI / metadata / save naming, but the
+  /// filesystem file is the source of truth for boot routing.
+  String get machineIdFilePath => '$path/machine_id.txt';
+
+  /// Read the device's filesystem-level machine identity. Reads
+  /// `machine_id.txt` if present; otherwise falls back to
+  /// `Platform.localHostname` sanitised. Returns a non-empty
+  /// filesystem-safe string suitable for direct interpolation
+  /// into [deviceLiveDbPath].
+  Future<String> readMachineId() async {
+    final file = File(machineIdFilePath);
+    if (file.existsSync()) {
+      try {
+        final raw = (await file.readAsString()).trim();
+        if (raw.isNotEmpty) {
+          return SaveSnapshot.sanitiseFilesystemLabel(
+            raw,
+            emptyFallback: 'MACHINE',
+          );
+        }
+      } catch (e) {
+        debugPrint('[libroot] failed to read $machineIdFilePath: $e');
+      }
+    }
+    String host = '';
+    try {
+      host = Platform.localHostname;
+    } catch (_) {/* keep empty, falls through to MACHINE */}
+    return SaveSnapshot.sanitiseFilesystemLabel(
+      host,
+      emptyFallback: 'MACHINE',
+    );
+  }
+
+  /// Write the device's filesystem-level machine identity to
+  /// `machine_id.txt`. Sanitises the value before persisting so
+  /// the on-disk filename matches what [readMachineId] will
+  /// return later. Idempotent — re-writing the same value is a
+  /// no-op effect on the boot path.
+  Future<void> writeMachineId(String machineId) async {
+    final sanitised = SaveSnapshot.sanitiseFilesystemLabel(
+      machineId,
+      emptyFallback: 'MACHINE',
+    );
+    await Directory(path).create(recursive: true);
+    await File(machineIdFilePath).writeAsString('$sanitised\n');
+  }
 
   /// Reserved for cross-device library exchange — timestamped
   /// per-device files from multiple machines so the eventual
@@ -81,19 +159,27 @@ class LibrarySaveManager {
 
   LibrarySaveManager({required this.root, this.maxSnapshots = 20});
 
-  /// Capture the current DB to a new `.library` file. Returns the
-  /// snapshot's path. Prunes older snapshots beyond [maxSnapshots]
-  /// after a successful write. If the DB doesn't exist yet (fresh
-  /// install before any data) the call is a no-op and returns null.
+  /// Capture the live DB to a new `.library` file in `Saves/`.
+  /// Returns the snapshot's path. Prunes older snapshots beyond
+  /// [maxSnapshots] after a successful write. If the live DB
+  /// doesn't exist yet (fresh install before any data) the call is
+  /// a no-op and returns null.
+  ///
+  /// [sourceDbPath] is the path to the running app's live SQLite
+  /// file. After the 2026-05-12 boot transition this is
+  /// `root.deviceLiveDbPath(machineId)` (Systems/{MACHINE}.library);
+  /// the parameter is explicit so the snapshot method has zero
+  /// hardcoded assumption about where "live" lives.
   Future<File?> snapshot({
     required String libraryName,
     required String machineId,
+    required String sourceDbPath,
     DateTime? at,
   }) async {
-    final dbFile = File(root.currentDbPath);
+    final dbFile = File(sourceDbPath);
     if (!dbFile.existsSync()) {
       debugPrint(
-        '[save] no Current/CURRENT.library yet — snapshot skipped',
+        '[save] no live DB at $sourceDbPath yet — snapshot skipped',
       );
       return null;
     }
@@ -125,52 +211,47 @@ class LibrarySaveManager {
     return created;
   }
 
-  /// Overwrite this device's operational state file at
-  /// `Systems/{sanitised(machineId)}.library` with the current
-  /// DB bytes. Returns the resulting File, or `null` when
-  /// `Current/CURRENT.library` doesn't exist yet (same no-op
-  /// semantics as [snapshot]).
+  /// Mirror the live `Systems/{MACHINE}.library` file to
+  /// `Current/CURRENT.library` for backward-compatible rollback.
+  /// Returns the destination File, or `null` when the live device
+  /// file doesn't exist yet (same no-op semantics as [snapshot]).
   ///
-  /// Unlike [snapshot] there is no rolling history at this layer —
-  /// one file per device, latest only. The Saves/ snapshot taken
-  /// in the same tick is the rollback / recovery surface; this
-  /// file is the operational truth, eventually authoritative for
-  /// startup once the resolver lands.
+  /// Reversed direction from the original `writeDeviceChannel` —
+  /// after the 2026-05-12 boot transition, `Systems/` is the live
+  /// DB that sqflite opens and writes to directly, and `Current/`
+  /// is a compatibility mirror so manual Finder-swap rollback and
+  /// external inspection still have a stable filename. Long-term
+  /// fate of `Current/` (keep / cache / remove) is deferred.
   ///
   /// [libraryName] is accepted for API symmetry with [snapshot]
-  /// even though it isn't part of the filename — keeps both write
-  /// paths interchangeable from the caller's POV and leaves room
-  /// to embed library identity into a future file header if
-  /// needed.
-  Future<File?> writeDeviceChannel({
+  /// even though it isn't part of the filename — leaves room for
+  /// future library-identity metadata.
+  Future<File?> mirrorToCurrent({
     required String libraryName,
     required String machineId,
   }) async {
-    final dbFile = File(root.currentDbPath);
-    if (!dbFile.existsSync()) {
+    final sourcePath = root.deviceLiveDbPath(machineId);
+    final sourceFile = File(sourcePath);
+    if (!sourceFile.existsSync()) {
       debugPrint(
-        '[save] no Current/CURRENT.library yet — '
-        'device channel write skipped',
+        '[save] no live device file at $sourcePath yet — '
+        'mirror skipped',
       );
       return null;
     }
-    final sanitised = SaveSnapshot.sanitiseFilesystemLabel(
-      machineId,
-      emptyFallback: 'MACHINE',
-    );
-    final destPath = '${root.systemsDir}/$sanitised.library';
-    await Directory(root.systemsDir).create(recursive: true);
+    final destPath = root.currentDbPath;
+    await Directory(root.currentDir).create(recursive: true);
     // Copy through `.partial` then rename for atomicity. A
     // half-baked write must never leave a corrupt
-    // Systems/{device}.library that a future startup resolver
-    // could read as authoritative state.
+    // Current/CURRENT.library that a manual rollback would
+    // restore from.
     final tmp = File('$destPath.partial');
     try {
-      await dbFile.copy(tmp.path);
+      await sourceFile.copy(tmp.path);
       // Dart's File.rename on macOS atomically replaces an
       // existing destination — same semantics as POSIX rename(2)
-      // — so the prior device-channel file goes away in the same
-      // syscall, not in a separate delete step that could race.
+      // — so the prior mirror file goes away in the same syscall,
+      // not in a separate delete step that could race.
       await tmp.rename(destPath);
     } catch (e) {
       if (tmp.existsSync()) {
@@ -181,7 +262,7 @@ class LibrarySaveManager {
       rethrow;
     }
     final created = File(destPath);
-    debugPrint('[save] wrote device channel ${created.path}');
+    debugPrint('[save] mirrored to ${created.path}');
     return created;
   }
 

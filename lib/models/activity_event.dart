@@ -57,6 +57,25 @@ abstract class EventType {
   /// at the song-identity layer rather than per-file. Payload:
   /// `{"dest_path": "/new/path", "dest_source_id": "..."}`.
   static const appInitiatedCopy = 'app_initiated_copy';
+
+  /// The file at this path has been modified by an external
+  /// process — Mp3tag/Rekordbox/Serato/Mixed In Key/etc rewrote
+  /// the tags, a DAW re-rendered an in-place export, the user
+  /// deliberately edited audio bytes. The system detects this
+  /// when a scan upsert finds an existing row whose stored
+  /// `content_hash` no longer matches the freshly-computed one
+  /// (path unchanged → same row, but bytes diverged).
+  ///
+  /// For v1 we record one event regardless of whether only tags
+  /// changed or actual audio bytes did — distinguishing the two
+  /// requires audio-content hashing, which is a future refinement.
+  /// What matters now: the row stays, intel survives, lifecycle
+  /// continues, but the audit trail captures the mutation so the
+  /// History panel can narrate it.
+  ///
+  /// Payload: `{"old_content_hash_prefix": "abc12345",
+  ///            "new_content_hash_prefix": "def67890"}`.
+  static const contentUpdatedExternal = 'content_updated_external';
 }
 
 /// Hydrated event row. Constructed by [LibraryRepository.loadRecentEvents]

@@ -446,6 +446,39 @@ class LibraryRepository {
         where: 'path = ?',
         whereArgs: [file.path],
       );
+
+      // External-mutation audit. If the row already had a real
+      // content_hash AND the freshly-computed one is different,
+      // some external process (tag editor, DAW re-render, the
+      // user's own bytes-on-disk edit) modified the file at this
+      // path. Same row, same intel, but the bytes diverged.
+      // Record one event so the History panel narrates the change
+      // instead of letting it happen silently.
+      //
+      // We intentionally do NOT fire this for backfills (null →
+      // hash) or for read-failure preservations (hash → null
+      // shielded → hash unchanged). Those are accounting
+      // transitions, not real mutations.
+      if (oldContentHash != null &&
+          newContentHash != null &&
+          oldContentHash != newContentHash) {
+        await recordEvent(
+          type: EventType.contentUpdatedExternal,
+          path: file.path,
+          sourceId: sourceId,
+          payload: {
+            'old_content_hash_prefix':
+                oldContentHash.length >= 12
+                    ? oldContentHash.substring(0, 12)
+                    : oldContentHash,
+            'new_content_hash_prefix':
+                newContentHash.length >= 12
+                    ? newContentHash.substring(0, 12)
+                    : newContentHash,
+          },
+          txn: txn,
+        );
+      }
     });
 
     return ids;

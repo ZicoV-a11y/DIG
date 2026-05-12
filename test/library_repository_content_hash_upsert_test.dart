@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:music_tracker/models/activity_event.dart';
 import 'package:music_tracker/services/content_hash.dart';
 import 'package:music_tracker/services/database.dart';
 import 'package:music_tracker/services/library_repository.dart';
@@ -305,6 +306,150 @@ void main() {
       expect(await contentHashAt(f.path), good,
           reason:
               'transient read failure must not overwrite a real hash with null');
+    });
+  });
+
+  group('upsert: content_updated_external audit event', () {
+    test(
+        'content_hash changes at existing path → records content_updated_external',
+        () async {
+      // Simulates the typical Mp3tag / Rekordbox tag-edit flow:
+      // file exists, gets upserted normally, then bytes change
+      // on disk (mtime bumps, content_hash recomputes to a new
+      // value), and the next scan upsert should leave an audit
+      // event so the History panel narrates the mutation.
+      final f = await writeFile('mut.mp3', 800 * 1024, seed: 71);
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fileFromDisk(f),
+        durationMs: 300000,
+      );
+      final firstHash = await contentHashAt(f.path);
+      expect(firstHash, isNotNull);
+
+      // Rewrite the file with different bytes — simulates a
+      // tag editor flipping ID3 fields in the head of the file.
+      final newF = await writeFile('mut.mp3', 800 * 1024, seed: 99);
+      final newStat = fileFromDisk(newF);
+      // Force the recompute branch by bumping mtime explicitly
+      // (writeAsBytes might or might not change the FS mtime
+      // observably within the same second).
+      final fakeScanned = ScannedFile(
+        path: newStat.path,
+        filename: newStat.filename,
+        filesize: newStat.filesize,
+        modifiedAt: newStat.modifiedAt + 60000,
+        fallbackTitle: 'T',
+      );
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fakeScanned,
+        durationMs: 300000,
+      );
+
+      final secondHash = await contentHashAt(f.path);
+      expect(secondHash, isNotNull);
+      expect(secondHash, isNot(equals(firstHash)),
+          reason: 'modified file → new content_hash');
+
+      final events = await repo.loadRecentEvents(
+        eventTypes: [EventType.contentUpdatedExternal],
+      );
+      expect(events, hasLength(1));
+      expect(events.first.path, f.path);
+      expect(events.first.payload['old_content_hash_prefix'],
+          firstHash!.substring(0, 12));
+      expect(events.first.payload['new_content_hash_prefix'],
+          secondHash!.substring(0, 12));
+    });
+
+    test('first hash population (null → hash) does NOT fire the event',
+        () async {
+      // Backfill scenario: pre-v10 row with NULL content_hash
+      // gets its first hash on next upsert. That's accounting,
+      // not an external mutation — must NOT log
+      // content_updated_external.
+      final f = await writeFile('backfill.mp3', 800 * 1024, seed: 73);
+      final st = f.statSync();
+      await raw.insert('indexed_files', {
+        'path': f.path,
+        'source_id': 'src1',
+        'filename': 'backfill.mp3',
+        'filesize': st.size,
+        'modified_at': st.modified.millisecondsSinceEpoch,
+        'duration_ms': 300000,
+        'fingerprint': 'fp-legacy',
+        'content_hash': null,
+        'uid': 'u-legacy',
+        'is_available': 1,
+        'last_seen_at': 0,
+        'title': 'T',
+      });
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fileFromDisk(f),
+        durationMs: 300000,
+      );
+      final events = await repo.loadRecentEvents(
+        eventTypes: [EventType.contentUpdatedExternal],
+      );
+      expect(events, isEmpty,
+          reason:
+              'first-time hash backfill must not be narrated as a mutation');
+    });
+
+    test('unchanged content_hash on rescan → no event', () async {
+      // Stable library, scan runs again: nothing changed about
+      // this file. The upsert reuse-branch preserves the hash
+      // and the audit log must stay quiet.
+      final f = await writeFile('stable.mp3', 800 * 1024, seed: 77);
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fileFromDisk(f),
+        durationMs: 300000,
+      );
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fileFromDisk(f),
+        durationMs: 300000,
+      );
+      final events = await repo.loadRecentEvents(
+        eventTypes: [EventType.contentUpdatedExternal],
+      );
+      expect(events, isEmpty);
+    });
+
+    test('transient read failure → preserved hash → no event', () async {
+      // Hash → null shielded → hash unchanged in DB. Must NOT
+      // narrate as a mutation, because the data didn't actually
+      // change — we just briefly couldn't read it.
+      final f = await writeFile('blip.mp3', 800 * 1024, seed: 79);
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fileFromDisk(f),
+        durationMs: 300000,
+      );
+      // Delete the file then upsert with a bumped mtime —
+      // computeContentHash returns null, upsert preserves the
+      // previously-good hash. Same hash → no event.
+      final scanned = fileFromDisk(f);
+      await f.delete();
+      final fakeScanned = ScannedFile(
+        path: scanned.path,
+        filename: scanned.filename,
+        filesize: scanned.filesize,
+        modifiedAt: scanned.modifiedAt + 60000,
+        fallbackTitle: 'T',
+      );
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fakeScanned,
+        durationMs: 300000,
+      );
+      final events = await repo.loadRecentEvents(
+        eventTypes: [EventType.contentUpdatedExternal],
+      );
+      expect(events, isEmpty);
     });
   });
 

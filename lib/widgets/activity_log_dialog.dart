@@ -365,6 +365,12 @@ _EventDescriptor _eventDescriptorFor(String type) {
         icon: Icons.link_rounded,
         iconColor: AppColors.accent,
       );
+    case EventType.contentUpdatedExternal:
+      return const _EventDescriptor(
+        label: 'Content updated externally',
+        icon: Icons.edit_note_rounded,
+        iconColor: AppColors.textSecondary,
+      );
     default:
       return _EventDescriptor(
         label: type,
@@ -395,6 +401,11 @@ String? _detailLineFor(ActivityEvent event) {
       final linked = event.payload['linked_to'] as String?;
       if (linked == null) return null;
       return 'linked to ${linked.split(Platform.pathSeparator).last}';
+    case EventType.contentUpdatedExternal:
+      final oldHash = event.payload['old_content_hash_prefix'] as String?;
+      final newHash = event.payload['new_content_hash_prefix'] as String?;
+      if (oldHash == null || newHash == null) return null;
+      return 'sha: $oldHash… → $newHash…';
     default:
       return null;
   }

@@ -22,15 +22,30 @@ class AppDatabase {
 
   Database get db => _db;
 
-  Future<void> open() async {
+  /// Open the database at [dbPath]. The caller is responsible for
+  /// ensuring the parent directory exists and for handling any
+  /// LibraryRoot-level migration (copy-first auto-migrate from the
+  /// legacy Application Support location lives in `main.dart`, not
+  /// here — keeps this class focused on schema concerns only).
+  ///
+  /// When [dbPath] is omitted, falls back to the legacy
+  /// Application Support location so tests and one-off tools keep
+  /// working. Production startup always passes a path.
+  Future<void> open({String? dbPath}) async {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
 
-    final dir = await getApplicationSupportDirectory();
-    final dbPath = '${dir.path}/music_tracker.db';
-    await _migrateFromSandboxedContainer(dbPath);
+    String path;
+    if (dbPath != null) {
+      path = dbPath;
+    } else {
+      final dir = await getApplicationSupportDirectory();
+      path = '${dir.path}/music_tracker.db';
+    }
+    await _migrateFromSandboxedContainer(path);
+    await Directory(path).parent.create(recursive: true);
     _db = await databaseFactory.openDatabase(
-      dbPath,
+      path,
       options: OpenDatabaseOptions(
         version: _schemaVersion,
         onConfigure: _onConfigure,

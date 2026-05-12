@@ -19,6 +19,7 @@ import '../services/content_hash.dart';
 import '../services/content_hash_backfill.dart';
 import '../services/intelligence_export.dart';
 import '../services/library_repository.dart';
+import '../services/library_save_manager.dart';
 import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
@@ -57,6 +58,14 @@ extension PlaybackModeView on PlaybackMode {
 class LibraryController extends ChangeNotifier {
   final PlaybackEngine engine;
   final LibraryRepository repo;
+  /// Owns the `Saves/` directory and the snapshot lifecycle. Null
+  /// in tests that don't exercise the save path — production
+  /// passes one from `main.dart`.
+  final LibrarySaveManager? saveManager;
+  /// Filesystem layout for this library — used by the controller
+  /// to address `Current/db.sqlite` for mtime checks before
+  /// snapshotting. Null in tests when `saveManager` is also null.
+  final LibraryRoot? libraryRoot;
   final Uuid _uuid = const Uuid();
 
   static const _recentBufferCapacity = 8;
@@ -289,7 +298,26 @@ class LibraryController extends ChangeNotifier {
 
   Timer? _flushTimer;
 
-  LibraryController({required this.engine, required this.repo}) {
+  // Save / autosave state — populated by [hydrate] from `app_settings`.
+  // Defaults are sensible-for-fresh-install; the user can override
+  // any of them later via settings.
+  String _libraryName = 'LIBRARY';
+  String _machineId = 'MACHINE';
+  bool _autosaveEnabled = true;
+  int _autosaveIntervalMinutes = 3;
+  Timer? _autosaveTimer;
+  /// mtime of `Current/db.sqlite` at the moment of the most recent
+  /// snapshot. The autosave tick reads the current mtime and skips
+  /// the snapshot if it hasn't advanced — cheap dirty-check that
+  /// avoids 20 identical files when nothing changed.
+  DateTime? _lastSnapshotDbMtime;
+
+  LibraryController({
+    required this.engine,
+    required this.repo,
+    this.saveManager,
+    this.libraryRoot,
+  }) {
     _backfillWorker = ContentHashBackfillWorker(
       repo,
       onProgress: _onBackfillProgress,
@@ -360,6 +388,35 @@ class LibraryController extends ChangeNotifier {
     final settings = await repo.loadSettings();
     _playThresholdSeconds =
         int.tryParse(settings['play_threshold_seconds'] ?? '') ?? 10;
+    // Save / autosave settings. Library name + machine ID default
+    // to sensible fresh-install values; the user can rename either
+    // later via settings (filename-sanitised at write time, so
+    // arbitrary input is safe).
+    final savedLibraryName = settings['library_name'];
+    if (savedLibraryName != null && savedLibraryName.isNotEmpty) {
+      _libraryName = savedLibraryName;
+    }
+    final savedMachineId = settings['machine_id'];
+    if (savedMachineId != null && savedMachineId.isNotEmpty) {
+      _machineId = savedMachineId;
+    } else {
+      // First-launch best-guess from hostname so saves are at
+      // least labelled with something machine-identifying instead
+      // of the literal "MACHINE". Users can override later.
+      try {
+        final host = Platform.localHostname;
+        if (host.isNotEmpty) _machineId = host;
+      } catch (_) {/* keep default */}
+    }
+    final savedAutosaveEnabled = settings['autosave_enabled'];
+    if (savedAutosaveEnabled != null) {
+      _autosaveEnabled = savedAutosaveEnabled != '0';
+    }
+    final savedAutosaveInterval =
+        int.tryParse(settings['autosave_interval_minutes'] ?? '');
+    if (savedAutosaveInterval != null && savedAutosaveInterval > 0) {
+      _autosaveIntervalMinutes = savedAutosaveInterval;
+    }
     final savedVolume = double.tryParse(settings['volume'] ?? '');
     if (savedVolume != null) {
       _volume = savedVolume.clamp(0.0, 1.0).toDouble();
@@ -462,6 +519,63 @@ class LibraryController extends ChangeNotifier {
     );
     // NO auto-enqueue. Untouched rows stay at filename-only until
     // the user scrolls/selects/plays them.
+
+    _startAutosaveTimer();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Save / autosave
+  // ---------------------------------------------------------------------------
+
+  /// Periodic dirty-check that snapshots `Current/db.sqlite` to
+  /// `Saves/` when the DB file has been written since the last
+  /// snapshot. Skipped entirely when `saveManager` is null (e.g.
+  /// in unit tests) or when the user disabled autosave.
+  void _startAutosaveTimer() {
+    _autosaveTimer?.cancel();
+    if (saveManager == null) return;
+    if (!_autosaveEnabled) return;
+    if (_autosaveIntervalMinutes <= 0) return;
+    _autosaveTimer = Timer.periodic(
+      Duration(minutes: _autosaveIntervalMinutes),
+      (_) => unawaited(_autosaveTick()),
+    );
+  }
+
+  Future<void> _autosaveTick() async {
+    final mgr = saveManager;
+    final root = libraryRoot;
+    if (mgr == null || root == null) return;
+    final dbFile = File(root.currentDbPath);
+    if (!dbFile.existsSync()) return;
+    final mtime = dbFile.statSync().modified;
+    if (_lastSnapshotDbMtime != null &&
+        !mtime.isAfter(_lastSnapshotDbMtime!)) {
+      // DB unchanged since the last snapshot — nothing to save.
+      return;
+    }
+    await _snapshotNow();
+  }
+
+  /// Take a snapshot right now, regardless of dirty state. Used by
+  /// lifecycle hooks (post-scan, on dispose) where we want a save
+  /// point at a meaningful moment even if the tick hasn't fired.
+  /// No-op when `saveManager` is null.
+  Future<void> _snapshotNow() async {
+    final mgr = saveManager;
+    final root = libraryRoot;
+    if (mgr == null || root == null) return;
+    try {
+      final file = await mgr.snapshot(
+        libraryName: _libraryName,
+        machineId: _machineId,
+      );
+      if (file != null) {
+        _lastSnapshotDbMtime = File(root.currentDbPath).statSync().modified;
+      }
+    } catch (e) {
+      debugPrint('[autosave] snapshot failed: $e');
+    }
   }
 
   /// The track table calls this with the paths currently on screen
@@ -2030,6 +2144,11 @@ class LibraryController extends ChangeNotifier {
       // unhashed.
       _backfillWorker.start();
       notifyListeners();
+      // Lifecycle save: a scan is a meaningful checkpoint — new
+      // rows, new content_hash, often new artwork/metadata. Save
+      // even if the autosave tick wouldn't fire for another few
+      // minutes so the user can roll back to "post-scan state".
+      unawaited(_snapshotNow());
     }
   }
 
@@ -3033,7 +3152,15 @@ class LibraryController extends ChangeNotifier {
   @override
   void dispose() {
     _flushTimer?.cancel();
+    _autosaveTimer?.cancel();
     _flushCurrentTrack();
+    // Final shutdown snapshot — fire-and-forget. App is exiting,
+    // so we can't await; sqflite's file is fully flushed by
+    // `_flushCurrentTrack` already, the copy below is just disk
+    // I/O. Worst case: app dies mid-copy and the snapshot is
+    // discarded (cleaned up by the next autosave tick on relaunch
+    // since `.partial` files don't match the filename format).
+    unawaited(_snapshotNow());
     _positionSub?.cancel();
     _playingSub?.cancel();
     _durationSub?.cancel();

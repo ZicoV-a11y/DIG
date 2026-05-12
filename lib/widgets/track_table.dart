@@ -684,6 +684,7 @@ Widget _buildRowInner(
             variants: (aggView != null && aggView.artistDivergent)
                 ? aggView.variants
                 : null,
+            isCurrent: isCurrent,
           ),
         ),
       );
@@ -1538,12 +1539,20 @@ class _TitleCellState extends State<_TitleCell> {
         _DivergenceMarker(badge: '$shown/$count'),
       ],
     );
-    // Whole-cell tap target so the user can cycle the title
-    // without having to hit the small marker icon. Per UX
-    // refinement (2026-05-11): "the toggle is going to the click
-    // of the cell." Behavior absorbs the tap so the row's
-    // click-to-play doesn't also fire — for divergent cells the
-    // primary action is "see the next variant's title."
+    // Two-stage tap semantics per UX refinement (2026-05-11):
+    // "the multiple clicks on the track after it's playing do
+    // nothing — so clicking after it's playing should change to
+    // alt metadata info."
+    //
+    //   First click on a non-current row → propagate to the
+    //   row's play handler (no GestureDetector intercept).
+    //   Subsequent clicks once the row IS the loaded track →
+    //   cycle through variant titles.
+    //
+    // So we only wrap in GestureDetector when isCurrent. Until
+    // then the tap falls through to the row → play kicks in →
+    // row becomes current → next click cycles.
+    if (!widget.isCurrent) return row;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: _cycle,
@@ -1676,7 +1685,17 @@ class _ArtistCell extends StatefulWidget {
   /// render of [track]'s artist.
   final List<Track>? variants;
 
-  const _ArtistCell({required this.track, this.variants});
+  /// Whether this row is the currently-loaded / playing track.
+  /// Two-stage tap rule (mirrors `_TitleCell`): cycle only fires
+  /// once the row is current; the first click on a non-current
+  /// row falls through to the row's play handler.
+  final bool isCurrent;
+
+  const _ArtistCell({
+    required this.track,
+    this.variants,
+    this.isCurrent = false,
+  });
 
   @override
   State<_ArtistCell> createState() => _ArtistCellState();
@@ -1731,6 +1750,11 @@ class _ArtistCellState extends State<_ArtistCell> {
         _DivergenceMarker(badge: '${_displayedIndex + 1}/$count'),
       ],
     );
+    // Two-stage tap: first click on a non-current row falls
+    // through to the row's play handler; subsequent clicks once
+    // the row IS current cycle through the variants. See
+    // _TitleCell for the full rationale.
+    if (!widget.isCurrent) return row;
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: _cycle,

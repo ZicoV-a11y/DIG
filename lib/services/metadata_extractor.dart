@@ -116,7 +116,16 @@ TrackMetadata _mapToTrackMetadata(String path, Object raw) {
 
   if (raw is Mp3Metadata) {
     title = raw.songName;
-    artist = raw.bandOrOrchestra ?? raw.leadPerformer ?? raw.originalArtist;
+    // TPE1 (leadPerformer) is what Mp3tag / Rekordbox / Serato /
+    // any user-facing "Artist" field writes to. TPE2
+    // (bandOrOrchestra) is the "Album Artist" slot — often empty,
+    // sometimes "Various" on compilations, sometimes a duplicate
+    // of TPE1. The old order preferred TPE2 first, which meant
+    // any stale TPE2 data silently overrode a fresh TPE1 edit:
+    // the user fixed their artist in Mp3tag, scan ran,
+    // re-enrichment ran, but the displayed artist stayed wrong
+    // because the parser kept reading the unedited TPE2.
+    artist = raw.leadPerformer ?? raw.bandOrOrchestra ?? raw.originalArtist;
     album = raw.album;
     genre = raw.genres.isNotEmpty ? raw.genres.first : null;
     bpm = double.tryParse(raw.bpm ?? '');

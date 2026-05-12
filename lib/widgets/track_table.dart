@@ -668,7 +668,9 @@ Widget _buildRowInner(
             showArtwork: showArtwork,
             titleColor: titleColor,
             titleWeight: titleWeight,
-            titleDivergent: aggView?.titleDivergent ?? false,
+            variants: (aggView != null && aggView.titleDivergent)
+                ? aggView.variants
+                : null,
           ),
         ),
       );
@@ -679,7 +681,9 @@ Widget _buildRowInner(
           alignment: Alignment.centerLeft,
           child: _ArtistCell(
             track: t,
-            divergent: aggView?.artistDivergent ?? false,
+            variants: (aggView != null && aggView.artistDivergent)
+                ? aggView.variants
+                : null,
           ),
         ),
       );
@@ -1458,7 +1462,7 @@ class _TrackRow extends StatelessWidget {
   }
 }
 
-class _TitleCell extends StatelessWidget {
+class _TitleCell extends StatefulWidget {
   final Track track;
   final bool isCurrent;
   final bool isLoading;
@@ -1466,13 +1470,16 @@ class _TitleCell extends StatelessWidget {
   final Color titleColor;
   final FontWeight titleWeight;
 
-  /// True when this row is the primary of a multi-variant bucket
-  /// whose variants disagree on the title field. Renders a small
-  /// divergence indicator after the title text. The reveal panel
-  /// (right-click → "Show variant metadata") surfaces the per-
-  /// variant breakdown; the indicator is just the at-a-glance
-  /// signal that something IS different.
-  final bool titleDivergent;
+  /// The full variant list of the bucket — passed only when the
+  /// bucket has multiple variants AND they disagree on title.
+  /// When provided, the cell becomes interactive: tapping the
+  /// divergence marker cycles `displayedIndex` through the
+  /// variants, swapping the rendered title in place. The user
+  /// can read each variant's title without leaving the table.
+  ///
+  /// `null` (or single-element list) → cell renders [track]'s
+  /// title once with no cycling affordance, as before.
+  final List<Track>? variants;
 
   const _TitleCell({
     required this.track,
@@ -1481,23 +1488,79 @@ class _TitleCell extends StatelessWidget {
     required this.showArtwork,
     required this.titleColor,
     required this.titleWeight,
-    this.titleDivergent = false,
+    this.variants,
   });
 
   @override
+  State<_TitleCell> createState() => _TitleCellState();
+}
+
+class _TitleCellState extends State<_TitleCell> {
+  int _displayedIndex = 0;
+
+  @override
+  void didUpdateWidget(covariant _TitleCell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // If the variant list shrank or its primary uid changed
+    // (e.g., a rescan re-bucketed), clamp the cycle index back
+    // into range so we don't dereference past the end.
+    final n = widget.variants?.length ?? 1;
+    if (_displayedIndex >= n) {
+      _displayedIndex = 0;
+    }
+  }
+
+  Track get _shownTrack {
+    final vs = widget.variants;
+    if (vs == null || vs.isEmpty) return widget.track;
+    return vs[_displayedIndex.clamp(0, vs.length - 1)];
+  }
+
+  void _cycle() {
+    final vs = widget.variants;
+    if (vs == null || vs.length < 2) return;
+    setState(() {
+      _displayedIndex = (_displayedIndex + 1) % vs.length;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final divergent = (widget.variants?.length ?? 1) > 1;
     final core = _buildCore();
-    if (!titleDivergent) return core;
-    return Row(
+    if (!divergent) return core;
+    final count = widget.variants!.length;
+    final shown = _displayedIndex + 1;
+    final row = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         Flexible(child: core),
-        const _DivergenceMarker(),
+        _DivergenceMarker(badge: '$shown/$count'),
       ],
+    );
+    // Whole-cell tap target so the user can cycle the title
+    // without having to hit the small marker icon. Per UX
+    // refinement (2026-05-11): "the toggle is going to the click
+    // of the cell." Behavior absorbs the tap so the row's
+    // click-to-play doesn't also fire — for divergent cells the
+    // primary action is "see the next variant's title."
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _cycle,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: row,
+      ),
     );
   }
 
   Widget _buildCore() {
+    final track = _shownTrack;
+    final isCurrent = widget.isCurrent;
+    final isLoading = widget.isLoading;
+    final showArtwork = widget.showArtwork;
+    final titleColor = widget.titleColor;
+    final titleWeight = widget.titleWeight;
     // Title text starts flush left so it lines up with the "TITLE"
     // header label — no leading EQ-glyph slot or padding inside the
     // cell itself. Album artwork (compact mode toggle) is the only
@@ -1603,14 +1666,49 @@ class _TitleCell extends StatelessWidget {
 /// artist text inline, append a small divergence marker when variants
 /// in the same bucket disagree on `displayArtist`. The reveal panel
 /// (sub-slice 2c) surfaces the per-variant values.
-class _ArtistCell extends StatelessWidget {
+class _ArtistCell extends StatefulWidget {
   final Track track;
-  final bool divergent;
 
-  const _ArtistCell({required this.track, this.divergent = false});
+  /// Full bucket-variant list passed only when the bucket has
+  /// multiple variants AND they disagree on artist. When provided,
+  /// the cell becomes interactive (cell-click cycles through each
+  /// variant's `displayArtist`). `null` / single-variant → static
+  /// render of [track]'s artist.
+  final List<Track>? variants;
+
+  const _ArtistCell({required this.track, this.variants});
+
+  @override
+  State<_ArtistCell> createState() => _ArtistCellState();
+}
+
+class _ArtistCellState extends State<_ArtistCell> {
+  int _displayedIndex = 0;
+
+  @override
+  void didUpdateWidget(covariant _ArtistCell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final n = widget.variants?.length ?? 1;
+    if (_displayedIndex >= n) _displayedIndex = 0;
+  }
+
+  Track get _shownTrack {
+    final vs = widget.variants;
+    if (vs == null || vs.isEmpty) return widget.track;
+    return vs[_displayedIndex.clamp(0, vs.length - 1)];
+  }
+
+  void _cycle() {
+    final vs = widget.variants;
+    if (vs == null || vs.length < 2) return;
+    setState(() {
+      _displayedIndex = (_displayedIndex + 1) % vs.length;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
+    final track = _shownTrack;
     final text = Text(
       track.displayArtist.isEmpty ? '—' : track.displayArtist,
       overflow: TextOverflow.ellipsis,
@@ -1623,38 +1721,69 @@ class _ArtistCell extends StatelessWidget {
         height: 1.0,
       ),
     );
+    final divergent = (widget.variants?.length ?? 1) > 1;
     if (!divergent) return text;
-    return Row(
+    final count = widget.variants!.length;
+    final row = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         Flexible(child: text),
-        const _DivergenceMarker(),
+        _DivergenceMarker(badge: '${_displayedIndex + 1}/$count'),
       ],
+    );
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _cycle,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: row,
+      ),
     );
   }
 }
 
 /// Small inline marker telling the user that two or more variants in
-/// the current bucket disagree on this cell's field. Visual hint only
-/// — the actual variant-by-variant breakdown lives in the reveal
-/// panel (sub-slice 2c). Tooltip hints at how to open it so the
-/// affordance isn't completely hidden.
+/// the current bucket disagree on this cell's field. When a [badge]
+/// is supplied (e.g., "1/2"), it shows the cycle position so the
+/// user can track which variant's value the cell is currently
+/// rendering. The cell that owns this marker is what handles the
+/// tap to cycle — the marker itself is visual.
 class _DivergenceMarker extends StatelessWidget {
-  const _DivergenceMarker();
+  final String? badge;
+
+  const _DivergenceMarker({this.badge});
 
   @override
   Widget build(BuildContext context) {
-    return const Padding(
-      padding: EdgeInsets.only(left: 6),
+    return Padding(
+      padding: const EdgeInsets.only(left: 6),
       child: Tooltip(
-        message:
-            'Variants disagree on this field — right-click → '
-            '"Show variant metadata" for the breakdown',
-        waitDuration: Duration(milliseconds: 400),
-        child: Icon(
-          Icons.warning_amber_rounded,
-          size: 11,
-          color: AppColors.favorite,
+        message: badge == null
+            ? 'Variants disagree on this field'
+            : 'Variants disagree on this field — click to cycle '
+                '(showing $badge)',
+        waitDuration: const Duration(milliseconds: 400),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.warning_amber_rounded,
+              size: 11,
+              color: AppColors.favorite,
+            ),
+            if (badge != null) ...[
+              const SizedBox(width: 3),
+              Text(
+                badge!,
+                style: const TextStyle(
+                  color: AppColors.favorite,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
+          ],
         ),
       ),
     );

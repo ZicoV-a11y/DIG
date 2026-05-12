@@ -172,41 +172,101 @@ class AggregatedTrackView {
     return best;
   }
 
-  /// Agreement → that value; one-present-one-blank → present value;
-  /// any disagreement → null (renders as `—`).
-  double? get bpm {
-    double? value;
-    var sawValue = false;
+  // ── Divergence + provenance ─────────────────────────────────
+  //
+  // Per project memory (variant divergence model, set 2026-05-11
+  // in conversation):
+  //
+  //   - title and artist participate in a "share-aware" model:
+  //     when variants disagree, the table cell renders a small
+  //     divergence indicator + the click-reveal panel surfaces
+  //     each variant's value. The cell itself shows the primary's
+  //     value so the row stays scannable.
+  //
+  //   - every OTHER displayable field (album, genre, BPM, key,
+  //     has_artwork) follows "last-change-wins": pick the value
+  //     from the variant whose `metadataReadAt` is freshest. The
+  //     bucket converges on whichever variant the user (or an
+  //     external tag editor) most recently edited.
+  //
+  //   - behavioural state (favorite, plays, last_played) is
+  //     already singular at the song-identity layer because the
+  //     bucket shares `intel_uid` — no divergence possible.
+
+  /// True when at least two variants disagree on `displayTitle`.
+  /// Drives the small divergence marker rendered in the title
+  /// cell + tells the right-click handler whether to offer
+  /// "Show variant metadata."
+  bool get titleDivergent {
+    String? first;
     for (final t in variants) {
-      final b = t.bpm;
-      if (b == null || b <= 0) continue;
-      if (!sawValue) {
-        value = b;
-        sawValue = true;
-      } else if (value != b) {
-        return null; // disagreement
-      }
+      final title = t.displayTitle;
+      if (title.isEmpty) continue;
+      first ??= title;
+      if (title != first) return true;
     }
-    return value;
+    return false;
   }
 
-  /// Normalized Camelot key with the same agreement / disagreement
-  /// rule as [bpm]. Returns empty string when variants disagree or
-  /// when no variant has a parseable key.
-  String get displayKey {
-    String? value;
-    var sawValue = false;
+  /// True when at least two variants disagree on `displayArtist`.
+  /// Same UX treatment as [titleDivergent] — marker + reveal.
+  bool get artistDivergent {
+    String? first;
     for (final t in variants) {
-      final k = normalizeKeyToCamelot(t.rawKey);
-      if (k == null || k.isEmpty) continue;
-      if (!sawValue) {
-        value = k;
-        sawValue = true;
-      } else if (value != k) {
-        return ''; // disagreement
+      final artist = t.displayArtist;
+      if (artist.isEmpty) continue;
+      first ??= artist;
+      if (artist != first) return true;
+    }
+    return false;
+  }
+
+  /// Variant the bucket consults for last-change-wins fields
+  /// (album / genre / BPM / key / has_artwork). Picks the variant
+  /// with the freshest `metadataReadAt`. Falls back to [primary]
+  /// when no variant has been enriched yet, so the row still has
+  /// something to render during the cold-start backfill.
+  Track get operationalMetadataSource {
+    Track? best;
+    DateTime? bestAt;
+    for (final t in variants) {
+      final at = t.metadataReadAt;
+      if (at == null) continue;
+      if (bestAt == null || at.isAfter(bestAt)) {
+        bestAt = at;
+        best = t;
       }
     }
-    return value ?? '';
+    return best ?? primary;
+  }
+
+  /// Last-change-wins: BPM from the variant with the freshest
+  /// `metadataReadAt` AND a non-zero BPM. If the operational-
+  /// metadata source has no BPM (the most-recently-enriched
+  /// variant happens to have a blank field), fall back to any
+  /// other variant that does — better to show a value than `—`
+  /// when the data exists somewhere in the bucket.
+  double? get bpm {
+    final ops = operationalMetadataSource.bpm;
+    if (ops != null && ops > 0) return ops;
+    for (final t in variants) {
+      final b = t.bpm;
+      if (b != null && b > 0) return b;
+    }
+    return null;
+  }
+
+  /// Normalized Camelot key, last-change-wins with the same
+  /// fallback rule as [bpm].
+  String get displayKey {
+    final opsKey =
+        normalizeKeyToCamelot(operationalMetadataSource.rawKey);
+    if (opsKey != null && opsKey.isNotEmpty) return opsKey;
+    for (final t in variants) {
+      final k = normalizeKeyToCamelot(t.rawKey);
+      if (k != null && k.isNotEmpty) return k;
+    }
+    return '';
   }
 
   /// `MP3 · AIFF` style label of the formats present in the bucket,

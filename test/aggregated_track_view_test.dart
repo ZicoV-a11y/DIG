@@ -13,6 +13,7 @@ Track _t({
   Duration cumulativeListened = Duration.zero,
   bool favorite = false,
   DateTime? lastPlayedAt,
+  DateTime? metadataReadAt,
   String? uid,
   String? identityOverride,
   String? fingerprint,
@@ -33,6 +34,7 @@ Track _t({
     cumulativeListened: cumulativeListened,
     favorite: favorite,
     lastPlayedAt: lastPlayedAt,
+    metadataReadAt: metadataReadAt,
   );
 }
 
@@ -134,7 +136,7 @@ void main() {
     });
   });
 
-  group('AggregatedTrackView — blank-on-disagreement (BPM)', () {
+  group('AggregatedTrackView — last-change-wins (BPM)', () {
     test('agreement passes the value through', () {
       final v = AggregatedTrackView([
         _t(filename: 'x.mp3', bpm: 125),
@@ -151,12 +153,39 @@ void main() {
       expect(v.bpm, 125);
     });
 
-    test('disagreement → null (blank)', () {
+    test(
+        'disagreement → freshest-enriched variant wins (last-change-wins)',
+        () {
+      // User refinement (2026-05-11): BPM no longer blanks on
+      // disagreement. Whichever variant was most recently
+      // re-enriched supplies the value. Lets the user "fix" a
+      // bucket's BPM by editing one variant's tag and trusting
+      // the bucket to converge on the new value.
+      final older = DateTime(2024, 1, 1);
+      final newer = DateTime(2024, 6, 1);
       final v = AggregatedTrackView([
-        _t(filename: 'x.mp3', bpm: 125),
-        _t(filename: 'x.aiff', bpm: 124),
+        _t(filename: 'x.mp3', bpm: 125, metadataReadAt: older),
+        _t(filename: 'x.aiff', bpm: 124, metadataReadAt: newer),
       ]);
-      expect(v.bpm, isNull);
+      expect(v.bpm, 124,
+          reason:
+              'freshest metadata_read_at (newer) supplies the BPM');
+    });
+
+    test(
+        'freshest variant has blank BPM → fallback to another variant with a value',
+        () {
+      // If the most-recently-enriched variant happens to have
+      // no BPM tag, fall back to a variant that does — better
+      // to show a value than `—` when the data exists somewhere
+      // in the bucket.
+      final older = DateTime(2024, 1, 1);
+      final newer = DateTime(2024, 6, 1);
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', bpm: 125, metadataReadAt: older),
+        _t(filename: 'x.aiff', bpm: null, metadataReadAt: newer),
+      ]);
+      expect(v.bpm, 125);
     });
 
     test('all blank → null', () {
@@ -176,7 +205,7 @@ void main() {
     });
   });
 
-  group('AggregatedTrackView — blank-on-disagreement (key)', () {
+  group('AggregatedTrackView — last-change-wins (key)', () {
     test('agreement on Camelot value', () {
       final v = AggregatedTrackView([
         _t(filename: 'x.mp3', musicalKey: 'Dm'), // 7A
@@ -193,14 +222,20 @@ void main() {
       expect(v.displayKey, '7A');
     });
 
-    test('disagreement → empty string (blank)', () {
-      // The A.C.N. — Warriors case from the user's screenshot:
-      // one variant tagged 1B, another tagged 10A → blank.
+    test('disagreement → freshest-enriched variant supplies the key',
+        () {
+      // The A.C.N. — Warriors case from earlier: one variant
+      // tagged 1B, another tagged 10A. Old behaviour blanked
+      // the cell; new behaviour picks the most-recently-enriched
+      // variant's value so the user's deliberate fix on one
+      // side propagates to the row display.
+      final older = DateTime(2024, 1, 1);
+      final newer = DateTime(2024, 6, 1);
       final v = AggregatedTrackView([
-        _t(filename: 'x.mp3', musicalKey: '1B'),
-        _t(filename: 'x.aiff', musicalKey: '10A'),
+        _t(filename: 'x.mp3', musicalKey: '1B', metadataReadAt: older),
+        _t(filename: 'x.aiff', musicalKey: '10A', metadataReadAt: newer),
       ]);
-      expect(v.displayKey, '');
+      expect(v.displayKey, '10A');
     });
 
     test('unparseable keys are treated as blank', () {
@@ -209,6 +244,65 @@ void main() {
         _t(filename: 'x.aiff', musicalKey: 'Dm'),
       ]);
       expect(v.displayKey, '7A');
+    });
+  });
+
+  group('AggregatedTrackView — divergence flags (title / artist)', () {
+    test('titleDivergent: identical titles → false', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', title: 'Song'),
+        _t(filename: 'x.aiff', title: 'Song'),
+      ]);
+      expect(v.titleDivergent, isFalse);
+      expect(v.artistDivergent, isFalse);
+    });
+
+    test('titleDivergent: differing titles → true', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', title: 'Song'),
+        _t(filename: 'x.aiff', title: 'Song test'),
+      ]);
+      expect(v.titleDivergent, isTrue);
+    });
+
+    test('artistDivergent: differing artists → true', () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', artist: 'Artist A'),
+        _t(filename: 'x.aiff', artist: 'Artist A & B'),
+      ]);
+      expect(v.artistDivergent, isTrue);
+    });
+
+    test(
+        'titleDivergent: one variant has empty title → not counted (only one real value)',
+        () {
+      // The empty-string check guards against treating a blank
+      // (un-enriched) variant as a divergence partner.
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3', title: 'Song'),
+        _t(filename: 'x.aiff', title: ''),
+      ]);
+      expect(v.titleDivergent, isFalse);
+    });
+
+    test(
+        'operationalMetadataSource: returns variant with freshest metadata_read_at',
+        () {
+      final older = DateTime(2024, 1, 1);
+      final newer = DateTime(2024, 6, 1);
+      final a = _t(filename: 'x.mp3', metadataReadAt: older);
+      final b = _t(filename: 'x.aiff', metadataReadAt: newer);
+      final v = AggregatedTrackView([a, b]);
+      expect(v.operationalMetadataSource.path, b.path);
+    });
+
+    test('operationalMetadataSource: no variant enriched → falls back to primary',
+        () {
+      final v = AggregatedTrackView([
+        _t(filename: 'x.mp3'),
+        _t(filename: 'x.aiff'),
+      ]);
+      expect(v.operationalMetadataSource.path, v.primary.path);
     });
   });
 

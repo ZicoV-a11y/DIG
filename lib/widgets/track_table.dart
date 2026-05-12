@@ -10,6 +10,7 @@ import '../utils/file_format.dart';
 import 'link_track_dialog.dart';
 import 'move_copy_dialog.dart';
 import 'track_artwork.dart';
+import 'variant_metadata_dialog.dart';
 
 class TrackTable extends StatefulWidget {
   final LibraryController controller;
@@ -667,6 +668,7 @@ Widget _buildRowInner(
             showArtwork: showArtwork,
             titleColor: titleColor,
             titleWeight: titleWeight,
+            titleDivergent: aggView?.titleDivergent ?? false,
           ),
         ),
       );
@@ -675,17 +677,9 @@ Widget _buildRowInner(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Align(
           alignment: Alignment.centerLeft,
-          child: Text(
-            t.displayArtist.isEmpty ? '—' : t.displayArtist,
-            overflow: TextOverflow.ellipsis,
-            maxLines: 1,
-            style: TextStyle(
-              color: t.displayArtist.isEmpty
-                  ? AppColors.textSecondary
-                  : AppColors.textPrimary,
-              fontSize: 12,
-              height: 1.0,
-            ),
+          child: _ArtistCell(
+            track: t,
+            divergent: aggView?.artistDivergent ?? false,
           ),
         ),
       );
@@ -922,6 +916,18 @@ class _TrackRow extends StatelessWidget {
     if (aggView != null && aggView.hasSiblings) {
       items.add(_unlinkMenuItem(variantCount: aggView.variantCount));
     }
+    // Show variant metadata: only meaningful when the bucket has
+    // multiple variants AND at least one diverging field. The
+    // dialog also surfaces last-change-wins values per variant,
+    // so even non-diverging buckets *could* benefit, but for v1
+    // we keep the menu uncluttered and only offer it when the
+    // user is likely to want forensic detail (i.e., divergence
+    // exists).
+    if (aggView != null &&
+        aggView.hasSiblings &&
+        (aggView.titleDivergent || aggView.artistDivergent)) {
+      items.add(_showVariantMetadataMenuItem());
+    }
     // Move/Copy entry — single item that opens a modal picker.
     // The old flat-list approach (one item per destination per
     // action) didn't scale past 3-4 sources; this single entry
@@ -986,6 +992,13 @@ class _TrackRow extends StatelessWidget {
       if (confirmed == true) {
         await controller.unlinkBucket(track);
       }
+    } else if (result == 'show-variant-metadata' && context.mounted) {
+      final view = controller.aggregatedViewForPrimary(track);
+      if (view == null || !view.hasSiblings) return;
+      await showVariantMetadataDialog(
+        context: context,
+        view: view,
+      );
     } else if (result == 'move-copy' && context.mounted) {
       // Open the modal picker. It owns the action toggle (Copy /
       // Move) and the destination checkbox list, and runs the
@@ -1164,6 +1177,31 @@ class _TrackRow extends StatelessWidget {
     return prevSep < 0
         ? parentPath
         : parentPath.substring(prevSep + 1);
+  }
+
+  PopupMenuItem<String> _showVariantMetadataMenuItem() {
+    return const PopupMenuItem<String>(
+      value: 'show-variant-metadata',
+      height: 32,
+      child: Row(
+        children: [
+          Icon(
+            Icons.compare_arrows_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'Show variant metadata…',
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   PopupMenuItem<String> _moveCopyMenuItem({
@@ -1428,6 +1466,14 @@ class _TitleCell extends StatelessWidget {
   final Color titleColor;
   final FontWeight titleWeight;
 
+  /// True when this row is the primary of a multi-variant bucket
+  /// whose variants disagree on the title field. Renders a small
+  /// divergence indicator after the title text. The reveal panel
+  /// (right-click → "Show variant metadata") surfaces the per-
+  /// variant breakdown; the indicator is just the at-a-glance
+  /// signal that something IS different.
+  final bool titleDivergent;
+
   const _TitleCell({
     required this.track,
     required this.isCurrent,
@@ -1435,10 +1481,23 @@ class _TitleCell extends StatelessWidget {
     required this.showArtwork,
     required this.titleColor,
     required this.titleWeight,
+    this.titleDivergent = false,
   });
 
   @override
   Widget build(BuildContext context) {
+    final core = _buildCore();
+    if (!titleDivergent) return core;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(child: core),
+        const _DivergenceMarker(),
+      ],
+    );
+  }
+
+  Widget _buildCore() {
     // Title text starts flush left so it lines up with the "TITLE"
     // header label — no leading EQ-glyph slot or padding inside the
     // cell itself. Album artwork (compact mode toggle) is the only
@@ -1535,6 +1594,68 @@ class _TitleCell extends StatelessWidget {
         fontSize: 13,
         fontWeight: titleWeight,
         height: 1.0,
+      ),
+    );
+  }
+}
+
+/// Artist column cell. Mirrors the title cell's pattern: render the
+/// artist text inline, append a small divergence marker when variants
+/// in the same bucket disagree on `displayArtist`. The reveal panel
+/// (sub-slice 2c) surfaces the per-variant values.
+class _ArtistCell extends StatelessWidget {
+  final Track track;
+  final bool divergent;
+
+  const _ArtistCell({required this.track, this.divergent = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Text(
+      track.displayArtist.isEmpty ? '—' : track.displayArtist,
+      overflow: TextOverflow.ellipsis,
+      maxLines: 1,
+      style: TextStyle(
+        color: track.displayArtist.isEmpty
+            ? AppColors.textSecondary
+            : AppColors.textPrimary,
+        fontSize: 12,
+        height: 1.0,
+      ),
+    );
+    if (!divergent) return text;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(child: text),
+        const _DivergenceMarker(),
+      ],
+    );
+  }
+}
+
+/// Small inline marker telling the user that two or more variants in
+/// the current bucket disagree on this cell's field. Visual hint only
+/// — the actual variant-by-variant breakdown lives in the reveal
+/// panel (sub-slice 2c). Tooltip hints at how to open it so the
+/// affordance isn't completely hidden.
+class _DivergenceMarker extends StatelessWidget {
+  const _DivergenceMarker();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.only(left: 6),
+      child: Tooltip(
+        message:
+            'Variants disagree on this field — right-click → '
+            '"Show variant metadata" for the breakdown',
+        waitDuration: Duration(milliseconds: 400),
+        child: Icon(
+          Icons.warning_amber_rounded,
+          size: 11,
+          color: AppColors.favorite,
+        ),
       ),
     );
   }

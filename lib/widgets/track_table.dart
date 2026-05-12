@@ -452,7 +452,7 @@ class _HeaderCell extends StatelessWidget {
     // the visible header just doesn't reflect sort state. Keeps
     // the header row stable and readable; sort state is conveyed
     // by the row order itself.
-    return InkWell(
+    final inner = InkWell(
       onTap: () => controller.setSort(column),
       hoverColor: AppColors.hoverRow,
       focusColor: AppColors.focusOverlay,
@@ -478,6 +478,22 @@ class _HeaderCell extends StatelessWidget {
         ),
       ),
     );
+    // FORMAT cycles through 10 sort leads (4 singles + 6 pair
+    // combos) with no visible mode indicator — by spec, the header
+    // text stays static. The tooltip surfaces the active lead on
+    // hover so the user can tell pair-lead "interleaving" (which
+    // is correct per family-clustering rules) from being on the
+    // wrong lead. Other columns don't have hidden sort state, so
+    // they don't need a tooltip.
+    if (column == TrackSortColumn.format &&
+        controller.sortColumn == TrackSortColumn.format) {
+      return Tooltip(
+        message: 'Sort lead: ${controller.sortFormatLead}',
+        waitDuration: const Duration(milliseconds: 400),
+        child: inner,
+      );
+    }
+    return inner;
   }
 }
 

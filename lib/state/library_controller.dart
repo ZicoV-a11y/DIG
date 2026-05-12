@@ -23,7 +23,6 @@ import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
 import '../utils/aggregated_track_view.dart';
-import '../utils/file_format.dart';
 import '../utils/key_normalizer.dart';
 import '../utils/song_identity.dart';
 
@@ -1626,52 +1625,8 @@ class LibraryController extends ChangeNotifier {
     rows.insert(insertAt, t);
   }
 
-  /// Rank a bucket under the current FORMAT-column sort lead.
-  ///
-  /// Family-clustering, not strict set matching. The mental model
-  /// is "keep buckets in the same format family adjacent" — not
-  /// "discriminate by exact set equality."
-  ///
-  /// **Single lead** (e.g. `[MP3]`):
-  ///   0 — exact: bucket has ONLY this format (`{MP3}`)
-  ///   1 — contains: bucket has this format among others
-  ///       (`{MP3, AIFF}`, `{MP3, WAV, AIFF}`)
-  ///   2 — none: bucket lacks this format
-  ///
-  /// **Pair lead** (e.g. `[MP3, WAV]`):
-  ///   0 — contains both: bucket has both formats (with or without
-  ///       extras — `{MP3, WAV}` and `{MP3, WAV, AIFF}` are one
-  ///       family, since "has the pair" is what the user is
-  ///       searching for)
-  ///   1 — contains one: bucket has exactly one of the pair
-  ///       (`{MP3}`, `{WAV}`, `{MP3, AIFF}`, `{WAV, FLAC}`)
-  ///   2 — none: bucket has neither
-  ///
-  /// Secondary title-sort in the comparator handles in-tier order
-  /// so siblings stay adjacent and click-to-click is stable.
-  int _formatBucketRank(AggregatedTrackView view) {
-    final lead = formatSortLeads[_sortFormatMode].toSet();
-    final formats = <String>{};
-    for (final t in view.variants) {
-      final f = fileFormatLabel(t.filename);
-      if (f.isNotEmpty) formats.add(f);
-    }
-    if (formats.isEmpty) return 2;
-    final intersection = formats.intersection(lead);
-    if (intersection.isEmpty) return 2;
-    if (lead.length == 1) {
-      // Single lead: tier 0 is pure-format-only; any bucket with
-      // extras drops to tier 1 (still in the family, but distinct
-      // from "I have only MP3" which is useful for finding
-      // singletons that need a lossless upgrade).
-      return formats.length == 1 ? 0 : 1;
-    }
-    // Pair lead: tier 0 absorbs both exact (`{MP3, WAV}`) and
-    // superset (`{MP3, WAV, AIFF}`) — they're the same family
-    // from the user's POV ("buckets that contain the pair").
-    // Tier 1 = has only one of the pair.
-    return intersection.length == lead.length ? 0 : 1;
-  }
+  int _formatBucketRank(AggregatedTrackView view) =>
+      computeFormatBucketRank(view, formatSortLeads[_sortFormatMode]);
 
   void _markLibraryDirty() {
     _libraryVersion++;

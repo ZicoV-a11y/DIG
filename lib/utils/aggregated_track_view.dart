@@ -311,6 +311,47 @@ class AggregatedTrackView {
 /// cell so the primary's encode reads leftmost.
 const List<String> _formatPreferenceOrder = ['MP3', 'M4A', 'OGG', 'FLAC', 'WAV', 'AIFF'];
 
+/// Rank a bucket against the active FORMAT-column sort lead.
+///
+/// Family-clustering, not strict set matching. See
+/// `feedback_format_sort_family_clustering.md` in project memory
+/// for the why-not-set-equality.
+///
+/// **Single lead** (e.g. `['MP3']`):
+///   0 — exact: bucket has ONLY this format (`{MP3}`)
+///   1 — contains: bucket has this format among others
+///       (`{MP3, AIFF}`, `{MP3, WAV, AIFF}`)
+///   2 — none: bucket lacks this format
+///
+/// **Pair lead** (e.g. `['MP3', 'WAV']`):
+///   0 — contains both: bucket has both formats with or without
+///       extras (`{MP3, WAV}` and `{MP3, WAV, AIFF}` cluster
+///       together — same family from the user's POV)
+///   1 — contains one: bucket has exactly one of the pair
+///       (`{MP3}`, `{WAV}`, `{MP3, AIFF}`, `{WAV, FLAC}`)
+///   2 — none: bucket has neither
+///
+/// Pure function over the view's variants and the lead — extracted
+/// from `LibraryController` so it can be tested directly.
+int computeFormatBucketRank(
+  AggregatedTrackView view,
+  List<String> lead,
+) {
+  final leadSet = lead.toSet();
+  final formats = <String>{};
+  for (final t in view.variants) {
+    final f = fileFormatLabel(t.filename);
+    if (f.isNotEmpty) formats.add(f);
+  }
+  if (formats.isEmpty) return 2;
+  final intersection = formats.intersection(leadSet);
+  if (intersection.isEmpty) return 2;
+  if (leadSet.length == 1) {
+    return formats.length == 1 ? 0 : 1;
+  }
+  return intersection.length == leadSet.length ? 0 : 1;
+}
+
 /// Choose the primary variant for a bucket of same-song tracks.
 /// Lowest-quality format wins (MP3 > FLAC > WAV > AIFF). When two
 /// variants share a format, falls back to insertion order from

@@ -27,14 +27,31 @@ void main() {
     await File(root.currentDbPath).writeAsString(contents);
   }
 
-  test('ensureLayout creates Current / Saves / Cache / Logs', () async {
+  test('ensureLayout creates Current / Saves / Cache / Logs / Systems',
+      () async {
     expect(Directory(root.currentDir).existsSync(), isTrue);
     expect(Directory(root.savesDir).existsSync(), isTrue);
     expect(Directory(root.cacheDir).existsSync(), isTrue);
     expect(Directory(root.logsDir).existsSync(), isTrue);
+    // Systems/ is scaffolded but unused this slice — formalises
+    // the per-device state direction in the on-disk layout so the
+    // future per-device save logic doesn't trigger a directory
+    // migration.
+    expect(Directory(root.systemsDir).existsSync(), isTrue);
   });
 
-  test('snapshot returns null when Current/db.sqlite is missing', () async {
+  test('Systems/ directory has its own dedicated coverage', () async {
+    // Explicit standalone check — keeps the per-device state
+    // scaffold visible in the test listing so a future regression
+    // (someone removing Systems/ from ensureLayout) fails with a
+    // self-explanatory name instead of a multi-directory
+    // assertion failure.
+    expect(Directory(root.systemsDir).path, endsWith('/Systems'));
+    expect(Directory(root.systemsDir).existsSync(), isTrue);
+  });
+
+  test('snapshot returns null when Current/CURRENT.library is missing',
+      () async {
     final file = await manager.snapshot(
       libraryName: 'AFRO',
       machineId: 'DJMAC',
@@ -122,7 +139,7 @@ void main() {
     expect(File('${root.savesDir}/note.txt').existsSync(), isTrue);
   });
 
-  test('restoreFromNewest copies into Current/db.sqlite when missing',
+  test('restoreFromNewest copies into Current/CURRENT.library when missing',
       () async {
     await writeCurrentDb('original');
     await manager.snapshot(

@@ -16,24 +16,36 @@ class LibraryRoot {
   const LibraryRoot(this.path);
 
   /// Live working DB lives here. The app reads/writes from this
-  /// file. Snapshots are immutable copies of it.
-  String get currentDbPath => '$path/Current/db.sqlite';
+  /// file. Snapshots in `Saves/` are immutable copies of it.
+  /// Filename intentionally matches the `.library` extension used
+  /// by snapshots — one canonical live identity per library, same
+  /// container format, so the user opening the folder in Finder
+  /// sees one consistent naming convention.
+  String get currentDbPath => '$path/Current/CURRENT.library';
 
   String get currentDir => '$path/Current';
   String get savesDir => '$path/Saves';
   String get cacheDir => '$path/Cache';
   String get logsDir => '$path/Logs';
 
+  /// Reserved for per-device state channel files
+  /// (`{MACHINE_ID}.library`). Scaffolded but not yet written to —
+  /// the directory's presence formalises the device-lineage
+  /// direction in the on-disk layout so future per-device save
+  /// logic ships into a stable shape, not a layout migration.
+  String get systemsDir => '$path/Systems';
+
   /// Create the directory skeleton if it doesn't exist. Idempotent.
-  /// Cache/ and Logs/ are created up front even though this slice
-  /// doesn't use them yet — keeps the on-disk shape stable so the
-  /// user sees the same layout every time they open the library
-  /// folder in Finder.
+  /// Cache/ / Logs/ / Systems/ are created up front even though
+  /// this slice doesn't write to them yet — keeps the on-disk shape
+  /// stable so the user sees the same layout every time they open
+  /// the library folder in Finder.
   Future<void> ensureLayout() async {
     await Directory(currentDir).create(recursive: true);
     await Directory(savesDir).create(recursive: true);
     await Directory(cacheDir).create(recursive: true);
     await Directory(logsDir).create(recursive: true);
+    await Directory(systemsDir).create(recursive: true);
   }
 }
 
@@ -72,7 +84,7 @@ class LibrarySaveManager {
     final dbFile = File(root.currentDbPath);
     if (!dbFile.existsSync()) {
       debugPrint(
-        '[save] no Current/db.sqlite yet — snapshot skipped',
+        '[save] no Current/CURRENT.library yet — snapshot skipped',
       );
       return null;
     }
@@ -122,16 +134,17 @@ class LibrarySaveManager {
   }
 
   /// Most-recent snapshot, or null if none exist. Used by the
-  /// startup restore path when `Current/db.sqlite` is missing.
+  /// startup restore path when `Current/CURRENT.library` is
+  /// missing.
   Future<SaveSnapshot?> newestSnapshot() async {
     final all = await listSnapshots();
     return all.isEmpty ? null : all.first;
   }
 
-  /// Restore the newest snapshot into `Current/db.sqlite`. Only
-  /// fires when `Current/db.sqlite` is missing — caller's
-  /// responsibility to check. Returns the snapshot that was used,
-  /// or null if `Saves/` was empty.
+  /// Restore the newest snapshot into `Current/CURRENT.library`.
+  /// Only fires when `Current/CURRENT.library` is missing —
+  /// caller's responsibility to check. Returns the snapshot that
+  /// was used, or null if `Saves/` was empty.
   Future<SaveSnapshot?> restoreFromNewest() async {
     final newest = await newestSnapshot();
     if (newest == null) return null;
@@ -140,7 +153,7 @@ class LibrarySaveManager {
     await Directory(root.currentDir).create(recursive: true);
     await src.copy(root.currentDbPath);
     debugPrint(
-      '[save] restored ${newest.filename} → Current/db.sqlite',
+      '[save] restored ${newest.filename} → Current/CURRENT.library',
     );
     return newest;
   }

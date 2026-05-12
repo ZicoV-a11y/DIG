@@ -19,9 +19,9 @@ Future<void> main() async {
   final saveManager = LibrarySaveManager(root: root);
 
   // Copy-first migration from the legacy Application Support DB.
-  // Runs only when Current/db.sqlite doesn't exist yet, never
-  // mutates the legacy file in place (per project decision —
-  // legacy file stays as an emergency fallback until the user
+  // Runs only when Current/CURRENT.library doesn't exist yet,
+  // never mutates the legacy file in place (per project decision
+  // — legacy file stays as an emergency fallback until the user
   // deletes it manually). If Current/ is missing but Saves/ has
   // files, fall through to restore-newest instead.
   await _bootstrapCurrentDb(root: root, saveManager: saveManager);
@@ -53,6 +53,31 @@ Future<void> _bootstrapCurrentDb({
   final currentDb = File(root.currentDbPath);
   if (currentDb.existsSync()) return;
 
+  // Priority 0: one-shot rename from the prior canonical name
+  // (`Current/db.sqlite`) to the new one (`Current/CURRENT.library`).
+  // Anyone who picked up the LibraryRoot commit before this rename
+  // has the live DB sitting at `db.sqlite`. The same SQLite bytes
+  // are valid under any filename, so an in-place rename is enough
+  // — no copy, no schema migration, no risk to the data. Guarded
+  // against the both-present edge case (shouldn't happen, but if
+  // it does, leave both alone so the user can investigate).
+  final priorCurrent = File('${root.currentDir}/db.sqlite');
+  if (priorCurrent.existsSync()) {
+    try {
+      await Directory(root.currentDir).create(recursive: true);
+      await priorCurrent.rename(root.currentDbPath);
+      debugPrint(
+        '[bootstrap] renamed Current/db.sqlite → Current/CURRENT.library',
+      );
+      return;
+    } catch (e) {
+      debugPrint(
+        '[bootstrap] rename db.sqlite → CURRENT.library failed: $e '
+        '— falling through to legacy / snapshot restore',
+      );
+    }
+  }
+
   // Priority 1: copy-first migration from the legacy Application
   // Support DB. The user already has 12k+ tracks there; first
   // launch with the new code should land them on the same data
@@ -75,7 +100,8 @@ Future<void> _bootstrapCurrentDb({
   // Priority 2: restore from the newest snapshot in Saves/.
   // Happens after a clean install on a machine where the user
   // dropped saves into the library root manually (or after the
-  // user deleted Current/db.sqlite intentionally to roll back).
+  // user deleted Current/CURRENT.library intentionally to roll
+  // back).
   final restored = await saveManager.restoreFromNewest();
   if (restored != null) {
     debugPrint(

@@ -63,7 +63,7 @@ class LibraryController extends ChangeNotifier {
   /// passes one from `main.dart`.
   final LibrarySaveManager? saveManager;
   /// Filesystem layout for this library — used by the controller
-  /// to address `Current/db.sqlite` for mtime checks before
+  /// to address `Current/CURRENT.library` for mtime checks before
   /// snapshotting. Null in tests when `saveManager` is also null.
   final LibraryRoot? libraryRoot;
   final Uuid _uuid = const Uuid();
@@ -306,10 +306,10 @@ class LibraryController extends ChangeNotifier {
   bool _autosaveEnabled = true;
   int _autosaveIntervalMinutes = 3;
   Timer? _autosaveTimer;
-  /// mtime of `Current/db.sqlite` at the moment of the most recent
-  /// snapshot. The autosave tick reads the current mtime and skips
-  /// the snapshot if it hasn't advanced — cheap dirty-check that
-  /// avoids 20 identical files when nothing changed.
+  /// mtime of `Current/CURRENT.library` at the moment of the most
+  /// recent snapshot. The autosave tick reads the current mtime
+  /// and skips the snapshot if it hasn't advanced — cheap dirty-
+  /// check that avoids 20 identical files when nothing changed.
   DateTime? _lastSnapshotDbMtime;
 
   LibraryController({
@@ -527,8 +527,8 @@ class LibraryController extends ChangeNotifier {
   // Save / autosave
   // ---------------------------------------------------------------------------
 
-  /// Periodic dirty-check that snapshots `Current/db.sqlite` to
-  /// `Saves/` when the DB file has been written since the last
+  /// Periodic dirty-check that snapshots `Current/CURRENT.library`
+  /// to `Saves/` when the DB file has been written since the last
   /// snapshot. Skipped entirely when `saveManager` is null (e.g.
   /// in unit tests) or when the user disabled autosave.
   void _startAutosaveTimer() {

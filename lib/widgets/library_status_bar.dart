@@ -37,6 +37,19 @@ class LibraryStatusBar extends StatelessWidget {
                 _OperationCluster(state: op),
               ] else
                 const _IdleIndicator(),
+              // Static FORMAT-sort indicator. The FORMAT header
+              // cycles through 10 leads (4 singles + 6 pair
+              // combos) but per the static-headers spec the header
+              // text never changes. Without this chip the user
+              // loses track of which lead they're on after a few
+              // clicks (especially the pair combos like MP3·FLAC,
+              // which interleave MP3-only and MP3+other rows
+              // — correct behavior, but indistinguishable from
+              // a bug if you can't see the lead).
+              if (controller.sortColumn == TrackSortColumn.format) ...[
+                const SizedBox(width: 16),
+                _FormatSortChip(lead: controller.sortFormatLead),
+              ],
               const SizedBox(width: 16),
               // Tally takes whatever's left and scrolls horizontally
               // if it can't all fit (large libraries → long file
@@ -237,6 +250,65 @@ class _OperationCluster extends StatelessWidget {
             ),
           ],
         ],
+      ),
+    );
+  }
+}
+
+/// Compact chip showing the active FORMAT-column sort lead.
+///
+/// Only renders while FORMAT is the active sort. Solves the
+/// "hidden state" problem from the static-headers refresh: FORMAT
+/// cycles through 10 leads with no visible mode change on the
+/// header itself, so the user can lose track of whether they're
+/// on `MP3`, `MP3 · WAV`, `MP3 · FLAC`, etc. Pair leads in
+/// particular create surprising-looking row orders (MP3-only
+/// and MP3·AIFF interleave under lead `[MP3, FLAC]` — both
+/// correctly land in tier 1 since each contains one of the
+/// pair, but it reads as a sort bug without context).
+class _FormatSortChip extends StatelessWidget {
+  final String lead;
+  const _FormatSortChip({required this.lead});
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message:
+          'FORMAT column sort. Click the FORMAT header to cycle '
+          'through 10 leads (4 single formats, 6 pair combos). '
+          'Pair leads cluster buckets that contain both formats '
+          'together at the top.',
+      waitDuration: const Duration(milliseconds: 400),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        decoration: BoxDecoration(
+          color: AppColors.surfaceAlt,
+          border: Border.all(color: AppColors.border),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'SORT',
+              style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 1.0,
+                color: AppColors.textTertiary,
+              ),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              lead,
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w500,
+                color: AppColors.textPrimary,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

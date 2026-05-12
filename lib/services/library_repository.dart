@@ -161,9 +161,25 @@ class LibraryRepository {
     final now = DateTime.now().millisecondsSinceEpoch;
     int inserted = 0;
 
+    // Paths whose content_hash changed during this batch — events
+    // are recorded outside the batch so they land in the same
+    // transaction without conflicting with sqflite's `Batch` API
+    // (which doesn't surface intermediate query results we'd need
+    // to keep the audit + state-mutation logic atomic).
+    final mutations = <({
+      String path,
+      String oldHash,
+      String newHash,
+    })>[];
+
     await _db.transaction((txn) async {
       // Pre-load existing rows for these paths in chunks (SQLite has
-      // a default ~999 parameter limit per statement).
+      // a default ~999 parameter limit per statement). Columns
+      // include `content_hash`, `filesize`, `modified_at` so we can
+      // detect external-mutation events at scan time — the
+      // per-file `upsertIndexedFile` has the same logic but the
+      // scan flow uses THIS batch path, so the detection must
+      // live here too.
       final existing = <String, Map<String, Object?>>{};
       const chunk = 400;
       for (var i = 0; i < files.length; i += chunk) {
@@ -171,7 +187,8 @@ class LibraryRepository {
         final slice = files.sublist(i, end);
         final placeholders = List.filled(slice.length, '?').join(',');
         final rows = await txn.rawQuery(
-          'SELECT path, uid, intel_uid FROM indexed_files '
+          'SELECT path, uid, intel_uid, content_hash, filesize, '
+          'modified_at FROM indexed_files '
           'WHERE path IN ($placeholders)',
           [for (final f in slice) f.path],
         );
@@ -190,6 +207,11 @@ class LibraryRepository {
         );
         final ex = existing[f.path];
         if (ex == null) {
+          // INSERT path: leave `content_hash` NULL and let the
+          // background backfill worker populate it. The bulk
+          // scan can't afford to read ~512KB per new file inline
+          // — initial 12k-file scans would balloon by 2 minutes.
+          // Backfill catches up at idle.
           batch.insert('indexed_files', {
             'path': f.path,
             'source_id': sourceId,
@@ -209,6 +231,10 @@ class LibraryRepository {
         } else {
           final oldUid = ex['uid'] as String;
           final oldIntelUid = ex['intel_uid'] as String?;
+          final oldContentHash = ex['content_hash'] as String?;
+          final oldFilesize = (ex['filesize'] as int?) ?? 0;
+          final oldModifiedAt = (ex['modified_at'] as int?) ?? 0;
+
           // Re-tag at same path: fingerprint shifted. If this row
           // owned intelligence (intel_uid == old uid), migrate the
           // tracks row's uid so the link survives.
@@ -228,26 +254,95 @@ class LibraryRepository {
               whereArgs: [oldUid],
             );
           }
+
+          // content_hash recompute on stat change. Same rules as
+          // the per-file upsertIndexedFile path:
+          //   - stat unchanged + hash present → reuse old
+          //   - stat changed → recompute; null result preserves
+          //     the previously-good hash (transient read failure
+          //     must not erase real evidence)
+          //   - hash mutation → reset metadata_read_at = 0 +
+          //     record content_updated_external (events queued
+          //     to fire after the batch commits, inside the
+          //     same transaction)
+          final statUnchanged = oldFilesize == f.filesize &&
+              oldModifiedAt == f.modifiedAtMs;
+          String? newContentHash;
+          bool contentMutated = false;
+          if (statUnchanged && oldContentHash != null) {
+            newContentHash = oldContentHash;
+          } else {
+            // computeContentHashSync is fine here: we're already
+            // inside an async-aware transaction loop, and the
+            // sync I/O cost only fires for files whose stat
+            // actually changed since the last scan (typically
+            // a handful per scan, not the whole library).
+            final computed = computeContentHashSync(f.path);
+            newContentHash = computed ?? oldContentHash;
+            if (oldContentHash != null &&
+                newContentHash != null &&
+                oldContentHash != newContentHash) {
+              contentMutated = true;
+              mutations.add((
+                path: f.path,
+                oldHash: oldContentHash,
+                newHash: newContentHash,
+              ));
+            }
+          }
+
+          final updateMap = <String, Object?>{
+            'source_id': sourceId,
+            'filename': f.filename,
+            'filesize': f.filesize,
+            'modified_at': f.modifiedAtMs,
+            'duration_ms': f.durationMs,
+            'fingerprint': ids.fingerprint,
+            'content_hash': newContentHash,
+            'uid': ids.uid,
+            'is_available': 1,
+            'availability_state': 'available',
+            'last_seen_at': now,
+          };
+          if (contentMutated) {
+            // External tag edit / DAW re-render / etc. — title /
+            // artist / album / etc. extracted from the OLD bytes
+            // are stale, so wipe metadata_read_at to make the
+            // reactive enrichment pipeline re-read on the next
+            // viewport / play / post-scan sweep.
+            updateMap['metadata_read_at'] = 0;
+          }
           batch.update(
             'indexed_files',
-            {
-              'source_id': sourceId,
-              'filename': f.filename,
-              'filesize': f.filesize,
-              'modified_at': f.modifiedAtMs,
-              'duration_ms': f.durationMs,
-              'fingerprint': ids.fingerprint,
-              'uid': ids.uid,
-              'is_available': 1,
-            'availability_state': 'available',
-              'last_seen_at': now,
-            },
+            updateMap,
             where: 'path = ?',
             whereArgs: [f.path],
           );
         }
       }
       await batch.commit(noResult: true);
+
+      // Record audit events for every detected content_hash
+      // mutation. Done after the batch commits but inside the
+      // same transaction so a transaction rollback would also
+      // drop the events — never narrate a change that didn't
+      // actually land.
+      for (final m in mutations) {
+        await recordEvent(
+          type: EventType.contentUpdatedExternal,
+          path: m.path,
+          sourceId: sourceId,
+          payload: {
+            'old_content_hash_prefix': m.oldHash.length >= 12
+                ? m.oldHash.substring(0, 12)
+                : m.oldHash,
+            'new_content_hash_prefix': m.newHash.length >= 12
+                ? m.newHash.substring(0, 12)
+                : m.newHash,
+          },
+          txn: txn,
+        );
+      }
     });
 
     return inserted;

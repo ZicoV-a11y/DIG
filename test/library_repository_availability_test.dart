@@ -544,6 +544,168 @@ void main() {
       expect(await stateOf('/srcA/old.mp3'), 'superseded');
     });
 
+    // ──────────────────────────────────────────────────────────────
+    // External rename + intel migration. This block exists to
+    // close the "I renamed my file and my plays vanished" bug:
+    // a rename in Finder / Mp3tag / Rekordbox / etc produces a
+    // new indexed_files row with intel_uid=NULL because
+    // reconnect-by-fingerprint can't bridge the basename change.
+    // markCrossSourceMoves must migrate the superseded row's
+    // intel_uid onto the available successor so behavioural
+    // history follows the file across the rename.
+    // ──────────────────────────────────────────────────────────────
+
+    test(
+        'rename in same source → event narrates as auto_move_same_source',
+        () async {
+      // Caught by content_hash even though fingerprint differs
+      // (basename changed). Successor sits in the SAME source as
+      // the missing predecessor, so the event-type label should
+      // reflect that — not the historical "cross_source" name.
+      await seedFile(
+          path: '/srcA/old name.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-old',
+          contentHash: 'ch-bytes',
+          uid: 'u-old',
+          state: 'missing');
+      await seedFile(
+          path: '/srcA/new name.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-new',
+          contentHash: 'ch-bytes',
+          uid: 'u-new');
+      await repo.markCrossSourceMoves();
+      expect(await stateOf('/srcA/old name.mp3'), 'superseded');
+
+      final events = await repo.loadRecentEvents();
+      final supEvents = events
+          .where((e) =>
+              e.eventType == 'auto_move_same_source' ||
+              e.eventType == 'auto_move_cross_source')
+          .toList();
+      expect(supEvents, hasLength(1));
+      expect(supEvents.first.eventType, 'auto_move_same_source',
+          reason:
+              'successor is in the same source — narrate as same-source');
+      expect(supEvents.first.payload['matched_on'], 'content_hash');
+    });
+
+    test('rename in same source → intel_uid migrates to successor',
+        () async {
+      // The behavioural-intel preservation contract for renames.
+      // Without this migration the user's plays/favorites/review
+      // state would silently disconnect from the renamed file.
+      await seedFile(
+          path: '/srcA/old.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-old',
+          contentHash: 'ch-bytes',
+          uid: 'u-old',
+          state: 'missing',
+          intelUid: 'intel-X');
+      await seedFile(
+          path: '/srcA/new.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-new',
+          contentHash: 'ch-bytes',
+          uid: 'u-new');
+      // Successor explicitly has intel_uid = NULL (its seedFile
+      // call didn't pass one).
+
+      await repo.markCrossSourceMoves();
+
+      final row = await raw.query(
+        'indexed_files',
+        columns: ['intel_uid'],
+        where: 'path = ?',
+        whereArgs: ['/srcA/new.mp3'],
+        limit: 1,
+      );
+      expect(row.first['intel_uid'], 'intel-X',
+          reason:
+              'intel from the superseded row must follow to the '
+              'available successor across the rename');
+    });
+
+    test(
+        'cross-source move → event narrates as auto_move_cross_source + intel migrates',
+        () async {
+      await seedFile(
+          path: '/srcA/song.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-1',
+          contentHash: 'ch-bytes',
+          uid: 'u-old',
+          state: 'missing',
+          intelUid: 'intel-Y');
+      await seedFile(
+          path: '/srcB/song.mp3',
+          sourceId: 'srcB',
+          fingerprint: 'fp-2',
+          contentHash: 'ch-bytes',
+          uid: 'u-new');
+
+      await repo.markCrossSourceMoves();
+
+      final events = await repo.loadRecentEvents();
+      final supEvents = events
+          .where((e) =>
+              e.eventType == 'auto_move_same_source' ||
+              e.eventType == 'auto_move_cross_source')
+          .toList();
+      expect(supEvents, hasLength(1));
+      expect(supEvents.first.eventType, 'auto_move_cross_source');
+      expect(supEvents.first.payload['successor_source_id'], 'srcB');
+
+      final row = await raw.query(
+        'indexed_files',
+        columns: ['intel_uid'],
+        where: 'path = ?',
+        whereArgs: ['/srcB/song.mp3'],
+        limit: 1,
+      );
+      expect(row.first['intel_uid'], 'intel-Y');
+    });
+
+    test(
+        'successor that ALREADY has intel_uid is NOT overwritten',
+        () async {
+      // Safety guard. If the available successor was already
+      // linked to some intel (e.g., via fingerprint reconnect on
+      // an earlier scan, or via the in-app Copy operation that
+      // shares intel deliberately), the migration must not
+      // silently overwrite it — that would bridge two unrelated
+      // intel rows.
+      await seedFile(
+          path: '/srcA/old.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-old',
+          contentHash: 'ch-bytes',
+          uid: 'u-old',
+          state: 'missing',
+          intelUid: 'intel-MIGRATE');
+      await seedFile(
+          path: '/srcA/new.mp3',
+          sourceId: 'srcA',
+          fingerprint: 'fp-new',
+          contentHash: 'ch-bytes',
+          uid: 'u-new',
+          intelUid: 'intel-EXISTING');
+
+      await repo.markCrossSourceMoves();
+
+      final row = await raw.query(
+        'indexed_files',
+        columns: ['intel_uid'],
+        where: 'path = ?',
+        whereArgs: ['/srcA/new.mp3'],
+        limit: 1,
+      );
+      expect(row.first['intel_uid'], 'intel-EXISTING',
+          reason: 'existing intel_uid on successor must be preserved');
+    });
+
     test('markCrossSourceMoves is idempotent across repeated calls', () async {
       await seedFile(
           path: '/srcA/x.mp3',

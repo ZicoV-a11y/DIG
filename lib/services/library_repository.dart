@@ -770,9 +770,15 @@ class LibraryRepository {
   /// Returns the number of rows upgraded from missing → superseded.
   Future<int> markCrossSourceMoves() async {
     // Pre-query the rows that the UPDATE below will supersede,
-    // along with the matched_on signal and successor path. Mirrors
-    // the UPDATE's WHERE clause exactly so the event log records
-    // every state change and nothing else.
+    // along with the matched_on signal, successor path, AND
+    // successor source_id. Mirrors the UPDATE's WHERE clause
+    // exactly so the event log records every state change and
+    // nothing else. The successor_source_id is what lets the
+    // event recorder distinguish a same-source rename (caught
+    // via content_hash because basename changed → fingerprint
+    // differs) from a true cross-source relocation — they're
+    // both "auto-resolved supersessions" but should narrate
+    // differently in the History panel.
     final affected = await _db.rawQuery('''
       SELECT
         m.path AS missing_path,
@@ -798,7 +804,25 @@ class LibraryRepository {
               AND a.duration_ms > 0
             LIMIT 1
           )
-        END AS successor_path
+        END AS successor_path,
+        CASE
+          WHEN m.content_hash IS NOT NULL THEN (
+            SELECT a.source_id FROM indexed_files a
+            WHERE a.content_hash = m.content_hash
+              AND a.availability_state = 'available'
+              AND a.filesize > 0
+              AND a.duration_ms > 0
+            LIMIT 1
+          )
+          ELSE (
+            SELECT a.source_id FROM indexed_files a
+            WHERE a.fingerprint = m.fingerprint
+              AND a.availability_state = 'available'
+              AND a.filesize > 0
+              AND a.duration_ms > 0
+            LIMIT 1
+          )
+        END AS successor_source_id
       FROM indexed_files m
       WHERE m.availability_state = 'missing'
         AND m.filesize > 0
@@ -858,13 +882,85 @@ class LibraryRepository {
         )
     ''');
 
+    // Intel migration pass. The supersession UPDATE above marks
+    // the old row as superseded but doesn't move its `intel_uid`
+    // anywhere — the new row at the new path was inserted fresh
+    // by upsert with `intel_uid = NULL`. For same-basename moves
+    // `reconnectIntelligenceBySource` can re-link by fingerprint,
+    // but for RENAMES (basename changed → fingerprint changed),
+    // that path fails. Without an explicit migration here, the
+    // user's plays / favorites / review state appear to "vanish"
+    // after a rename in Mp3tag / Rekordbox / Serato / etc.
+    //
+    // The migration: for every superseded row that just got
+    // marked, look up its content_hash (or fingerprint, fallback
+    // path) match in the available pool. If the matched
+    // available row has `intel_uid = NULL`, copy the superseded
+    // row's intel_uid onto it. Never overwrite an existing
+    // intel_uid — that would silently bridge two unrelated
+    // intels in the rare case the available row was already
+    // linked.
+    await _db.rawUpdate('''
+      UPDATE indexed_files
+      SET intel_uid = (
+        SELECT m.intel_uid FROM indexed_files m
+        WHERE m.availability_state = 'superseded'
+          AND m.intel_uid IS NOT NULL
+          AND m.filesize > 0
+          AND m.duration_ms > 0
+          AND (
+            (m.content_hash IS NOT NULL
+              AND indexed_files.content_hash IS NOT NULL
+              AND m.content_hash = indexed_files.content_hash)
+            OR
+            (m.content_hash IS NULL
+              AND m.fingerprint = indexed_files.fingerprint)
+          )
+        LIMIT 1
+      )
+      WHERE availability_state = 'available'
+        AND intel_uid IS NULL
+        AND filesize > 0
+        AND duration_ms > 0
+        AND EXISTS (
+          SELECT 1 FROM indexed_files m
+          WHERE m.availability_state = 'superseded'
+            AND m.intel_uid IS NOT NULL
+            AND m.filesize > 0
+            AND m.duration_ms > 0
+            AND (
+              (m.content_hash IS NOT NULL
+                AND indexed_files.content_hash IS NOT NULL
+                AND m.content_hash = indexed_files.content_hash)
+              OR
+              (m.content_hash IS NULL
+                AND m.fingerprint = indexed_files.fingerprint)
+            )
+        )
+    ''');
+
+    // Event-type label honesty. The "cross-source" name is
+    // historical — markCrossSourceMoves doesn't filter by source
+    // and will happily catch a same-source rename (content_hash
+    // matches, basenames differ → fingerprint missed it). When
+    // the successor sits in the same source as the missing row,
+    // the event is semantically a same-source relocation and
+    // should be narrated as such.
     for (final row in affected) {
+      final originSource = row['source_id'] as String?;
+      final successorSource = row['successor_source_id'] as String?;
+      final sameSource = originSource != null &&
+          successorSource != null &&
+          originSource == successorSource;
       await recordEvent(
-        type: EventType.autoMoveCrossSource,
+        type: sameSource
+            ? EventType.autoMoveSameSource
+            : EventType.autoMoveCrossSource,
         path: row['missing_path'] as String,
-        sourceId: row['source_id'] as String?,
+        sourceId: originSource,
         payload: {
           'successor_path': row['successor_path'] as String?,
+          'successor_source_id': successorSource,
           'matched_on': row['matched_on'] as String,
         },
       );

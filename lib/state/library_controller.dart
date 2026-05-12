@@ -142,16 +142,25 @@ class LibraryController extends ChangeNotifier {
   final MediaKeysBridge _media = MediaKeysBridge();
 
   // Utility columns: locked widths.
-  double _colFavWidth = 32;
-  double _colRevWidth = 38;
-  double _colBpmWidth = 38;
+  // Defaults sized for "label + 12px horizontal padding (6 each
+  // side) + a few px of breathing room". Headers are static (no
+  // sort arrow, no dynamic rewrites), so there's no reserved-glyph
+  // slot to account for. LAST is sized for the M/D/YY data form
+  // ("12/31/24" is the widest), not its 4-char header.
+  double _colFavWidth = 36;
+  double _colRevWidth = 48;
+  double _colBpmWidth = 50;
   double _colKeyWidth = 50;
-  double _colTimeWidth = 50;
+  double _colTimeWidth = 56;
   // Wide enough to fit aggregated `MP3 · AIFF` style labels comfortably
   // when grouping is on, plus the expand-chevron prefix.
-  double _colFormatWidth = 78;
-  double _colPlaysWidth = 52;
-  double _colLastPlayedWidth = 90;
+  // FORMAT default sized for pair combos like "MP3 · WAV" /
+  // "MP3 · FLAC" — the W in WAV is unusually wide so the 9-char
+  // string needs noticeably more room than 4-char "MP3" alone.
+  // Triple/quad combos still ellipsize; users can drag wider.
+  double _colFormatWidth = 96;
+  double _colPlaysWidth = 60;
+  double _colLastPlayedWidth = 68;
   // Text columns: persisted absolute widths.
   double _colTitleWidth = 350;
   double _colArtistWidth = 240;
@@ -369,12 +378,17 @@ class LibraryController extends ChangeNotifier {
         sidebarMaxWidth,
       ).toDouble();
     }
-    _colTitleWidth =
-        double.tryParse(settings['col_title_width'] ?? '') ?? _colTitleWidth;
-    _colArtistWidth =
-        double.tryParse(settings['col_artist_width'] ?? '') ?? _colArtistWidth;
-    _colFormatWidth =
-        double.tryParse(settings['col_format_width'] ?? '') ?? _colFormatWidth;
+    // Apply the runtime resize-clamps on load too so any stale
+    // saved value from a previous build (e.g., a 78px FORMAT
+    // width saved before we raised the floor to fit
+    // "FORMAT · MP3") is pulled up to the current minimum
+    // instead of silently restoring an unreadable layout.
+    final savedTitleW = double.tryParse(settings['col_title_width'] ?? '');
+    if (savedTitleW != null) _colTitleWidth = savedTitleW.clamp(120.0, 1500.0);
+    final savedArtistW = double.tryParse(settings['col_artist_width'] ?? '');
+    if (savedArtistW != null) _colArtistWidth = savedArtistW.clamp(100.0, 1200.0);
+    final savedFormatW = double.tryParse(settings['col_format_width'] ?? '');
+    if (savedFormatW != null) _colFormatWidth = savedFormatW.clamp(80.0, 200.0);
     final orderStr = settings['column_order'];
     if (orderStr != null && orderStr.isNotEmpty) {
       final parsed = orderStr
@@ -892,14 +906,17 @@ class LibraryController extends ChangeNotifier {
     return result;
   }
 
-  /// Watched sources that can be a Move/Copy destination — every
-  /// non-sub-view source except the one the [track] currently
-  /// lives in. Used to populate the right-click menu's source
-  /// picker (sub-slice C).
+  /// Watched sources that can appear in the Move/Copy dialog —
+  /// every non-sub-view source, INCLUDING the one the [track]
+  /// currently lives in. The current source is rendered as a
+  /// disabled "CURRENT LOCATION" row inside the dialog (rather
+  /// than hidden) so the user sees the full routing graph and
+  /// can answer "where is this file right now?" without leaving
+  /// the picker. The dialog is responsible for blocking selection
+  /// of the current source; this method does not pre-filter it
+  /// out.
   List<Source> moveCopyDestinationsFor(Track track) {
-    return _sources
-        .where((s) => !s.isSubView && s.id != track.sourceId)
-        .toList(growable: false);
+    return _sources.where((s) => !s.isSubView).toList(growable: false);
   }
 
   /// Distinct song-identity count — same buckets the variant
@@ -1232,35 +1249,35 @@ class LibraryController extends ChangeNotifier {
     double clamped;
     switch (column) {
       case 'fav':
-        clamped = width.clamp(28.0, 80.0);
+        clamped = width.clamp(32.0, 80.0);
         _colFavWidth = clamped;
         break;
       case 'rev':
-        clamped = width.clamp(28.0, 80.0);
+        clamped = width.clamp(40.0, 80.0);
         _colRevWidth = clamped;
         break;
       case 'bpm':
-        clamped = width.clamp(36.0, 120.0);
+        clamped = width.clamp(44.0, 120.0);
         _colBpmWidth = clamped;
         break;
       case 'key':
-        clamped = width.clamp(36.0, 120.0);
+        clamped = width.clamp(44.0, 120.0);
         _colKeyWidth = clamped;
         break;
       case 'time':
-        clamped = width.clamp(40.0, 120.0);
+        clamped = width.clamp(48.0, 120.0);
         _colTimeWidth = clamped;
         break;
       case 'format':
-        clamped = width.clamp(44.0, 120.0);
+        clamped = width.clamp(80.0, 200.0);
         _colFormatWidth = clamped;
         break;
       case 'plays':
-        clamped = width.clamp(36.0, 120.0);
+        clamped = width.clamp(52.0, 120.0);
         _colPlaysWidth = clamped;
         break;
       case 'lastPlayed':
-        clamped = width.clamp(70.0, 160.0);
+        clamped = width.clamp(60.0, 200.0);
         _colLastPlayedWidth = clamped;
         break;
       case 'title':
@@ -1507,16 +1524,19 @@ class LibraryController extends ChangeNotifier {
           return dir * a.duration.compareTo(b.duration);
         case TrackSortColumn.format:
           // Each click on the FORMAT header rotates which format
-          // leads. The bucket's sort key is the best (lowest) rank
-          // any of its formats achieves under the current rotation.
-          // Direction toggle doesn't apply to FORMAT — the click
-          // advances the lead instead of flipping asc/desc.
+          // (or pair) leads. The bucket's primary rank tiers it
+          // by set-match to the lead (exact / superset / partial
+          // / none). Direction toggle doesn't apply to FORMAT —
+          // clicks advance the lead instead of flipping asc/desc.
+          // Within a tier, fall back to title ascending so rows
+          // settle into a readable order instead of the previous
+          // sort's leftover insertion order.
           final ar = _formatBucketRank(va);
           final br = _formatBucketRank(vb);
-          if (ar == _unknownFormatRank && br == _unknownFormatRank) return 0;
-          if (ar == _unknownFormatRank) return 1;
-          if (br == _unknownFormatRank) return -1;
-          return ar.compareTo(br);
+          if (ar != br) return ar.compareTo(br);
+          final at = va.primary.displayTitle.toLowerCase();
+          final bt = vb.primary.displayTitle.toLowerCase();
+          return at.compareTo(bt);
         case TrackSortColumn.plays:
           return dir * va.playCount.compareTo(vb.playCount);
         case TrackSortColumn.lastPlayed:
@@ -1606,34 +1626,48 @@ class LibraryController extends ChangeNotifier {
     rows.insert(insertAt, t);
   }
 
-  /// Sentinel rank for a bucket that contains no format in
-  /// `formatSortLeads`. Such buckets sort to the very end of the
-  /// FORMAT-column ordering regardless of the current lead.
-  static const int _unknownFormatRank = 1 << 20;
-
-  /// Rank a bucket under the current FORMAT-column sort rotation.
-  /// Returns the lowest position any of its formats occupies in the
-  /// rotated priority list — so a bucket containing the current
-  /// leading format always sorts to position 0, and the next-best
-  /// format wins among the remainder. Unknown-format buckets
-  /// (`fileFormatLabel` returned empty or a non-leads value) return
-  /// [_unknownFormatRank].
+  /// Rank a bucket under the current FORMAT-column sort lead.
+  ///
+  /// Set-based 4-tier ranking — works for both single and pair
+  /// leads. Comparing the bucket's format set to the lead's set:
+  ///
+  ///   0 — exact match: same format set (e.g. lead `[MP3, WAV]`,
+  ///       bucket has exactly `{MP3, WAV}` regardless of variant
+  ///       counts)
+  ///   1 — superset: bucket has all of the lead's formats plus
+  ///       extras (e.g. lead `[MP3, WAV]`, bucket has
+  ///       `{MP3, WAV, AIFF}`)
+  ///   2 — partial: bucket has some but not all of the lead's
+  ///       formats (e.g. lead `[MP3, WAV]`, bucket has `{MP3}` or
+  ///       `{MP3, AIFF}`)
+  ///   3 — none: bucket has none of the lead's formats, or
+  ///       holds only unrecognised extensions
+  ///
+  /// Single leads collapse the tiers naturally: a `[MP3]` lead
+  /// gives exact-match for pure-MP3 buckets, superset for
+  /// MP3+anything, partial is impossible (lead has 1 format, so
+  /// "some but not all" can't happen with non-empty intersection),
+  /// none for buckets without MP3.
+  ///
+  /// Secondary title-sort in the comparator handles in-tier order.
   int _formatBucketRank(AggregatedTrackView view) {
-    const leadCount = 4; // matches formatSortLeads.length
-    // Build the rotated priority order: starting at the current
-    // mode, wrapping around the list. mode 0 = [MP3, FLAC, WAV, AIFF],
-    // mode 1 = [FLAC, WAV, AIFF, MP3], etc.
-    int best = _unknownFormatRank;
+    final lead = formatSortLeads[_sortFormatMode].toSet();
+    final formats = <String>{};
     for (final t in view.variants) {
       final f = fileFormatLabel(t.filename);
-      if (f.isEmpty) continue;
-      final origIdx = formatSortLeads.indexOf(f);
-      if (origIdx < 0) continue;
-      final rotatedIdx =
-          (origIdx - _sortFormatMode + leadCount) % leadCount;
-      if (rotatedIdx < best) best = rotatedIdx;
+      if (f.isNotEmpty) formats.add(f);
     }
-    return best;
+    if (formats.isEmpty) return 3;
+    final intersection = formats.intersection(lead);
+    if (intersection.isEmpty) return 3;
+    final matchesAllOfLead = intersection.length == lead.length;
+    if (matchesAllOfLead) {
+      // All lead formats present. Exact match if bucket has
+      // nothing extra, otherwise superset.
+      return formats.length == lead.length ? 0 : 1;
+    }
+    // Bucket has some lead formats but not all — partial.
+    return 2;
   }
 
   void _markLibraryDirty() {
@@ -2218,26 +2252,41 @@ class LibraryController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Ordered list of which format leads the FORMAT-column sort.
+  /// Ordered list of which formats lead the FORMAT-column sort.
   /// Each click on the FORMAT header advances through this list,
-  /// wrapping at the end. The matcher / display still prefers the
+  /// wrapping at the end.
+  ///
+  /// First 4 entries are the original single-format leads. Entries
+  /// 5–10 are the meaningful 2-format pair combos — when a pair
+  /// lead is active, buckets whose variants contain BOTH formats
+  /// sort to the top together, letting the user surface things
+  /// like "all my MP3+AIFF pairs" by clicking through.
+  ///
+  /// The matcher / display still prefers the
   /// `aggregated_track_view._formatPreferenceOrder` for playback;
-  /// this is purely a sort-visualization knob.
-  static const List<String> formatSortLeads = [
-    'MP3',
-    'FLAC',
-    'WAV',
-    'AIFF',
+  /// this is purely a sort-visualization knob. The FORMAT header
+  /// itself is static — sort state is conveyed only by row order.
+  static const List<List<String>> formatSortLeads = [
+    ['MP3'],
+    ['FLAC'],
+    ['WAV'],
+    ['AIFF'],
+    ['MP3', 'AIFF'],
+    ['MP3', 'FLAC'],
+    ['MP3', 'WAV'],
+    ['FLAC', 'AIFF'],
+    ['FLAC', 'WAV'],
+    ['WAV', 'AIFF'],
   ];
 
   int get sortFormatMode => _sortFormatMode;
 
-  /// The format that leads the current FORMAT-column sort, e.g.
-  /// `'MP3'`. Buckets containing this format sort to the top;
-  /// remaining buckets fall through to the rest of [formatSortLeads]
-  /// in order. Only meaningful when the FORMAT column is the active
-  /// sort.
-  String get sortFormatLead => formatSortLeads[_sortFormatMode];
+  /// Display label for the current FORMAT-column lead — e.g.
+  /// `'MP3'` for a single-format lead or `'MP3 · AIFF'` for a pair
+  /// lead. Matches the visual shape of `AggregatedTrackView.formatLabel`
+  /// so any future tooltip / debug surface stays consistent with
+  /// what the rows display.
+  String get sortFormatLead => formatSortLeads[_sortFormatMode].join(' · ');
 
   void setSort(TrackSortColumn column) {
     if (_sortColumn == column) {

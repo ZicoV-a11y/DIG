@@ -62,7 +62,12 @@ class FolderSidebar extends StatelessWidget {
               const _SectionHeader('LIBRARY'),
               _SourceTile(
                 label: 'All Tracks',
-                count: controller.totalTrackCount,
+                // Song count, not file count — the library's
+                // headline number should mirror "how many songs
+                // do I have", which is also what the status bar
+                // shows. Files and variants are surfaced
+                // separately in the status bar.
+                count: controller.songCount,
                 selected: controller.selectedSourceId == null,
                 icon: Icons.library_music_outlined,
                 onTap: () => controller.selectSource(null),

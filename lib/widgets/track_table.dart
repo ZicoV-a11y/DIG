@@ -441,57 +441,43 @@ class _HeaderCell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final isSorted = controller.sortColumn == column;
-    final ascending = controller.sortAscending;
     final mainAlign = align == TextAlign.right
         ? MainAxisAlignment.end
         : align == TextAlign.center
             ? MainAxisAlignment.center
             : MainAxisAlignment.start;
-    // FORMAT cycles through priority leads instead of asc/desc, so
-    // its header shows the leading format (e.g., "FORMAT · MP3")
-    // when active so the user can see which lead is current.
-    final isFormatColumn = column == TrackSortColumn.format;
-    final displayLabel = (isFormatColumn && isSorted)
-        ? '$label · ${controller.sortFormatLead}'
-        : label;
-
+    // Static headers — no sort arrow, no dynamic label rewrites
+    // (FORMAT stays "FORMAT" even when sorting cycles its priority
+    // lead). Clicking the cell still drives `controller.setSort`,
+    // the visible header just doesn't reflect sort state. Keeps
+    // the header row stable and readable; sort state is conveyed
+    // by the row order itself.
     return InkWell(
-        onTap: () => controller.setSort(column),
-        hoverColor: AppColors.hoverRow,
-        focusColor: AppColors.focusOverlay,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-          child: Row(
-            mainAxisAlignment: mainAlign,
-            children: [
-              Flexible(
-                child: Text(
-                  displayLabel,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: align,
-                  style: const TextStyle(
-                    color: AppColors.textSecondary,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w500,
-                    letterSpacing: 1.0,
-                  ),
+      onTap: () => controller.setSort(column),
+      hoverColor: AppColors.hoverRow,
+      focusColor: AppColors.focusOverlay,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Row(
+          mainAxisAlignment: mainAlign,
+          children: [
+            Flexible(
+              child: Text(
+                label,
+                overflow: TextOverflow.ellipsis,
+                textAlign: align,
+                style: const TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                  letterSpacing: 1.0,
                 ),
               ),
-              if (isSorted && !isFormatColumn) ...[
-                const SizedBox(width: 2),
-                Icon(
-                  ascending
-                      ? Icons.arrow_drop_up_rounded
-                      : Icons.arrow_drop_down_rounded,
-                  size: 14,
-                  color: AppColors.textPrimary,
-                ),
-              ],
-            ],
-          ),
+            ),
+          ],
         ),
-      );
+      ),
+    );
   }
 }
 
@@ -596,7 +582,7 @@ Widget _buildHeaderInner(String col, LibraryController c) {
       );
     case 'lastPlayed':
       return _HeaderCell(
-        label: 'LAST PLAYED',
+        label: 'LAST',
         column: TrackSortColumn.lastPlayed,
         controller: c,
         align: TextAlign.center,
@@ -742,10 +728,9 @@ Widget _buildRowInner(
         child: Center(child: Text('$plays', style: _numStyle)),
       );
     case 'lastPlayed':
-      // `_formatLastPlayed` returns a short, allocation-light
-      // string (one of `Today` / `Yesterday` / `3d ago` / `Apr 28`
-      // / `Never`). No DateTime arithmetic per-comparison sort —
-      // the sort comparator works on `lastPlayedAt` directly.
+      // `_formatLastPlayed` returns short numeric M/D/YY (e.g.
+      // "5/14/25") or "—" when never played. Sort comparator
+      // works on `lastPlayedAt` directly — no string parsing.
       final at = aggView?.lastPlayedAt ?? t.lastPlayedAt;
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
@@ -940,8 +925,13 @@ class _TrackRow extends StatelessWidget {
     // or Move) and one or more destinations from a checkbox list.
     // For multi-variant rows the dialog operates on the row's
     // primary track; per-variant move/copy is a future refinement.
+    // Gate the menu entry on having at least one OTHER source —
+    // controller now returns the current source too (so the dialog
+    // can render it as disabled), but with only the current
+    // source the dialog has no actionable target.
     final destinations = controller.moveCopyDestinationsFor(track);
-    if (destinations.isNotEmpty) {
+    final hasOtherDest = destinations.any((s) => s.id != track.sourceId);
+    if (hasOtherDest) {
       items.add(const PopupMenuDivider(height: 1));
       items.add(_moveCopyMenuItem(
         value: 'move-copy',
@@ -1871,37 +1861,14 @@ String _formatBpm(double? bpm) {
   return bpm.round().toString();
 }
 
-const _monthsShort = [
-  'Jan',
-  'Feb',
-  'Mar',
-  'Apr',
-  'May',
-  'Jun',
-  'Jul',
-  'Aug',
-  'Sep',
-  'Oct',
-  'Nov',
-  'Dec',
-];
-
 /// Compact relative-time label for the Last Played column.
 /// Pure function over `(at, now)` — no allocations beyond the
 /// returned String, no DateTime arithmetic per-frame beyond a few
 /// integer subtractions. Cheap enough at 60fps × ~50 visible rows.
 String _formatLastPlayed(DateTime? at) {
-  if (at == null) return 'Never';
-  final now = DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
-  final atDay = DateTime(at.year, at.month, at.day);
-  final days = today.difference(atDay).inDays;
-  if (days <= 0) return 'Today';
-  if (days == 1) return 'Yesterday';
-  if (days < 7) return '${days}d ago';
-  // Older than a week → drop to "Mon D" / "Mon D, YYYY" if not
-  // current calendar year.
-  final monthDay = '${_monthsShort[at.month - 1]} ${at.day}';
-  if (at.year == now.year) return monthDay;
-  return '$monthDay, ${at.year}';
+  // Short numeric M/D/YY, no leading zeros, 2-digit year. Never
+  // played → em dash. Examples: 5/14/25, 5/9/25, 1/3/25, 12/31/24.
+  if (at == null) return '—';
+  final yy = (at.year % 100).toString().padLeft(2, '0');
+  return '${at.month}/${at.day}/$yy';
 }

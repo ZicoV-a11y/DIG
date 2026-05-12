@@ -120,6 +120,7 @@ class _MoveCopyDialogState extends State<_MoveCopyDialog> {
                               source: dest,
                               checked: _selectedDestIds.contains(dest.id),
                               multiSelect: _isCopy,
+                              isCurrent: dest.id == widget.track.sourceId,
                               onToggle: () => _toggle(dest.id),
                             ),
                         ],
@@ -164,15 +165,15 @@ class _MoveCopyDialogState extends State<_MoveCopyDialog> {
   }
 
   List<Source> _validDestinations() {
-    // Exclude the track's current source (would be a same-path
-    // operation) and any sub-views (filter projections, not
-    // real storage targets). The per-source flat-list filter
-    // from sub-slice B was correct for singletons; for v1 we
-    // keep the same model and let the repo's pre-flight catch
-    // collisions on already-existing destination filenames.
+    // Show every top-level watched folder — including the track's
+    // current source. The current row renders disabled
+    // ("CURRENT LOCATION") so the user sees the full routing graph
+    // ("file is here → could go there") instead of a single
+    // destination implying there's only one possible target.
+    // Sub-views stay excluded — they're filter projections of a
+    // parent source, not independent storage targets.
     return widget.controller.sources
-        .where((s) =>
-            !s.isSubView && s.id != widget.track.sourceId)
+        .where((s) => !s.isSubView)
         .toList(growable: false);
   }
 
@@ -406,16 +407,79 @@ class _DestinationRow extends StatelessWidget {
   final Source source;
   final bool checked;
   final bool multiSelect;
+  final bool isCurrent;
   final VoidCallback onToggle;
   const _DestinationRow({
     required this.source,
     required this.checked,
     required this.multiSelect,
+    required this.isCurrent,
     required this.onToggle,
   });
 
   @override
   Widget build(BuildContext context) {
+    // Current source: muted text, no checkbox, no hover. Visible
+    // so the user sees the full routing graph (where the file is
+    // now vs. where it could go) but not selectable — sending a
+    // file to the folder it already lives in is a no-op.
+    if (isCurrent) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.place_rounded,
+              size: 16,
+              color: AppColors.textTertiary,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        source.displayName,
+                        style: const TextStyle(
+                          color: AppColors.textSecondary,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'CURRENT LOCATION',
+                        style: TextStyle(
+                          color: AppColors.textTertiary,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    source.folderPath,
+                    style: const TextStyle(
+                      color: AppColors.textTertiary,
+                      fontSize: 10,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     return Material(
       color: Colors.transparent,
       child: InkWell(

@@ -17,6 +17,7 @@ import '../models/track.dart';
 import '../services/audio_scanner.dart';
 import '../services/content_hash.dart';
 import '../services/content_hash_backfill.dart';
+import '../models/operational_state.dart';
 import '../services/intelligence_export.dart';
 import '../services/library_repository.dart';
 import '../services/library_save_manager.dart';
@@ -303,6 +304,20 @@ class LibraryController extends ChangeNotifier {
   // any of them later via settings.
   String _libraryName = 'LIBRARY';
   String _machineId = 'MACHINE';
+
+  /// Resolved machine identity for this device, as known to the
+  /// controller. Mirrors `app_settings.machine_id` (with hostname
+  /// fallback) and is kept in sync with the filesystem-level
+  /// `LibraryRoot/machine_id.txt`. Used by widgets that need to
+  /// distinguish "this device's state" from other devices' (see
+  /// the Load Operational State dialog).
+  String get machineId => _machineId;
+
+  /// Resolved library name — the user's whole music universe
+  /// identity (e.g. `NEOMAC_LIBRARY`). Defaults to `LIBRARY` for
+  /// fresh installs; user can rename via the `library_name`
+  /// app_settings key.
+  String get libraryName => _libraryName;
   bool _autosaveEnabled = true;
   int _autosaveIntervalMinutes = 3;
   Timer? _autosaveTimer;
@@ -614,6 +629,81 @@ class LibraryController extends ChangeNotifier {
     } catch (e) {
       debugPrint('[autosave] compatibility mirror failed: $e');
     }
+  }
+
+  /// Switch the running app's operational state to [target].
+  ///
+  /// Mechanics:
+  ///   1. Take a final autosave snapshot of the *current* state so
+  ///      this transition is itself a recoverable lineage point.
+  ///      (Every state transition becomes reversible — that's the
+  ///      operational-continuity guarantee.)
+  ///   2. Copy `target.filePath` over the live device DB at
+  ///      `Systems/{MACHINE}.library`. Atomic-rename via `.partial`.
+  ///   3. Return successfully — the UI then instructs the user to
+  ///      quit and relaunch. We deliberately do NOT attempt an
+  ///      in-app reload in V1: too many runtime caches (sqflite
+  ///      handles, controllers, scan state, playback) would need
+  ///      coordinated teardown, and an explicit restart honestly
+  ///      communicates "you are entering another operational
+  ///      reality." Process-bound operational identity stays
+  ///      clean.
+  ///
+  /// Loading the current-device file (the one already live) is
+  /// allowed but a no-op beyond the autosave; this lets the UI
+  /// always offer "Load this state" without special-casing.
+  ///
+  /// Returns null on success; non-null human-readable error on
+  /// failure (so the UI can surface it). Never throws.
+  Future<String?> loadOperationalState(OperationalState target) async {
+    final mgr = saveManager;
+    final root = libraryRoot;
+    if (mgr == null || root == null) {
+      return 'Save manager unavailable — cannot switch state.';
+    }
+    final liveDbPath = root.deviceLiveDbPath(_machineId);
+    // Step 1 — final autosave of current state for recoverability.
+    try {
+      await _snapshotNow();
+    } catch (e) {
+      // Don't abort the load just because the safety snapshot
+      // failed — but log loudly. The user explicitly asked to
+      // transition; surface the issue without blocking.
+      debugPrint('[loadOperationalState] pre-load snapshot failed: $e');
+    }
+    // Step 2 — swap the file into Systems/{MACHINE}.library.
+    if (target.filePath == liveDbPath) {
+      // Loading the already-live file is a no-op. The autosave
+      // above already captured current state; nothing else to do.
+      debugPrint(
+        '[loadOperationalState] target IS the live DB — no swap needed',
+      );
+      return null;
+    }
+    final source = File(target.filePath);
+    if (!source.existsSync()) {
+      return 'Selected operational state file is missing on disk.';
+    }
+    final tmp = File('$liveDbPath.partial');
+    try {
+      await Directory(root.systemsDir).create(recursive: true);
+      await source.copy(tmp.path);
+      // Atomic-replace the live DB. Dart's File.rename on macOS
+      // matches POSIX rename(2) semantics — the prior live file
+      // goes away in the same syscall, no race.
+      await tmp.rename(liveDbPath);
+    } catch (e) {
+      if (tmp.existsSync()) {
+        try {
+          await tmp.delete();
+        } catch (_) {/* best-effort */}
+      }
+      return 'Failed to swap operational state: $e';
+    }
+    debugPrint(
+      '[loadOperationalState] swapped ${target.filePath} → $liveDbPath',
+    );
+    return null;
   }
 
   /// The track table calls this with the paths currently on screen

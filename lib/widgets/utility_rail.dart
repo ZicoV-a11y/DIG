@@ -10,6 +10,7 @@ import '../utils/file_format.dart';
 import 'activity_log_dialog.dart';
 import 'duplicates_audit_dialog.dart';
 import 'import_confirm_dialog.dart';
+import 'load_state_dialog.dart';
 import 'move_copy_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
@@ -768,6 +769,38 @@ class _DataModule extends StatelessWidget {
                 SizedBox(height: 2),
                 Text(
                   'EXPORT',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                    color: AppColors.textPrimary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        _RailButton(
+          tooltip:
+              'Switch the running app to a different library reality '
+              '— Systems / Saves / Shared Libraries.',
+          onPressed: () => showLoadStateDialog(
+            context: context,
+            controller: controller,
+          ),
+          child: const Padding(
+            padding: EdgeInsets.symmetric(vertical: 2),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.swap_horiz_rounded,
+                  size: 20,
+                  color: AppColors.textSecondary,
+                ),
+                SizedBox(height: 2),
+                Text(
+                  'LOAD',
                   style: TextStyle(
                     fontSize: 10,
                     fontWeight: FontWeight.w700,

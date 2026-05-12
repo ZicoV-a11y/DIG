@@ -1628,28 +1628,27 @@ class LibraryController extends ChangeNotifier {
 
   /// Rank a bucket under the current FORMAT-column sort lead.
   ///
-  /// Set-based 4-tier ranking — works for both single and pair
-  /// leads. Comparing the bucket's format set to the lead's set:
+  /// Family-clustering, not strict set matching. The mental model
+  /// is "keep buckets in the same format family adjacent" — not
+  /// "discriminate by exact set equality."
   ///
-  ///   0 — exact match: same format set (e.g. lead `[MP3, WAV]`,
-  ///       bucket has exactly `{MP3, WAV}` regardless of variant
-  ///       counts)
-  ///   1 — superset: bucket has all of the lead's formats plus
-  ///       extras (e.g. lead `[MP3, WAV]`, bucket has
-  ///       `{MP3, WAV, AIFF}`)
-  ///   2 — partial: bucket has some but not all of the lead's
-  ///       formats (e.g. lead `[MP3, WAV]`, bucket has `{MP3}` or
-  ///       `{MP3, AIFF}`)
-  ///   3 — none: bucket has none of the lead's formats, or
-  ///       holds only unrecognised extensions
+  /// **Single lead** (e.g. `[MP3]`):
+  ///   0 — exact: bucket has ONLY this format (`{MP3}`)
+  ///   1 — contains: bucket has this format among others
+  ///       (`{MP3, AIFF}`, `{MP3, WAV, AIFF}`)
+  ///   2 — none: bucket lacks this format
   ///
-  /// Single leads collapse the tiers naturally: a `[MP3]` lead
-  /// gives exact-match for pure-MP3 buckets, superset for
-  /// MP3+anything, partial is impossible (lead has 1 format, so
-  /// "some but not all" can't happen with non-empty intersection),
-  /// none for buckets without MP3.
+  /// **Pair lead** (e.g. `[MP3, WAV]`):
+  ///   0 — contains both: bucket has both formats (with or without
+  ///       extras — `{MP3, WAV}` and `{MP3, WAV, AIFF}` are one
+  ///       family, since "has the pair" is what the user is
+  ///       searching for)
+  ///   1 — contains one: bucket has exactly one of the pair
+  ///       (`{MP3}`, `{WAV}`, `{MP3, AIFF}`, `{WAV, FLAC}`)
+  ///   2 — none: bucket has neither
   ///
-  /// Secondary title-sort in the comparator handles in-tier order.
+  /// Secondary title-sort in the comparator handles in-tier order
+  /// so siblings stay adjacent and click-to-click is stable.
   int _formatBucketRank(AggregatedTrackView view) {
     final lead = formatSortLeads[_sortFormatMode].toSet();
     final formats = <String>{};
@@ -1657,17 +1656,21 @@ class LibraryController extends ChangeNotifier {
       final f = fileFormatLabel(t.filename);
       if (f.isNotEmpty) formats.add(f);
     }
-    if (formats.isEmpty) return 3;
+    if (formats.isEmpty) return 2;
     final intersection = formats.intersection(lead);
-    if (intersection.isEmpty) return 3;
-    final matchesAllOfLead = intersection.length == lead.length;
-    if (matchesAllOfLead) {
-      // All lead formats present. Exact match if bucket has
-      // nothing extra, otherwise superset.
-      return formats.length == lead.length ? 0 : 1;
+    if (intersection.isEmpty) return 2;
+    if (lead.length == 1) {
+      // Single lead: tier 0 is pure-format-only; any bucket with
+      // extras drops to tier 1 (still in the family, but distinct
+      // from "I have only MP3" which is useful for finding
+      // singletons that need a lossless upgrade).
+      return formats.length == 1 ? 0 : 1;
     }
-    // Bucket has some lead formats but not all — partial.
-    return 2;
+    // Pair lead: tier 0 absorbs both exact (`{MP3, WAV}`) and
+    // superset (`{MP3, WAV, AIFF}`) — they're the same family
+    // from the user's POV ("buckets that contain the pair").
+    // Tier 1 = has only one of the pair.
+    return intersection.length == lead.length ? 0 : 1;
   }
 
   void _markLibraryDirty() {

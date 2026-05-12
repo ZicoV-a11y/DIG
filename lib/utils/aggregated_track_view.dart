@@ -352,6 +352,33 @@ int computeFormatBucketRank(
   return intersection.length == leadSet.length ? 0 : 1;
 }
 
+/// Compare two buckets under the active FORMAT-column sort lead.
+///
+/// Three-level ordering (extracted from the controller's
+/// comparator so the same logic is testable directly):
+///
+///   1. Tier from [computeFormatBucketRank] — `0` exact / `1`
+///      contains / `2` lacks. Primary clustering.
+///   2. `view.formatLabel` ascending — secondary clustering so
+///      same-combo rows form adjacent blocks. Without this,
+///      tier 1 mixes `MP3 · AIFF` and `MP3 · WAV` by title alone.
+///   3. Primary track's title ascending — tertiary.
+int compareFormatBuckets(
+  AggregatedTrackView a,
+  AggregatedTrackView b,
+  List<String> lead,
+) {
+  final ar = computeFormatBucketRank(a, lead);
+  final br = computeFormatBucketRank(b, lead);
+  if (ar != br) return ar.compareTo(br);
+  final aLabel = a.formatLabel;
+  final bLabel = b.formatLabel;
+  if (aLabel != bLabel) return aLabel.compareTo(bLabel);
+  return a.primary.displayTitle
+      .toLowerCase()
+      .compareTo(b.primary.displayTitle.toLowerCase());
+}
+
 /// Choose the primary variant for a bucket of same-song tracks.
 /// Lowest-quality format wins (MP3 > FLAC > WAV > AIFF). When two
 /// variants share a format, falls back to insertion order from

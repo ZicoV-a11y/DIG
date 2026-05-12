@@ -9,14 +9,14 @@ import 'package:music_tracker/utils/aggregated_track_view.dart';
 /// scattering, the bug is not in the rank but in how the live
 /// controller wires it (caching, stale view, hot-reload not
 /// picking up the controller change, etc.).
-Track _t(String filename) {
+Track _t(String filename, {String? title}) {
   return Track(
     uid: 'uid-$filename',
     fingerprint: 'fp-$filename',
     path: '/lib/$filename',
     filename: filename,
     sourceId: 'src',
-    title: filename,
+    title: title ?? filename,
     artist: 'a',
     duration: const Duration(minutes: 4),
     musicalKey: '',
@@ -130,6 +130,75 @@ void main() {
       expect(
         computeFormatBucketRank(_view(['x.weird']), const ['MP3']),
         2,
+      );
+    });
+  });
+
+  /// Under single-MP3 lead, tier-1 rows (any bucket containing MP3
+  /// plus extras) must form adjacent blocks by exact combo
+  /// signature — NOT interleave by title alone. The user-visible
+  /// goal: scrolling shows all `MP3 · AIFF` rows together, then
+  /// all `MP3 · FLAC`, then all `MP3 · WAV`, etc., with title
+  /// ordering only inside each block.
+  group('compareFormatBuckets — combo block clustering', () {
+    test('same-combo rows cluster, different combos separate', () {
+      const lead = ['MP3'];
+      // Two MP3·AIFF buckets (titles B / D), two MP3·WAV buckets
+      // (titles A / E), one pure MP3 bucket (title C). Shuffled
+      // input order — the sort must regroup them into:
+      //   tier 0: pure MP3 (C)
+      //   tier 1 / MP3·AIFF block: B, D
+      //   tier 1 / MP3·WAV block:  A, E
+      final views = <AggregatedTrackView>[
+        AggregatedTrackView([_t('a.mp3', title: 'A'), _t('a.wav', title: 'A')]),
+        AggregatedTrackView([_t('b.mp3', title: 'B'), _t('b.aiff', title: 'B')]),
+        AggregatedTrackView([_t('c.mp3', title: 'C')]),
+        AggregatedTrackView([_t('d.mp3', title: 'D'), _t('d.aiff', title: 'D')]),
+        AggregatedTrackView([_t('e.mp3', title: 'E'), _t('e.wav', title: 'E')]),
+      ];
+      views.sort((a, b) => compareFormatBuckets(a, b, lead));
+      expect(
+        views.map((v) => '${v.formatLabel}/${v.primary.displayTitle}').toList(),
+        [
+          'MP3/C',          // tier 0
+          'MP3 · AIFF/B',   // tier 1, AIFF block first (alphabetical)
+          'MP3 · AIFF/D',
+          'MP3 · WAV/A',    // tier 1, WAV block next
+          'MP3 · WAV/E',
+        ],
+      );
+    });
+
+    test('3-format combo lands in its own block, after 2-format combos', () {
+      const lead = ['MP3'];
+      final views = <AggregatedTrackView>[
+        AggregatedTrackView([
+          _t('a.mp3', title: 'A'),
+          _t('a.wav', title: 'A'),
+          _t('a.aiff', title: 'A'),
+        ]),
+        AggregatedTrackView([_t('b.mp3', title: 'B'), _t('b.wav', title: 'B')]),
+      ];
+      views.sort((a, b) => compareFormatBuckets(a, b, lead));
+      expect(
+        views.map((v) => v.formatLabel).toList(),
+        ['MP3 · WAV', 'MP3 · WAV · AIFF'],
+        reason:
+            'MP3 · WAV sorts before MP3 · WAV · AIFF — same prefix, '
+            'shorter combo first by lexicographic order on formatLabel',
+      );
+    });
+
+    test('tier 2 (no lead) rows sink below all tier-1 blocks', () {
+      const lead = ['MP3'];
+      final views = <AggregatedTrackView>[
+        AggregatedTrackView([_t('a.flac', title: 'A')]),
+        AggregatedTrackView([_t('b.mp3', title: 'B'), _t('b.aiff', title: 'B')]),
+      ];
+      views.sort((a, b) => compareFormatBuckets(a, b, lead));
+      expect(
+        views.map((v) => v.formatLabel).toList(),
+        ['MP3 · AIFF', 'FLAC'],
       );
     });
   });

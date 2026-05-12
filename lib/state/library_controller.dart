@@ -1522,20 +1522,21 @@ class LibraryController extends ChangeNotifier {
         case TrackSortColumn.duration:
           return dir * a.duration.compareTo(b.duration);
         case TrackSortColumn.format:
-          // Each click on the FORMAT header rotates which format
-          // (or pair) leads. The bucket's primary rank tiers it
-          // by set-match to the lead (exact / superset / partial
-          // / none). Direction toggle doesn't apply to FORMAT —
-          // clicks advance the lead instead of flipping asc/desc.
-          // Within a tier, fall back to title ascending so rows
-          // settle into a readable order instead of the previous
-          // sort's leftover insertion order.
-          final ar = _formatBucketRank(va);
-          final br = _formatBucketRank(vb);
-          if (ar != br) return ar.compareTo(br);
-          final at = va.primary.displayTitle.toLowerCase();
-          final bt = vb.primary.displayTitle.toLowerCase();
-          return at.compareTo(bt);
+          // Three-level sort delegated to `compareFormatBuckets`:
+          //   1. Tier (exact / contains / lacks the lead)
+          //   2. formatLabel — same-combo rows form adjacent
+          //      blocks so the user sees "format family blocks"
+          //      while scrolling rather than title-interleaved
+          //      combos
+          //   3. Title ascending — within each block
+          //
+          // Direction toggle doesn't apply to FORMAT — clicks
+          // advance the lead instead of flipping asc/desc.
+          return compareFormatBuckets(
+            va,
+            vb,
+            formatSortLeads[_sortFormatMode],
+          );
         case TrackSortColumn.plays:
           return dir * va.playCount.compareTo(vb.playCount);
         case TrackSortColumn.lastPlayed:
@@ -1624,9 +1625,6 @@ class LibraryController extends ChangeNotifier {
     final insertAt = _lockedCurrentIndex!.clamp(0, rows.length);
     rows.insert(insertAt, t);
   }
-
-  int _formatBucketRank(AggregatedTrackView view) =>
-      computeFormatBucketRank(view, formatSortLeads[_sortFormatMode]);
 
   void _markLibraryDirty() {
     _libraryVersion++;

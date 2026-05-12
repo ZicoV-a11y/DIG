@@ -79,7 +79,6 @@ class PlaybackBar extends StatelessWidget {
                         const SizedBox(width: 6),
                         _PlayPauseButton(
                           isPlaying: controller.isPlaying,
-                          isLoading: controller.isLoadingTrack,
                           onPressed: controller.togglePlayPause,
                         ),
                         const SizedBox(width: 6),
@@ -504,23 +503,25 @@ class _CircleIconButton extends StatelessWidget {
 
 class _PlayPauseButton extends StatelessWidget {
   final bool isPlaying;
-  final bool isLoading;
   final VoidCallback onPressed;
   const _PlayPauseButton({
     required this.isPlaying,
-    required this.isLoading,
     required this.onPressed,
   });
 
   @override
   Widget build(BuildContext context) {
+    // Play/pause is sacred — always visible, always tappable. Even
+    // mid-load (slow Dropbox materialisation, cold-cache AIFF, etc.)
+    // the user can still pause/abort. Replacing the icon with a
+    // spinner and disabling taps used to lock the button when a load
+    // stalled; now `controller.togglePlayPause` handles the in-flight
+    // case (engine.pause() during load aborts cleanly).
     return Material(
       color: AppColors.accent,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
       child: InkWell(
-        // Disable taps while loading — the engine.setTrack is in
-        // flight and tapping again would just queue redundant work.
-        onTap: isLoading ? null : onPressed,
+        onTap: onPressed,
         customBorder:
             const RoundedRectangleBorder(borderRadius: BorderRadius.zero),
         hoverColor: Colors.white.withValues(alpha: 0.10),
@@ -528,23 +529,11 @@ class _PlayPauseButton extends StatelessWidget {
         child: SizedBox(
           width: 80,
           height: 80,
-          child: isLoading
-              ? const Center(
-                  child: SizedBox(
-                    width: 28,
-                    height: 28,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2.5,
-                      valueColor:
-                          AlwaysStoppedAnimation<Color>(Colors.white),
-                    ),
-                  ),
-                )
-              : Icon(
-                  isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                  color: Colors.white,
-                  size: 32,
-                ),
+          child: Icon(
+            isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
+            color: Colors.white,
+            size: 32,
+          ),
         ),
       ),
     );

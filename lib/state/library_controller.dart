@@ -561,6 +561,18 @@ class LibraryController extends ChangeNotifier {
   /// lifecycle hooks (post-scan, on dispose) where we want a save
   /// point at a meaningful moment even if the tick hasn't fired.
   /// No-op when `saveManager` is null.
+  ///
+  /// Two writes per call:
+  ///   1. Rolling timestamped snapshot in `Saves/` — historical
+  ///      lineage / crash recovery / rollback (still the primary
+  ///      durability guarantee).
+  ///   2. Always-overwritten device channel at
+  ///      `Systems/{MACHINE_ID}.library` — this device's
+  ///      operational truth, latest only. Not yet authoritative
+  ///      for startup; the resolver + boot switchover ship in a
+  ///      later slice. A failure here is logged but doesn't abort
+  ///      the call: the Saves/ snapshot is what matters for
+  ///      recovery, the Systems/ mirror is parallel validation.
   Future<void> _snapshotNow() async {
     final mgr = saveManager;
     final root = libraryRoot;
@@ -575,6 +587,14 @@ class LibraryController extends ChangeNotifier {
       }
     } catch (e) {
       debugPrint('[autosave] snapshot failed: $e');
+    }
+    try {
+      await mgr.writeDeviceChannel(
+        libraryName: _libraryName,
+        machineId: _machineId,
+      );
+    } catch (e) {
+      debugPrint('[autosave] device channel write failed: $e');
     }
   }
 

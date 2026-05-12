@@ -47,8 +47,8 @@ class SaveSnapshot {
     required String machineId,
     required DateTime capturedAt,
   }) {
-    final lib = _sanitiseLabel(libraryName);
-    final mach = _sanitiseLabel(machineId);
+    final lib = sanitiseFilesystemLabel(libraryName);
+    final mach = sanitiseFilesystemLabel(machineId, emptyFallback: 'MACHINE');
     final date = _formatDate(capturedAt);
     final time = _formatTime(capturedAt);
     return '${lib}__${mach}__${date}__$time.library';
@@ -87,10 +87,19 @@ class SaveSnapshot {
   }
 
   /// Collapse anything filesystem-unfriendly to underscores and
-  /// uppercase. Empty input falls back to the literal "LIBRARY"
-  /// (or "MACHINE") so we never emit zero-length fields, which
-  /// would make the filename unparseable.
-  static String _sanitiseLabel(String raw) {
+  /// uppercase. Empty input falls back to [emptyFallback] so we
+  /// never emit zero-length fields, which would make any filename
+  /// using this output unparseable.
+  ///
+  /// Public so the device-channel file builder
+  /// (`LibrarySaveManager.writeDeviceChannel`) can share the exact
+  /// same sanitisation rules — having two divergent label-cleaners
+  /// for save-related filenames would let one path produce names
+  /// the other can't round-trip.
+  static String sanitiseFilesystemLabel(
+    String raw, {
+    String emptyFallback = 'LIBRARY',
+  }) {
     final out = StringBuffer();
     for (final c in raw.runes) {
       final ch = String.fromCharCode(c);
@@ -105,7 +114,7 @@ class SaveSnapshot {
     final collapsed = s
         .replaceAll(RegExp(r'_+'), '_')
         .replaceAll(RegExp(r'^_+|_+$'), '');
-    return collapsed.isEmpty ? 'LIBRARY' : collapsed;
+    return collapsed.isEmpty ? emptyFallback : collapsed;
   }
 
   static const _months = [

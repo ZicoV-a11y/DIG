@@ -28,24 +28,33 @@ class LibraryRoot {
   String get cacheDir => '$path/Cache';
   String get logsDir => '$path/Logs';
 
-  /// Reserved for per-device state channel files
-  /// (`{MACHINE_ID}.library`). Scaffolded but not yet written to —
-  /// the directory's presence formalises the device-lineage
-  /// direction in the on-disk layout so future per-device save
-  /// logic ships into a stable shape, not a layout migration.
+  /// Per-device state channel files (`{MACHINE_ID}.library`).
+  /// Each device writes ONE always-overwritten file here per
+  /// autosave — the operational truth for that device. Saves/
+  /// holds the rolling lineage; Systems/ holds latest-only state.
   String get systemsDir => '$path/Systems';
 
+  /// Reserved for cross-device library exchange — timestamped
+  /// per-device files from multiple machines so the eventual
+  /// resolver can do "newest per device" load on startup.
+  /// Scaffolded empty this slice; the resolver + cross-device
+  /// merge semantics are explicitly deferred. Folder name contains
+  /// a space intentionally — matches the user-facing label so
+  /// Finder browsing reads naturally.
+  String get sharedLibrariesDir => '$path/Shared Libraries';
+
   /// Create the directory skeleton if it doesn't exist. Idempotent.
-  /// Cache/ / Logs/ / Systems/ are created up front even though
-  /// this slice doesn't write to them yet — keeps the on-disk shape
-  /// stable so the user sees the same layout every time they open
-  /// the library folder in Finder.
+  /// Cache/ / Logs/ / Shared Libraries/ are created up front even
+  /// though this slice doesn't write to them yet — keeps the on-disk
+  /// shape stable so the user sees the same layout every time they
+  /// open the library folder in Finder.
   Future<void> ensureLayout() async {
     await Directory(currentDir).create(recursive: true);
     await Directory(savesDir).create(recursive: true);
     await Directory(cacheDir).create(recursive: true);
     await Directory(logsDir).create(recursive: true);
     await Directory(systemsDir).create(recursive: true);
+    await Directory(sharedLibrariesDir).create(recursive: true);
   }
 }
 
@@ -113,6 +122,66 @@ class LibrarySaveManager {
     final created = File(path);
     debugPrint('[save] wrote ${created.path}');
     await _prune();
+    return created;
+  }
+
+  /// Overwrite this device's operational state file at
+  /// `Systems/{sanitised(machineId)}.library` with the current
+  /// DB bytes. Returns the resulting File, or `null` when
+  /// `Current/CURRENT.library` doesn't exist yet (same no-op
+  /// semantics as [snapshot]).
+  ///
+  /// Unlike [snapshot] there is no rolling history at this layer —
+  /// one file per device, latest only. The Saves/ snapshot taken
+  /// in the same tick is the rollback / recovery surface; this
+  /// file is the operational truth, eventually authoritative for
+  /// startup once the resolver lands.
+  ///
+  /// [libraryName] is accepted for API symmetry with [snapshot]
+  /// even though it isn't part of the filename — keeps both write
+  /// paths interchangeable from the caller's POV and leaves room
+  /// to embed library identity into a future file header if
+  /// needed.
+  Future<File?> writeDeviceChannel({
+    required String libraryName,
+    required String machineId,
+  }) async {
+    final dbFile = File(root.currentDbPath);
+    if (!dbFile.existsSync()) {
+      debugPrint(
+        '[save] no Current/CURRENT.library yet — '
+        'device channel write skipped',
+      );
+      return null;
+    }
+    final sanitised = SaveSnapshot.sanitiseFilesystemLabel(
+      machineId,
+      emptyFallback: 'MACHINE',
+    );
+    final destPath = '${root.systemsDir}/$sanitised.library';
+    await Directory(root.systemsDir).create(recursive: true);
+    // Copy through `.partial` then rename for atomicity. A
+    // half-baked write must never leave a corrupt
+    // Systems/{device}.library that a future startup resolver
+    // could read as authoritative state.
+    final tmp = File('$destPath.partial');
+    try {
+      await dbFile.copy(tmp.path);
+      // Dart's File.rename on macOS atomically replaces an
+      // existing destination — same semantics as POSIX rename(2)
+      // — so the prior device-channel file goes away in the same
+      // syscall, not in a separate delete step that could race.
+      await tmp.rename(destPath);
+    } catch (e) {
+      if (tmp.existsSync()) {
+        try {
+          await tmp.delete();
+        } catch (_) {/* best-effort */}
+      }
+      rethrow;
+    }
+    final created = File(destPath);
+    debugPrint('[save] wrote device channel ${created.path}');
     return created;
   }
 

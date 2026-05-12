@@ -50,6 +50,85 @@ void main() {
     expect(Directory(root.systemsDir).existsSync(), isTrue);
   });
 
+  test('Shared Libraries/ directory scaffolded by ensureLayout', () async {
+    // Future cross-device exchange layer. Empty this slice — the
+    // resolver and newest-per-device load logic are explicitly
+    // deferred. Folder name contains a space intentionally to
+    // match the user-facing label when browsing in Finder.
+    expect(
+      Directory(root.sharedLibrariesDir).path,
+      endsWith('/Shared Libraries'),
+    );
+    expect(Directory(root.sharedLibrariesDir).existsSync(), isTrue);
+  });
+
+  group('writeDeviceChannel — operational device truth', () {
+    test('returns null when Current/CURRENT.library is missing', () async {
+      final file = await manager.writeDeviceChannel(
+        libraryName: 'AFRO',
+        machineId: 'DJMAC',
+      );
+      expect(file, isNull);
+      // No half-written `.partial` left behind.
+      final entries =
+          await Directory(root.systemsDir).list().toList();
+      expect(entries, isEmpty);
+    });
+
+    test('writes Systems/{MACHINE}.library with current DB bytes',
+        () async {
+      await writeCurrentDb('hello-device-channel');
+      final file = await manager.writeDeviceChannel(
+        libraryName: 'AFRO',
+        machineId: 'DJMAC',
+      );
+      expect(file, isNotNull);
+      expect(file!.uri.pathSegments.last, 'DJMAC.library');
+      expect(file.parent.path, endsWith('/Systems'));
+      expect(file.readAsStringSync(), 'hello-device-channel');
+    });
+
+    test('overwrites existing Systems/ file in place (latest only)',
+        () async {
+      await writeCurrentDb('v1');
+      await manager.writeDeviceChannel(
+        libraryName: 'AFRO',
+        machineId: 'DJMAC',
+      );
+      await writeCurrentDb('v2');
+      final second = await manager.writeDeviceChannel(
+        libraryName: 'AFRO',
+        machineId: 'DJMAC',
+      );
+      // Same path — file got replaced, not duplicated.
+      expect(second!.readAsStringSync(), 'v2');
+      // Systems/ holds exactly one file for this device. No
+      // rolling history at this layer — that's Saves/'s job.
+      final entries = await Directory(root.systemsDir)
+          .list()
+          .where((e) => e is File)
+          .toList();
+      expect(entries.length, 1);
+      expect(entries.first.path, second.path);
+    });
+
+    test('sanitises machine ID for filesystem safety', () async {
+      await writeCurrentDb('payload');
+      // Machine ID with spaces, dashes, lowercase, special chars —
+      // must collapse to the same alphanumeric+underscore shape as
+      // the Saves/ filename builder uses.
+      final file = await manager.writeDeviceChannel(
+        libraryName: 'AFRO',
+        machineId: 'neomacs-macbook.local',
+      );
+      expect(file, isNotNull);
+      expect(
+        file!.uri.pathSegments.last,
+        'NEOMACS_MACBOOK_LOCAL.library',
+      );
+    });
+  });
+
   test('snapshot returns null when Current/CURRENT.library is missing',
       () async {
     final file = await manager.snapshot(

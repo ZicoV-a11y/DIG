@@ -60,11 +60,10 @@ void main() {
         machineId: '!!!',
         capturedAt: DateTime(2026, 5, 12, 14, 0),
       );
-      // Empty library → fallback. All non-alphanumeric machine →
-      // fallback to "LIBRARY" too (the function uses a single
-      // sanitiser; "MACHINE" is just documentation of intent, not
-      // a separate code path — both fields share the rule).
-      expect(name.startsWith('LIBRARY__LIBRARY__'), isTrue);
+      // Each field has its own emptyFallback now: library → "LIBRARY",
+      // machine → "MACHINE". Keeps the two slots distinguishable in
+      // the filename even when both inputs sanitise to nothing.
+      expect(name.startsWith('LIBRARY__MACHINE__'), isTrue);
     });
   });
 

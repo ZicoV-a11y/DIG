@@ -1965,6 +1965,25 @@ class LibraryController extends ChangeNotifier {
       final allTracks = await repo.loadTracks();
       _replaceTracks(allTracks);
 
+      // Post-scan re-enrichment trigger. The scan upsert marks
+      // a row's `metadata_read_at = 0` whenever its
+      // `content_hash` diverged at the same path — that's the
+      // signal "an external app (Mp3tag / Rekordbox / DAW)
+      // rewrote tags or audio bytes; the stored title/artist/
+      // album/BPM/key fields are now stale." Without an active
+      // enqueue here the reactive viewport-driven enrichment
+      // only re-reads when the user scrolls the row in or out,
+      // and rows already visible would silently stay frozen at
+      // the old values.
+      //
+      // `enrichSource(source.id)` enqueues any indexed_files
+      // row for this source whose `metadata_read_at` is null,
+      // which covers both newly-inserted rows AND rows the
+      // upsert just invalidated. The enrichment queue runs in
+      // the background; we don't block the scan completion on
+      // it.
+      enrichSource(source.id);
+
       // Diagnostic: how many rows in this source are now unavailable?
       // If preUnavailable < postUnavailable, the scan correctly
       // marked some files as gone. If unchanged after deleting a

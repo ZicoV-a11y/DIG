@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:uuid/uuid.dart';
 
 import '../models/activity_event.dart';
 import '../models/intelligence_record.dart';
@@ -429,20 +430,36 @@ class LibraryRepository {
         newContentHash = computed ?? oldContentHash;
       }
 
+      final bool contentMutated = oldContentHash != null &&
+          newContentHash != null &&
+          oldContentHash != newContentHash;
+
+      final updateMap = <String, Object?>{
+        'source_id': sourceId,
+        'filename': file.filename,
+        'filesize': file.filesize,
+        'modified_at': file.modifiedAt,
+        'duration_ms': durationMs,
+        'fingerprint': ids.fingerprint,
+        'content_hash': newContentHash,
+        'uid': ids.uid,
+        'is_available': 1,
+        'last_seen_at': now,
+      };
+      // When the bytes diverge at this path, the previously-extracted
+      // ID3 / Vorbis fields (title, artist, album, ...) may be stale.
+      // Reset `metadata_read_at` so the reactive enrichment pipeline
+      // re-reads them on the next viewport / play / post-scan sweep.
+      // Without this the tag editor's change to the title field would
+      // never surface in the UI — the enrichment gate is
+      // `metadataReadAt == null` and a one-shot stamp from the
+      // initial enrichment would otherwise lock the old values in.
+      if (contentMutated) {
+        updateMap['metadata_read_at'] = 0;
+      }
       await txn.update(
         'indexed_files',
-        {
-          'source_id': sourceId,
-          'filename': file.filename,
-          'filesize': file.filesize,
-          'modified_at': file.modifiedAt,
-          'duration_ms': durationMs,
-          'fingerprint': ids.fingerprint,
-          'content_hash': newContentHash,
-          'uid': ids.uid,
-          'is_available': 1,
-          'last_seen_at': now,
-        },
+        updateMap,
         where: 'path = ?',
         whereArgs: [file.path],
       );
@@ -459,9 +476,7 @@ class LibraryRepository {
       // hash) or for read-failure preservations (hash → null
       // shielded → hash unchanged). Those are accounting
       // transitions, not real mutations.
-      if (oldContentHash != null &&
-          newContentHash != null &&
-          oldContentHash != newContentHash) {
+      if (contentMutated) {
         await recordEvent(
           type: EventType.contentUpdatedExternal,
           path: file.path,
@@ -1276,6 +1291,29 @@ class LibraryRepository {
             txn: txn,
           );
         }
+        // Shared identity_override across the Copy pair. The
+        // user's mental model: "this is one song with two
+        // locations." If they later edit the title on ONE
+        // variant in Mp3tag / Rekordbox / etc, the song-identity
+        // 4-field key would otherwise diverge and the rows would
+        // split into two separate songs in the table. Pinning
+        // both rows to the same identity_override keeps them in
+        // the same bucket regardless of metadata divergence.
+        //
+        // If source already has an identity_override (e.g., from
+        // a prior Copy chain or a manual link), reuse it. Else
+        // generate a fresh UUID and stamp BOTH source and dest.
+        String? sharedOverride =
+            row['identity_override'] as String?;
+        if (sharedOverride == null) {
+          sharedOverride = const Uuid().v4();
+          await txn.update(
+            'indexed_files',
+            {'identity_override': sharedOverride},
+            where: 'path = ?',
+            whereArgs: [sourcePath],
+          );
+        }
         final newRow = Map<String, Object?>.from(row);
         newRow['path'] = destPath;
         newRow['source_id'] = destSource.id;
@@ -1283,6 +1321,7 @@ class LibraryRepository {
         newRow['filesize'] = destStat.size;
         newRow['modified_at'] = newMtime;
         newRow['uid'] = newUid;
+        newRow['identity_override'] = sharedOverride;
         // intel_uid carried over unchanged → both file rows share
         // intel at the song-identity layer.
         newRow['is_available'] = 1;
@@ -1296,6 +1335,7 @@ class LibraryRepository {
           payload: {
             'dest_path': destPath,
             'dest_source_id': destSource.id,
+            'shared_identity_override': sharedOverride,
           },
           txn: txn,
         );

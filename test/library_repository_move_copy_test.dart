@@ -99,6 +99,7 @@ void main() {
     required String sourceId,
     String? intelUid,
     String? contentHash,
+    String? identityOverride,
   }) async {
     final st = file.statSync();
     await raw.insert('indexed_files', {
@@ -112,6 +113,7 @@ void main() {
       'content_hash': contentHash,
       'uid': 'u-${file.path.hashCode}',
       'intel_uid': intelUid,
+      'identity_override': identityOverride,
       'is_available': 1,
       'availability_state': 'available',
       'last_seen_at': 1,
@@ -319,6 +321,66 @@ void main() {
       expect(events.first.payload['dest_path'],
           '${srcB.folderPath}/song.mp3');
       expect(events.first.payload['dest_source_id'], srcB.id);
+    });
+  });
+
+  group('copyTrackFile — shared identity_override', () {
+    test(
+        'source has no identity_override → generates one and stamps both rows',
+        () async {
+      final f = await writeFile('share.mp3', 800 * 1024, seed: 53);
+      await seedIndexedRow(file: f, sourceId: srcA.id);
+      // Source's identity_override is null by default.
+
+      final result = await repo.copyTrackFile(
+        sourcePath: f.path,
+        destSource: srcB,
+      );
+      expect(result.success, isTrue);
+
+      final src = await rowAt(f.path);
+      final dest = await rowAt('${srcB.folderPath}/share.mp3');
+      final srcOverride = src!['identity_override'] as String?;
+      final destOverride = dest!['identity_override'] as String?;
+
+      expect(srcOverride, isNotNull,
+          reason:
+              'source row should have been stamped with a fresh '
+              'identity_override during Copy');
+      expect(destOverride, equals(srcOverride),
+          reason:
+              'destination should share the same identity_override '
+              'so the variants stay bucketed after metadata edits');
+
+      final events = await repo.loadRecentEvents();
+      final copyEvents =
+          events.where((e) => e.eventType == 'app_initiated_copy').toList();
+      expect(copyEvents, hasLength(1));
+      expect(copyEvents.first.payload['shared_identity_override'],
+          equals(srcOverride));
+    });
+
+    test(
+        'source already has identity_override → reused for the new row',
+        () async {
+      final f = await writeFile('reuse.mp3', 800 * 1024, seed: 57);
+      await seedIndexedRow(
+        file: f,
+        sourceId: srcA.id,
+        identityOverride: 'preexisting-link',
+      );
+
+      final result = await repo.copyTrackFile(
+        sourcePath: f.path,
+        destSource: srcB,
+      );
+      expect(result.success, isTrue);
+
+      final src = await rowAt(f.path);
+      final dest = await rowAt('${srcB.folderPath}/reuse.mp3');
+      expect(src!['identity_override'], 'preexisting-link',
+          reason: 'existing override on source must NOT be overwritten');
+      expect(dest!['identity_override'], 'preexisting-link');
     });
   });
 

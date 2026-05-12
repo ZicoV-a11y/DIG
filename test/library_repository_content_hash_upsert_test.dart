@@ -363,6 +363,60 @@ void main() {
           secondHash!.substring(0, 12));
     });
 
+    test(
+        'content_hash change ALSO resets metadata_read_at = 0 (re-enrichment trigger)',
+        () async {
+      // Companion to the audit event: when bytes diverge at the
+      // same path the previously-extracted ID3/Vorbis fields are
+      // stale, so metadata_read_at gets wiped so the reactive
+      // enrichment pipeline re-reads them. Without this, a tag
+      // edit in Mp3tag would update content_hash but leave the
+      // title field frozen at its old value forever.
+      final f = await writeFile('refresh.mp3', 800 * 1024, seed: 89);
+      // Initial upsert (sets metadata_read_at via separate
+      // enrichment in production; here we simulate it being
+      // stamped).
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fileFromDisk(f),
+        durationMs: 300000,
+      );
+      await raw.update(
+        'indexed_files',
+        {'metadata_read_at': 1234567890},
+        where: 'path = ?',
+        whereArgs: [f.path],
+      );
+
+      // Rewrite the file → content_hash diverges on next upsert.
+      final newF = await writeFile('refresh.mp3', 800 * 1024, seed: 97);
+      final newStat = fileFromDisk(newF);
+      final fakeScanned = ScannedFile(
+        path: newStat.path,
+        filename: newStat.filename,
+        filesize: newStat.filesize,
+        modifiedAt: newStat.modifiedAt + 60000,
+        fallbackTitle: 'T',
+      );
+      await repo.upsertIndexedFile(
+        sourceId: 'src1',
+        file: fakeScanned,
+        durationMs: 300000,
+      );
+
+      final row = await raw.query(
+        'indexed_files',
+        columns: ['metadata_read_at'],
+        where: 'path = ?',
+        whereArgs: [f.path],
+        limit: 1,
+      );
+      expect(row.first['metadata_read_at'], 0,
+          reason:
+              'content_hash change must mark metadata stale so the '
+              'reactive enrichment pipeline re-reads the tags');
+    });
+
     test('first hash population (null → hash) does NOT fire the event',
         () async {
       // Backfill scenario: pre-v10 row with NULL content_hash

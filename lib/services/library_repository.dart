@@ -18,6 +18,32 @@ import 'track_uid.dart';
 /// Either succeeded (and we know the new path + how the move was
 /// physically performed) or failed cleanly (no half-state — the
 /// FS and DB are both back to where they were).
+/// Temporal-soundness threshold for auto-supersession.
+///
+/// A missing row and its proposed available successor must satisfy:
+///
+///     successor.first_seen_at >= missing.last_seen_at - {grace}
+///
+/// In words: the successor must have been first observed AT OR
+/// AFTER the missing row's last observation, with a small grace
+/// window to absorb scan-timing noise (one scan saw both rows
+/// briefly as `available` before the next scan moved the old row
+/// to `missing`).
+///
+/// If the rows coexisted as `available` for LONGER than the grace
+/// window, the most likely interpretation is "intentional duplicate
+/// then later removed" — not "moved." Auto-supersession refuses to
+/// apply in that case; the rows stay independent File Instances and
+/// the missing row remains visible in the Review-missing dialog.
+///
+/// 10 minutes is the L9 starting threshold from
+/// `docs/architecture/architectural_laws.md` and the original
+/// `project_three_layer_identity_model.md` memo. Tune as real-world
+/// telemetry exposes false-positive / false-negative patterns;
+/// changes here ripple to both `markMovedSupersessions` and
+/// `markCrossSourceMoves` automatically.
+const supersessionTemporalOverlapGrace = Duration(minutes: 10);
+
 class MoveCopyResult {
   final bool success;
   final String? newPath;
@@ -793,59 +819,161 @@ class LibraryRepository {
     return deleted;
   }
 
-  /// Auto-detect "moved file" supersession after a scan: any row in
-  /// [sourceId] currently `availability_state = 'missing'` whose
-  /// fingerprint also appears on an `'available'` row in the same
-  /// source gets re-marked as `'superseded'`. The intel link via
-  /// fingerprint is already established by
-  /// `reconnectIntelligenceBySource`; this step's job is to tell
-  /// the UI which "missing" rows are actually moved (and should be
-  /// hidden by default) vs truly gone (and should still show in
-  /// the missing tally).
+  /// Auto-detect "moved file" supersession after a scan, within a
+  /// single source. Upgrades a `'missing'` row to `'superseded'`
+  /// only when ALL FOUR conditions of the L9 rule hold against an
+  /// available candidate in the same source:
+  ///
+  ///   1. Missing row is `availability_state = 'missing'`.
+  ///   2. EXACTLY ONE candidate matches on `content_hash` (preferred)
+  ///      or `fingerprint` (fallback when content_hash is NULL on
+  ///      either side). Multiple candidates → ambiguous, leave
+  ///      missing. Zero candidates → genuinely missing, leave it.
+  ///   3. Both rows pass junk-stat protection (filesize > 0 AND
+  ///      duration_ms > 0). Transient I/O glitches must not trigger
+  ///      cascading false supersessions.
+  ///   4. Temporal soundness: candidate's `first_seen_at` ≥
+  ///      missing's `last_seen_at − supersessionTemporalOverlapGrace`.
+  ///      The candidate must have appeared at or after the missing
+  ///      row disappeared, modulo a small grace window for
+  ///      scan-timing noise.
+  ///
+  /// The intel link is then carried by the same migration pass as
+  /// `markCrossSourceMoves` runs at its tail; this per-source pass
+  /// only writes the `availability_state` flip and the audit event.
+  /// (Same-source intel re-link via `reconnectIntelligenceBySource`
+  /// is the legacy path; the explicit migration here lets renames
+  /// — basename changed → fingerprint shifted — survive.)
   ///
   /// Returns the number of rows upgraded from missing → superseded.
   Future<int> markMovedSupersessions(String sourceId) async {
-    // Pre-query the rows that will be superseded, along with one
-    // candidate successor path each (for the event payload). The
-    // current rule has no uniqueness guard, so multiple successors
-    // could exist — we record the first per `LIMIT 1`; the event
-    // is informational, not the authoritative decision.
+    final graceMs = supersessionTemporalOverlapGrace.inMilliseconds;
+
+    // Pre-query the rows that the UPDATE below will supersede,
+    // along with the matched signal, successor path, and temporal
+    // evidence (missing.last_seen_at, successor.first_seen_at,
+    // computed overlap). The WHERE clause mirrors the UPDATE's
+    // exactly so the event log records every state change and
+    // nothing else. Same-source: both missing and successor are
+    // restricted to [sourceId].
     final affected = await _db.rawQuery('''
       SELECT
         m.path AS missing_path,
+        m.last_seen_at AS missing_last_seen_at,
+        CASE
+          WHEN m.content_hash IS NOT NULL THEN 'content_hash'
+          ELSE 'fingerprint'
+        END AS matched_on,
         (SELECT a.path FROM indexed_files a
-         WHERE a.source_id = m.source_id
+         WHERE a.source_id = ?
            AND a.availability_state = 'available'
-           AND a.fingerprint = m.fingerprint
-         LIMIT 1) AS successor_path
+           AND a.filesize > 0 AND a.duration_ms > 0
+           AND ((m.content_hash IS NOT NULL AND a.content_hash = m.content_hash)
+                OR (m.content_hash IS NULL AND a.fingerprint = m.fingerprint))
+           AND a.first_seen_at >= m.last_seen_at - ?
+         LIMIT 1) AS successor_path,
+        (SELECT a.first_seen_at FROM indexed_files a
+         WHERE a.source_id = ?
+           AND a.availability_state = 'available'
+           AND a.filesize > 0 AND a.duration_ms > 0
+           AND ((m.content_hash IS NOT NULL AND a.content_hash = m.content_hash)
+                OR (m.content_hash IS NULL AND a.fingerprint = m.fingerprint))
+           AND a.first_seen_at >= m.last_seen_at - ?
+         LIMIT 1) AS successor_first_seen_at
       FROM indexed_files m
       WHERE m.source_id = ?
         AND m.availability_state = 'missing'
-        AND m.fingerprint IN (
-          SELECT fingerprint FROM indexed_files
-          WHERE source_id = ? AND availability_state = 'available'
+        AND m.filesize > 0 AND m.duration_ms > 0
+        AND (
+          (m.content_hash IS NOT NULL AND (
+            SELECT COUNT(*) FROM indexed_files a
+            WHERE a.source_id = ?
+              AND a.content_hash = m.content_hash
+              AND a.availability_state = 'available'
+              AND a.filesize > 0 AND a.duration_ms > 0
+          ) = 1)
+          OR
+          (m.content_hash IS NULL AND (
+            SELECT COUNT(*) FROM indexed_files a
+            WHERE a.source_id = ?
+              AND a.fingerprint = m.fingerprint
+              AND a.availability_state = 'available'
+              AND a.filesize > 0 AND a.duration_ms > 0
+          ) = 1)
         )
-    ''', [sourceId, sourceId]);
+        AND EXISTS (
+          SELECT 1 FROM indexed_files a
+          WHERE a.source_id = ?
+            AND a.availability_state = 'available'
+            AND a.filesize > 0 AND a.duration_ms > 0
+            AND ((m.content_hash IS NOT NULL AND a.content_hash = m.content_hash)
+                 OR (m.content_hash IS NULL AND a.fingerprint = m.fingerprint))
+            AND a.first_seen_at >= m.last_seen_at - ?
+        )
+    ''', [
+      sourceId, graceMs,
+      sourceId, graceMs,
+      sourceId,
+      sourceId,
+      sourceId,
+      sourceId, graceMs,
+    ]);
 
-    final count = await _db.rawUpdate(
-      "UPDATE indexed_files "
-      "SET availability_state = 'superseded' "
-      "WHERE source_id = ? "
-      "  AND availability_state = 'missing' "
-      "  AND fingerprint IN ("
-      "    SELECT fingerprint FROM indexed_files "
-      "    WHERE source_id = ? AND availability_state = 'available'"
-      "  )",
-      [sourceId, sourceId],
-    );
+    final count = await _db.rawUpdate('''
+      UPDATE indexed_files
+      SET availability_state = 'superseded'
+      WHERE source_id = ?
+        AND availability_state = 'missing'
+        AND filesize > 0 AND duration_ms > 0
+        AND (
+          (content_hash IS NOT NULL AND (
+            SELECT COUNT(*) FROM indexed_files a
+            WHERE a.source_id = ?
+              AND a.content_hash = indexed_files.content_hash
+              AND a.availability_state = 'available'
+              AND a.filesize > 0 AND a.duration_ms > 0
+          ) = 1)
+          OR
+          (content_hash IS NULL AND (
+            SELECT COUNT(*) FROM indexed_files a
+            WHERE a.source_id = ?
+              AND a.fingerprint = indexed_files.fingerprint
+              AND a.availability_state = 'available'
+              AND a.filesize > 0 AND a.duration_ms > 0
+          ) = 1)
+        )
+        AND EXISTS (
+          SELECT 1 FROM indexed_files a
+          WHERE a.source_id = ?
+            AND a.availability_state = 'available'
+            AND a.filesize > 0 AND a.duration_ms > 0
+            AND ((indexed_files.content_hash IS NOT NULL
+                  AND a.content_hash = indexed_files.content_hash)
+                 OR (indexed_files.content_hash IS NULL
+                     AND a.fingerprint = indexed_files.fingerprint))
+            AND a.first_seen_at >= indexed_files.last_seen_at - ?
+        )
+    ''', [sourceId, sourceId, sourceId, sourceId, graceMs]);
 
     for (final row in affected) {
+      final missingLastSeenAt = row['missing_last_seen_at'] as int;
+      final successorFirstSeenAt = row['successor_first_seen_at'] as int?;
+      final overlapMs = successorFirstSeenAt == null
+          ? null
+          : missingLastSeenAt - successorFirstSeenAt;
       await recordEvent(
         type: EventType.autoMoveSameSource,
         path: row['missing_path'] as String,
         sourceId: sourceId,
         payload: {
           'successor_path': row['successor_path'] as String?,
+          'matched_on': row['matched_on'] as String,
+          'missing_last_seen_at': missingLastSeenAt,
+          'successor_first_seen_at': successorFirstSeenAt,
+          // Negative = clean succession (successor appeared after
+          // missing disappeared). Zero or positive = they overlapped,
+          // within the grace window.
+          'overlap_ms': overlapMs,
         },
       );
     }
@@ -957,15 +1085,22 @@ class LibraryRepository {
   ///       upgrades these over time, after which subsequent
   ///       calls take the strong path.
   ///
-  /// Both paths share the rest of the rules from project memory:
+  /// Both paths share the rest of the L9 rule:
   ///   - missing row + matching row both must have filesize > 0
-  ///     AND duration_ms > 0 (junk fingerprint protection)
+  ///     AND duration_ms > 0 (junk-stat protection).
   ///   - EXACTLY ONE matching available row (uniqueness — multiple
   ///     same-content rows are coexisting duplicates, never a
-  ///     relocation event)
+  ///     relocation event).
+  ///   - **Temporal soundness:** successor's `first_seen_at` ≥
+  ///     missing's `last_seen_at − supersessionTemporalOverlapGrace`.
+  ///     The candidate must have appeared at or after the missing
+  ///     row disappeared, modulo a small grace window for scan-
+  ///     timing noise. Rejects intentional duplicates that were
+  ///     coexisting long before one of them went missing.
   ///
   /// Returns the number of rows upgraded from missing → superseded.
   Future<int> markCrossSourceMoves() async {
+    final graceMs = supersessionTemporalOverlapGrace.inMilliseconds;
     // Pre-query the rows that the UPDATE below will supersede,
     // along with the matched_on signal, successor path, AND
     // successor source_id. Mirrors the UPDATE's WHERE clause
@@ -976,72 +1111,70 @@ class LibraryRepository {
     // differs) from a true cross-source relocation — they're
     // both "auto-resolved supersessions" but should narrate
     // differently in the History panel.
+    // The successor selectors are filtered by temporal soundness
+    // (first_seen_at >= missing.last_seen_at - graceMs) so the
+    // path / source_id we record in the event are the *qualifying*
+    // successor — the one that would actually pass the auto-
+    // supersession check. Without this filter the affected SELECT
+    // could record a non-temporally-sound candidate even though the
+    // outer WHERE-EXISTS clause refused the supersession.
     final affected = await _db.rawQuery('''
       SELECT
         m.path AS missing_path,
         m.source_id,
+        m.last_seen_at AS missing_last_seen_at,
         CASE
           WHEN m.content_hash IS NOT NULL THEN 'content_hash'
           ELSE 'fingerprint'
         END AS matched_on,
-        CASE
-          WHEN m.content_hash IS NOT NULL THEN (
-            SELECT a.path FROM indexed_files a
-            WHERE a.content_hash = m.content_hash
-              AND a.availability_state = 'available'
-              AND a.filesize > 0
-              AND a.duration_ms > 0
-            LIMIT 1
-          )
-          ELSE (
-            SELECT a.path FROM indexed_files a
-            WHERE a.fingerprint = m.fingerprint
-              AND a.availability_state = 'available'
-              AND a.filesize > 0
-              AND a.duration_ms > 0
-            LIMIT 1
-          )
-        END AS successor_path,
-        CASE
-          WHEN m.content_hash IS NOT NULL THEN (
-            SELECT a.source_id FROM indexed_files a
-            WHERE a.content_hash = m.content_hash
-              AND a.availability_state = 'available'
-              AND a.filesize > 0
-              AND a.duration_ms > 0
-            LIMIT 1
-          )
-          ELSE (
-            SELECT a.source_id FROM indexed_files a
-            WHERE a.fingerprint = m.fingerprint
-              AND a.availability_state = 'available'
-              AND a.filesize > 0
-              AND a.duration_ms > 0
-            LIMIT 1
-          )
-        END AS successor_source_id
+        (SELECT a.path FROM indexed_files a
+         WHERE a.availability_state = 'available'
+           AND a.filesize > 0 AND a.duration_ms > 0
+           AND ((m.content_hash IS NOT NULL AND a.content_hash = m.content_hash)
+                OR (m.content_hash IS NULL AND a.fingerprint = m.fingerprint))
+           AND a.first_seen_at >= m.last_seen_at - ?
+         LIMIT 1) AS successor_path,
+        (SELECT a.source_id FROM indexed_files a
+         WHERE a.availability_state = 'available'
+           AND a.filesize > 0 AND a.duration_ms > 0
+           AND ((m.content_hash IS NOT NULL AND a.content_hash = m.content_hash)
+                OR (m.content_hash IS NULL AND a.fingerprint = m.fingerprint))
+           AND a.first_seen_at >= m.last_seen_at - ?
+         LIMIT 1) AS successor_source_id,
+        (SELECT a.first_seen_at FROM indexed_files a
+         WHERE a.availability_state = 'available'
+           AND a.filesize > 0 AND a.duration_ms > 0
+           AND ((m.content_hash IS NOT NULL AND a.content_hash = m.content_hash)
+                OR (m.content_hash IS NULL AND a.fingerprint = m.fingerprint))
+           AND a.first_seen_at >= m.last_seen_at - ?
+         LIMIT 1) AS successor_first_seen_at
       FROM indexed_files m
       WHERE m.availability_state = 'missing'
-        AND m.filesize > 0
-        AND m.duration_ms > 0
+        AND m.filesize > 0 AND m.duration_ms > 0
         AND (
           (m.content_hash IS NOT NULL AND (
             SELECT COUNT(*) FROM indexed_files a
             WHERE a.content_hash = m.content_hash
               AND a.availability_state = 'available'
-              AND a.filesize > 0
-              AND a.duration_ms > 0
+              AND a.filesize > 0 AND a.duration_ms > 0
           ) = 1)
           OR
           (m.content_hash IS NULL AND (
             SELECT COUNT(*) FROM indexed_files a
             WHERE a.fingerprint = m.fingerprint
               AND a.availability_state = 'available'
-              AND a.filesize > 0
-              AND a.duration_ms > 0
+              AND a.filesize > 0 AND a.duration_ms > 0
           ) = 1)
         )
-    ''');
+        AND EXISTS (
+          SELECT 1 FROM indexed_files a
+          WHERE a.availability_state = 'available'
+            AND a.filesize > 0 AND a.duration_ms > 0
+            AND ((m.content_hash IS NOT NULL AND a.content_hash = m.content_hash)
+                 OR (m.content_hash IS NULL AND a.fingerprint = m.fingerprint))
+            AND a.first_seen_at >= m.last_seen_at - ?
+        )
+    ''', [graceMs, graceMs, graceMs, graceMs]);
 
     final count = await _db.rawUpdate('''
       UPDATE indexed_files
@@ -1077,7 +1210,21 @@ class LibraryRepository {
             ) = 1
           )
         )
-    ''');
+        -- Temporal soundness gate: the (unique) successor row must
+        -- have appeared at or after this row went missing, modulo
+        -- a small grace window. Rejects intentional duplicates
+        -- that coexisted long before one of them disappeared.
+        AND EXISTS (
+          SELECT 1 FROM indexed_files a
+          WHERE a.availability_state = 'available'
+            AND a.filesize > 0 AND a.duration_ms > 0
+            AND ((indexed_files.content_hash IS NOT NULL
+                  AND a.content_hash = indexed_files.content_hash)
+                 OR (indexed_files.content_hash IS NULL
+                     AND a.fingerprint = indexed_files.fingerprint))
+            AND a.first_seen_at >= indexed_files.last_seen_at - ?
+        )
+    ''', [graceMs]);
 
     // Intel migration pass. The supersession UPDATE above marks
     // the old row as superseded but doesn't move its `intel_uid`
@@ -1149,6 +1296,11 @@ class LibraryRepository {
       final sameSource = originSource != null &&
           successorSource != null &&
           originSource == successorSource;
+      final missingLastSeenAt = row['missing_last_seen_at'] as int;
+      final successorFirstSeenAt = row['successor_first_seen_at'] as int?;
+      final overlapMs = successorFirstSeenAt == null
+          ? null
+          : missingLastSeenAt - successorFirstSeenAt;
       await recordEvent(
         type: sameSource
             ? EventType.autoMoveSameSource
@@ -1159,6 +1311,12 @@ class LibraryRepository {
           'successor_path': row['successor_path'] as String?,
           'successor_source_id': successorSource,
           'matched_on': row['matched_on'] as String,
+          'missing_last_seen_at': missingLastSeenAt,
+          'successor_first_seen_at': successorFirstSeenAt,
+          // Negative = clean succession (successor appeared after
+          // missing disappeared). Zero/positive = they overlapped,
+          // within the grace window.
+          'overlap_ms': overlapMs,
         },
       );
     }

@@ -194,7 +194,9 @@ Last revised: 2026-05-13.
 - `ui_philosophy.md` — the surface derived from the ontology
   (operational-state language, three-zone hierarchy,
   Operational Trust Boundaries).
-- `runtime_state_flow.md` (deferred, post-resolver) — how
-  operational state moves through the system.
-- `resolver_architecture.md` (future) — graph composition,
-  contribution reconciliation, multi-device ontology execution.
+- [`resolver_architecture.md`](resolver_architecture.md) (design
+  only, no implementation yet) — graph composition, contribution
+  reconciliation, multi-device ontology execution. L4, L5, L6
+  are the load-bearing laws there.
+- `runtime_state_flow.md` (deferred, post-resolver-implementation)
+  — how operational state moves through the system.

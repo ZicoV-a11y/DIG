@@ -12,10 +12,11 @@ Everything else in `docs/architecture/` derives from this document:
   detectors).
 - `ui_philosophy.md` = surface derived from the ontology (the
   language and trust boundaries the user touches).
+- [`resolver_architecture.md`](resolver_architecture.md) (design
+  only, no implementation yet) = composition derived from the
+  ontology.
 - `runtime_state_flow.md` (deferred) = flows derived from the
   ontology.
-- `resolver_architecture.md` (future) = composition derived from
-  the ontology.
 
 Architectural layering: **Ontology defines reality. Laws enforce
 reality. UI expresses reality. Resolver executes reality. Runtime
@@ -562,10 +563,12 @@ architecture-docs sequencing:
   still in the discovery phase; formalizing runtime flow before
   the contribution model stabilizes would prematurely freeze
   unresolved authority semantics.
-- **`resolver_architecture.md` waits** because the resolver
-  hasn't entered concrete design yet — composition rules,
-  conflict semantics, and lineage interpretation are still
-  open.
+- **`resolver_architecture.md` ships as design only** (2026-05-13)
+  — it captures the conceptual contract every future resolver
+  implementation must satisfy (additive-only composition,
+  ephemeral derived view, no cross-device authority hierarchy).
+  Implementation waits until empirical iteration answers the
+  open questions enumerated in its §9.
 
 Speculative formalization is more dangerous than no doc at all,
 because it ossifies the wrong model and creates rework debt.
@@ -581,8 +584,9 @@ it's true.
   here must hold under *which* constraints.
 - `ui_philosophy.md` — the user-facing vocabulary and
   operational trust boundaries derived from this ontology.
-- `runtime_state_flow.md` (deferred, post-resolver) — *how*
-  state moves between the entities defined here.
-- `resolver_architecture.md` (future) — graph composition,
-  contribution reconciliation, state authority logic, lineage
-  interpretation, multi-device ontology execution.
+- [`resolver_architecture.md`](resolver_architecture.md) (design
+  only, no implementation yet) — graph composition, contribution
+  reconciliation, state authority logic, lineage interpretation,
+  multi-device ontology execution.
+- `runtime_state_flow.md` (deferred, post-resolver-implementation)
+  — *how* state moves between the entities defined here.

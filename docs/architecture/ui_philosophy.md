@@ -354,8 +354,11 @@ doc paragraph. Strip it.
   conceptual model this UI expresses.
 - [`architectural_laws.md`](architectural_laws.md) — the
   invariants this UI must surface honestly.
-- `runtime_state_flow.md` (deferred, post-resolver) — how
-  operational state moves through the system; will inform
+- [`resolver_architecture.md`](resolver_architecture.md) (design
+  only, no implementation yet) — the composition engine whose
+  visibility this trust philosophy demands. The §5 conflict
+  semantics there are the contract that future cross-device UI
+  must honour.
+- `runtime_state_flow.md` (deferred, post-resolver-implementation)
+  — how operational state moves through the system; will inform
   future UI for composition / conflict surfaces.
-- `resolver_architecture.md` (future) — the composition engine
-  whose visibility this trust philosophy demands.

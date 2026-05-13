@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 
+import '../models/activity_event.dart';
 import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
+import 'event_log_format.dart';
 
 /// "Review removed & moved files" dialog — surfaces `indexed_files`
 /// rows whose `availability_state` is `missing` (UI: "Removed" —
@@ -47,6 +49,66 @@ class _ReviewMissingDialog extends StatefulWidget {
 
 class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
   final Set<String> _selected = <String>{};
+
+  /// Lineage event for each visible row, keyed by path. Populated by
+  /// [_refreshLineage] when the dialog opens and after any controller
+  /// emit that changes the set of paths we're showing. Surfaces the
+  /// "why is this row in its current state" narration beneath each
+  /// row (auto-move successor, removal evidence, etc.). Empty until
+  /// the first fetch resolves — rows render fine without it.
+  Map<String, ActivityEvent> _lineageEvents = const {};
+
+  /// Stable signature of the path set we last fetched lineage for.
+  /// Used to avoid re-fetching on every controller emit when the
+  /// visible rows didn't actually change.
+  String? _lineageFetchKey;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_maybeRefreshLineage);
+    // Initial fetch — pull whatever's currently in the review list.
+    // build() may run before this resolves; that's fine, lineage
+    // panes are progressive enhancement.
+    _maybeRefreshLineage();
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_maybeRefreshLineage);
+    super.dispose();
+  }
+
+  /// Detect whether the visible-rows path set has changed since the
+  /// last fetch; if so, kick off a new fetch and update state when
+  /// it resolves. Cheap when the path set is stable (the common
+  /// case while the user reads the dialog).
+  void _maybeRefreshLineage() {
+    if (!mounted) return;
+    final paths = widget.controller.tracksNeedingReview
+        .map((t) => t.path)
+        .toList(growable: false)
+      ..sort();
+    final key = paths.join('\n');
+    if (key == _lineageFetchKey) return;
+    _lineageFetchKey = key;
+    if (paths.isEmpty) {
+      setState(() => _lineageEvents = const {});
+      return;
+    }
+    // Fire and forget; setState updates the map when ready. We don't
+    // block render on this — the rows show without lineage first,
+    // then progressively enhance as the events arrive.
+    widget.controller.repo
+        .mostRecentLifecycleEventsFor(paths)
+        .then((events) {
+      if (!mounted) return;
+      // Guard: if a newer fetch was kicked off (key changed again
+      // while we were waiting), discard this stale result.
+      if (key != _lineageFetchKey) return;
+      setState(() => _lineageEvents = events);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -132,6 +194,9 @@ class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
                                     track: t,
                                     selected:
                                         _selected.contains(t.path),
+                                    lineageEvent: _lineageEvents[t.path],
+                                    coexistingVariants:
+                                        _coexistingVariantsFor(t),
                                     onToggleSelected: () => _toggle(t),
                                     onShowInFinder: () =>
                                         _showInFinder(t),
@@ -158,6 +223,8 @@ class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
                                     track: t,
                                     selected:
                                         _selected.contains(t.path),
+                                    lineageEvent: _lineageEvents[t.path],
+                                    coexistingVariants: const <String>[],
                                     onToggleSelected: () => _toggle(t),
                                     onShowInFinder: () =>
                                         _showInFinder(t),
@@ -185,6 +252,29 @@ class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
     setState(() {
       if (!_selected.remove(t.path)) _selected.add(t.path);
     });
+  }
+
+  /// Distinct codec labels of [track]'s 4-field-matched siblings
+  /// that are still `available`, with [track] itself excluded. Used
+  /// to narrate "AIFF · WAV variants still available" beneath
+  /// REMOVED rows so the user sees the song hasn't fully left the
+  /// library even though one File Instance is gone.
+  ///
+  /// Returns an empty list when nothing co-exists — the row's row
+  /// renderer treats that as "no other variants of this song" and
+  /// can choose to omit the line entirely.
+  List<String> _coexistingVariantsFor(Track track) {
+    final bucket = widget.controller.variantsFor(track);
+    final seen = <String>{};
+    final ordered = <String>[];
+    for (final v in bucket) {
+      if (v.path == track.path) continue;
+      if (v.availability != 'available') continue;
+      final fmt = fileFormatLabel(v.filename);
+      if (fmt.isEmpty) continue;
+      if (seen.add(fmt)) ordered.add(fmt);
+    }
+    return ordered;
   }
 
   Future<void> _showInFinder(Track t) async {
@@ -443,11 +533,23 @@ class _SectionHeader extends StatelessWidget {
 class _TrackRow extends StatelessWidget {
   final Track track;
   final bool selected;
+  /// Most recent lifecycle event affecting [track.path]. Drives the
+  /// "→ successor / matched on / overlap" narration beneath the
+  /// path. `null` when no relevant event has been recorded yet —
+  /// the row still renders, just without the causal line.
+  final ActivityEvent? lineageEvent;
+  /// Distinct codec labels of 4-field-matched siblings of [track]
+  /// that are still `available`. Used for the "AIFF · WAV variants
+  /// still available" narration on REMOVED rows; ignored on MOVED
+  /// rows where the lineage event already names a successor.
+  final List<String> coexistingVariants;
   final VoidCallback onToggleSelected;
   final VoidCallback onShowInFinder;
   const _TrackRow({
     required this.track,
     required this.selected,
+    required this.lineageEvent,
+    required this.coexistingVariants,
     required this.onToggleSelected,
     required this.onShowInFinder,
   });
@@ -455,6 +557,7 @@ class _TrackRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final fmt = fileFormatLabel(track.filename);
+    final lineageLine = _lineageLine();
     return Material(
       color: selected ? AppColors.focusOverlay : Colors.transparent,
       child: InkWell(
@@ -503,6 +606,19 @@ class _TrackRow extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
+                    if (lineageLine != null) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        lineageLine,
+                        style: const TextStyle(
+                          color: AppColors.textSecondary,
+                          fontSize: 10,
+                          fontStyle: FontStyle.italic,
+                        ),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -526,6 +642,67 @@ class _TrackRow extends StatelessWidget {
       ),
     );
   }
+
+  /// The "→ moved to X · matched on … · 3m overlap" / "last seen Nd
+  /// ago · AIFF · WAV variants still available" narration beneath
+  /// the path. Returns `null` when no useful narration exists for
+  /// the row's current state (no lineage event AND no coexisting
+  /// variants).
+  ///
+  /// MOVED rows (state == 'superseded' OR the coexisting-paths
+  /// reclassification): the lineage event drives the line — it has
+  /// the successor path, matched_on signal, and (post-Phase-2)
+  /// temporal evidence. Coexisting-variants is intentionally not
+  /// surfaced here because the successor IS the coexistence; saying
+  /// both would double-narrate the same fact.
+  ///
+  /// REMOVED rows (state == 'missing' and not coexistence-reclassified):
+  /// no lineage event is expected (the row went `missing` without
+  /// auto-supersession; the system found no qualifying successor).
+  /// Two parts:
+  ///   - "last seen Nd ago" — from the row's last_seen_at, surfaced
+  ///     as a relative age so the user reads it as recency, not a
+  ///     timestamp.
+  ///   - "AIFF · WAV variants still available" — coexistence at the
+  ///     Track Identity level: the song hasn't fully left the
+  ///     library even though this File Instance is gone. Surfaces
+  ///     codec coexistence per the §3.3 ontology rule (codec is an
+  ///     operational axis, not duplication).
+  String? _lineageLine() {
+    final event = lineageEvent;
+    if (event != null) {
+      return eventDetailLineFor(event);
+    }
+    // No lineage event recorded — render the REMOVED-row narration
+    // from row state + coexisting siblings.
+    final parts = <String>[];
+    final lastSeenMs = track.lastSeenAt;
+    if (lastSeenMs > 0) {
+      parts.add(
+        'last seen ${_relativeAge(DateTime.fromMillisecondsSinceEpoch(lastSeenMs))}',
+      );
+    }
+    if (coexistingVariants.isNotEmpty) {
+      final list = coexistingVariants.join(' · ');
+      final word = coexistingVariants.length == 1 ? 'variant' : 'variants';
+      parts.add('$list $word still available');
+    }
+    if (parts.isEmpty) return null;
+    return parts.join('  ·  ');
+  }
+}
+
+/// Convert an absolute timestamp into a coarse, user-friendly
+/// "N{unit} ago" string. Bucketed for calm reading: minutes <
+/// hour, hours < day, days < month, months < year, years.
+String _relativeAge(DateTime t) {
+  final diff = DateTime.now().difference(t);
+  if (diff.inMinutes < 1) return 'just now';
+  if (diff.inHours < 1) return '${diff.inMinutes}m ago';
+  if (diff.inDays < 1) return '${diff.inHours}h ago';
+  if (diff.inDays < 30) return '${diff.inDays}d ago';
+  if (diff.inDays < 365) return '${diff.inDays ~/ 30}mo ago';
+  return '${diff.inDays ~/ 365}y ago';
 }
 
 class _Pill extends StatelessWidget {

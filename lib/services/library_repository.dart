@@ -1823,6 +1823,100 @@ class LibraryRepository {
     return (row.first['c'] as int?) ?? 0;
   }
 
+  /// Most recent lifecycle event affecting [path], or `null` when
+  /// none has been recorded. Used by lineage-narration surfaces
+  /// (currently: Review-missing dialog) to render *why* a row is in
+  /// its current state — what replaced it, when it moved, what the
+  /// supersession evidence was. The narration is the visible side
+  /// of the causal integrity the supersession rewrite (Slice 2)
+  /// just established.
+  ///
+  /// Scope: filters to the event types whose payloads explain a row
+  /// transitioning OUT of `available`. This is intentionally
+  /// narrower than `loadRecentEvents` — content-update / link /
+  /// purge events are about state changes WITHIN a row's lifetime;
+  /// the lineage caller wants the event that explains the *end* of
+  /// the row at this path.
+  Future<ActivityEvent?> mostRecentLifecycleEventFor(String path) async {
+    const lifecycleTypes = <String>[
+      EventType.autoMoveSameSource,
+      EventType.autoMoveCrossSource,
+      EventType.appInitiatedMove,
+      EventType.removedExternal,
+    ];
+    final placeholders = List.filled(lifecycleTypes.length, '?').join(',');
+    final rows = await _db.rawQuery(
+      'SELECT id, recorded_at, event_type, path, source_id, payload '
+      'FROM events '
+      'WHERE path = ? AND event_type IN ($placeholders) '
+      'ORDER BY recorded_at DESC, id DESC '
+      'LIMIT 1',
+      [path, ...lifecycleTypes],
+    );
+    if (rows.isEmpty) return null;
+    return ActivityEvent.fromRow(rows.first);
+  }
+
+  /// Batch variant of [mostRecentLifecycleEventFor]. Returns a map
+  /// from path → most-recent lifecycle event, for every path in
+  /// [paths] that has at least one such event recorded. Paths
+  /// without events are absent from the map.
+  ///
+  /// Single round-trip — necessary because the Review-missing
+  /// dialog renders hundreds of rows and a per-row fetch would
+  /// thrash the DB on open. Internally uses a windowed query so
+  /// each path returns at most one event (its newest).
+  Future<Map<String, ActivityEvent>> mostRecentLifecycleEventsFor(
+    Iterable<String> paths,
+  ) async {
+    final pathList = paths.toList(growable: false);
+    if (pathList.isEmpty) return const {};
+    const lifecycleTypes = <String>[
+      EventType.autoMoveSameSource,
+      EventType.autoMoveCrossSource,
+      EventType.appInitiatedMove,
+      EventType.removedExternal,
+    ];
+    final typePlaceholders =
+        List.filled(lifecycleTypes.length, '?').join(',');
+    final result = <String, ActivityEvent>{};
+    // SQLite parameter cap is around 999. Chunk paths to stay
+    // comfortably below it; lifecycle events are sparse so a few
+    // round-trips on a huge dialog is still cheap.
+    const chunk = 400;
+    for (var i = 0; i < pathList.length; i += chunk) {
+      final end = (i + chunk).clamp(0, pathList.length);
+      final slice = pathList.sublist(i, end);
+      final pathPlaceholders = List.filled(slice.length, '?').join(',');
+      // The "windowed newest per path" trick: pick rows where no
+      // newer event with the same path exists. Cheaper than a
+      // GROUP BY + correlated subquery, and SQLite optimises the
+      // anti-join well when there's an index on (path, recorded_at).
+      final rows = await _db.rawQuery(
+        '''
+        SELECT e.id, e.recorded_at, e.event_type, e.path, e.source_id,
+               e.payload
+        FROM events e
+        WHERE e.path IN ($pathPlaceholders)
+          AND e.event_type IN ($typePlaceholders)
+          AND NOT EXISTS (
+            SELECT 1 FROM events e2
+            WHERE e2.path = e.path
+              AND e2.event_type IN ($typePlaceholders)
+              AND (e2.recorded_at, e2.id) > (e.recorded_at, e.id)
+          )
+        ''',
+        [...slice, ...lifecycleTypes, ...lifecycleTypes],
+      );
+      for (final r in rows) {
+        final p = r['path'] as String?;
+        if (p == null) continue;
+        result[p] = ActivityEvent.fromRow(r);
+      }
+    }
+    return result;
+  }
+
   // ---------------------------------------------------------------------------
 
   /// Number of indexed files (any availability) under [sourceId].

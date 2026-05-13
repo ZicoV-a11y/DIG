@@ -524,6 +524,22 @@ class LibraryController extends ChangeNotifier {
     }
 
     final sources = await repo.loadSources();
+    // One-time healing pass: backfill identity_override onto rows
+    // that were orphaned by pre-fix Copy operations (e.g. AIFF
+    // sibling losing its bucket pairing with MP3s after a Copy
+    // stamped overrides on source + dest but not on the AIFF).
+    // Idempotent: once the library is healed, this is a no-op on
+    // every subsequent hydrate.
+    try {
+      final healed = await repo.healOrphanedIdentitySiblings();
+      if (healed > 0) {
+        debugPrint(
+          '[hydrate] healed $healed orphaned identity_override siblings',
+        );
+      }
+    } catch (e) {
+      debugPrint('[hydrate] heal pass failed: $e');
+    }
     final tracks = await repo.loadTracks();
     _sources
       ..clear()

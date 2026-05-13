@@ -382,6 +382,102 @@ void main() {
           reason: 'existing override on source must NOT be overwritten');
       expect(dest!['identity_override'], 'preexisting-link');
     });
+
+    test(
+        '4-field-matched siblings get widened so codecs stay grouped',
+        () async {
+      // Three-row bucket: 2 MP3s + 1 AIFF, all using the SAME
+      // basename-no-ext / title / artist / duration → grouped by
+      // the 4-field song-identity key (no identity_override on
+      // any of them yet).
+      //
+      // Bug this guards against: Copy used to stamp identity_override
+      // on source + dest only, orphaning the AIFF sibling in a
+      // different bucket — collapsing codec coexistence into
+      // filename duplication. Fix: widen the override across every
+      // 4-field-matched sibling.
+      final mp3 =
+          await writeFile('right_now.mp3', 800 * 1024, seed: 71);
+      final aiff =
+          await writeFile('right_now.aiff', 800 * 1024, seed: 72);
+      await seedIndexedRow(file: mp3, sourceId: srcA.id);
+      await seedIndexedRow(file: aiff, sourceId: srcA.id);
+
+      final result = await repo.copyTrackFile(
+        sourcePath: mp3.path,
+        destSource: srcB,
+      );
+      expect(result.success, isTrue);
+
+      final src = await rowAt(mp3.path);
+      final dest = await rowAt('${srcB.folderPath}/right_now.mp3');
+      final aiffRow = await rowAt(aiff.path);
+
+      final override = src!['identity_override'] as String?;
+      expect(override, isNotNull);
+      expect(dest!['identity_override'], override);
+      expect(aiffRow!['identity_override'], override,
+          reason: 'AIFF sibling (4-field-matched) must inherit the '
+              'shared override so the Track Identity bucket survives');
+    });
+
+    test(
+        "siblings with their OWN override are not hijacked",
+        () async {
+      // Two MP3s share basename-no-ext / title / artist / duration,
+      // but one of them was manually linked previously (already
+      // has identity_override = "their-preexisting-link"). Copy
+      // must NOT overwrite that — the manual link decision wins.
+      final mp3A =
+          await writeFile('lonely.mp3', 800 * 1024, seed: 80);
+      final mp3B =
+          await writeFile('lonely.aiff', 800 * 1024, seed: 81);
+      await seedIndexedRow(file: mp3A, sourceId: srcA.id);
+      await seedIndexedRow(
+        file: mp3B,
+        sourceId: srcA.id,
+        identityOverride: 'their-preexisting-link',
+      );
+
+      final result = await repo.copyTrackFile(
+        sourcePath: mp3A.path,
+        destSource: srcB,
+      );
+      expect(result.success, isTrue);
+
+      final mp3BRow = await rowAt(mp3B.path);
+      expect(
+        mp3BRow!['identity_override'],
+        'their-preexisting-link',
+        reason: 'rows with their own override must never be hijacked '
+            'by an unrelated Copy operation',
+      );
+    });
+
+    test(
+        'rows with different basename-no-ext are not widened',
+        () async {
+      // Two files share title/artist/duration but have completely
+      // different basenames → NOT the same 4-field key. Copy
+      // must not pull the unrelated row into the new bucket.
+      final mp3 =
+          await writeFile('apples.mp3', 800 * 1024, seed: 90);
+      final other =
+          await writeFile('oranges.mp3', 800 * 1024, seed: 91);
+      await seedIndexedRow(file: mp3, sourceId: srcA.id);
+      await seedIndexedRow(file: other, sourceId: srcA.id);
+
+      final result = await repo.copyTrackFile(
+        sourcePath: mp3.path,
+        destSource: srcB,
+      );
+      expect(result.success, isTrue);
+
+      final otherRow = await rowAt(other.path);
+      expect(otherRow!['identity_override'], isNull,
+          reason: 'unrelated row (different basename) must NOT be '
+              'pulled into the new bucket');
+    });
   });
 
   group('copyTrackFile — stale row at dest', () {

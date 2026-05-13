@@ -8,6 +8,7 @@ import '../models/activity_event.dart';
 import '../models/intelligence_record.dart';
 import '../models/source.dart';
 import '../models/track.dart';
+import '../utils/song_identity.dart';
 import 'content_hash.dart';
 import 'database.dart';
 import 'metadata_extractor.dart';
@@ -113,6 +114,90 @@ class LibraryRepository {
   // ---------------------------------------------------------------------------
   // Tracks (joined load over indexed_files + tracks)
   // ---------------------------------------------------------------------------
+
+  /// One-time healing pass for asymmetric `identity_override` state.
+  ///
+  /// Background: `copyTrackFile` used to stamp an `identity_override`
+  /// on the source + new dest row only. If the bucket also contained
+  /// a different-codec sibling (e.g. an AIFF that was paired in via
+  /// the 4-field key), that sibling kept its NULL override and fell
+  /// out of the bucket — `sameSongIdentity` treats the asymmetric
+  /// case (one override, one NULL) as intentionally distinct, which
+  /// is the right rule for manual link/unlink but the wrong outcome
+  /// when Copy auto-stamped the override.
+  ///
+  /// This method finds rows with NULL override that share a 4-field
+  /// key (basename-no-ext + title + artist + duration_sec) with at
+  /// least one sibling that has an override, and copies the
+  /// sibling's override down. Idempotent — safe to run on every
+  /// hydrate; once a library is fully healed it's a no-op.
+  ///
+  /// **Unlinked rows are not touched.** Unlink sets the override to
+  /// the row's OWN uid (not NULL), so unlinked rows never match the
+  /// "NULL override" filter and stay singletons.
+  ///
+  /// Returns the number of rows whose override was backfilled.
+  Future<int> healOrphanedIdentitySiblings() async {
+    return _db.transaction<int>((txn) async {
+      // Pull every available row with NULL/empty override that has
+      // enough metadata to 4-field-match anything. Empty title or
+      // artist excludes the row from grouping entirely, so there's
+      // no override to inherit even if a "sibling" existed.
+      final orphans = await txn.query(
+        'indexed_files',
+        columns: [
+          'path',
+          'filename',
+          'title',
+          'artist',
+          'duration_ms',
+        ],
+        where:
+            "(identity_override IS NULL OR identity_override = '') "
+            "AND title <> '' AND artist <> '' AND is_available = 1",
+      );
+      if (orphans.isEmpty) return 0;
+
+      var healed = 0;
+      for (final o in orphans) {
+        final basenameKey =
+            basenameForIdentity(o['filename'] as String);
+        final title = o['title'] as String;
+        final artist = o['artist'] as String;
+        final durationSec = ((o['duration_ms'] as int?) ?? 0) ~/ 1000;
+
+        // Find any sibling sharing the 4-field key that already has
+        // an override. LIMIT 1 — if multiple exist they're already
+        // grouped (Copy propagation keeps them consistent), so any
+        // one is fine.
+        final siblings = await txn.query(
+          'indexed_files',
+          columns: ['filename', 'identity_override'],
+          where:
+              "identity_override IS NOT NULL AND identity_override <> '' "
+              "AND title = ? AND artist = ? AND (duration_ms / 1000) = ?",
+          whereArgs: [title, artist, durationSec],
+        );
+        String? override;
+        for (final s in siblings) {
+          final sFilename = s['filename'] as String;
+          if (basenameForIdentity(sFilename) != basenameKey) continue;
+          override = s['identity_override'] as String;
+          break;
+        }
+        if (override == null) continue;
+
+        await txn.update(
+          'indexed_files',
+          {'identity_override': override},
+          where: 'path = ?',
+          whereArgs: [o['path'] as String],
+        );
+        healed++;
+      }
+      return healed;
+    });
+  }
 
   Future<List<Track>> loadTracks() async {
     final rows = await _db.rawQuery('''
@@ -1386,28 +1471,72 @@ class LibraryRepository {
             txn: txn,
           );
         }
-        // Shared identity_override across the Copy pair. The
-        // user's mental model: "this is one song with two
-        // locations." If they later edit the title on ONE
-        // variant in Mp3tag / Rekordbox / etc, the song-identity
-        // 4-field key would otherwise diverge and the rows would
-        // split into two separate songs in the table. Pinning
-        // both rows to the same identity_override keeps them in
-        // the same bucket regardless of metadata divergence.
+        // Shared identity_override across the Copy pair AND every
+        // existing sibling that's currently grouped with the
+        // source via the 4-field song-identity key. The user's
+        // ontology: ONE song identity → multiple media
+        // representations (codecs) → multiple file instances.
+        // Without widening, copying an MP3 would stamp identity_
+        // override only on source + dest MP3s, leaving an
+        // existing AIFF sibling (grouped via the 4-field key)
+        // orphaned in a different bucket. Codec coexistence
+        // collapses into "filename duplication" — exactly the
+        // ontology drift the 3-layer model is meant to prevent.
         //
-        // If source already has an identity_override (e.g., from
-        // a prior Copy chain or a manual link), reuse it. Else
-        // generate a fresh UUID and stamp BOTH source and dest.
+        // Reconciliation rule:
+        //   - If source already has identity_override (e.g.,
+        //     from a prior Copy chain or manual link), reuse it.
+        //     No widening — existing siblings either already
+        //     share it or are intentionally in a separate
+        //     bucket (manual relink etc).
+        //   - Else: compute the source's 4-field key, find ALL
+        //     other available indexed_files rows that match it
+        //     and have identity_override = NULL (only widen
+        //     siblings using the same key — never hijack rows
+        //     that have their own override), stamp the new
+        //     UUID on source + every match.
         String? sharedOverride =
             row['identity_override'] as String?;
         if (sharedOverride == null) {
           sharedOverride = const Uuid().v4();
-          await txn.update(
+          // Source's 4-field key components — taken from the
+          // indexed_files row we already loaded.
+          final srcBasenameKey =
+              basenameForIdentity(row['filename'] as String);
+          final srcTitle = (row['title'] as String? ?? '');
+          final srcArtist = (row['artist'] as String? ?? '');
+          final srcDurationSec =
+              ((row['duration_ms'] as int?) ?? 0) ~/ 1000;
+          // Find existing siblings — same title, artist, and
+          // whole-second duration; identity_override NULL (don't
+          // widen rows with their own override); available only.
+          // The basename-no-ext check happens in Dart (no SQL
+          // function for it).
+          final candidates = await txn.query(
             'indexed_files',
-            {'identity_override': sharedOverride},
-            where: 'path = ?',
-            whereArgs: [sourcePath],
+            columns: ['path', 'filename'],
+            where: 'identity_override IS NULL '
+                'AND is_available = 1 '
+                'AND title = ? '
+                'AND artist = ? '
+                "AND (duration_ms / 1000) = ?",
+            whereArgs: [srcTitle, srcArtist, srcDurationSec],
           );
+          // Stamp the new override on every candidate whose
+          // basename-no-ext matches the source. That set
+          // includes the source itself.
+          for (final c in candidates) {
+            final cFilename = c['filename'] as String;
+            if (basenameForIdentity(cFilename) != srcBasenameKey) {
+              continue;
+            }
+            await txn.update(
+              'indexed_files',
+              {'identity_override': sharedOverride},
+              where: 'path = ?',
+              whereArgs: [c['path']],
+            );
+          }
         }
         final newRow = Map<String, Object?>.from(row);
         newRow['path'] = destPath;

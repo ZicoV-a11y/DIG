@@ -4,6 +4,7 @@ import '../models/source.dart';
 import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
+import '../utils/file_format.dart';
 
 /// Summary of a Move/Copy batch the dialog completed. Returned to
 /// the caller so a SnackBar / log line can narrate the result.
@@ -63,12 +64,59 @@ class _MoveCopyDialogState extends State<_MoveCopyDialog> {
   bool _isCopy = true;
   final Set<String> _selectedDestIds = {};
   bool _busy = false;
+  /// The physical file the user is choosing to act on. When the
+  /// underlying bucket has multiple codec variants (e.g. MP3 + AIFF
+  /// + WAV), the picker lets the user pick which one to move/copy —
+  /// codec choice is operationally meaningful for DJs (lossless for
+  /// home listening, MP3 for travel/USB drives). Defaults to the
+  /// row the user right-clicked; falls back to that on first frame.
+  late Track _selectedVariant = widget.track;
+
+  @override
+  void initState() {
+    super.initState();
+    // Re-render when the controller's track list mutates — file
+    // watcher events (external delete / rename), scan completions,
+    // and Copy/Move side effects all flow through here. Without
+    // this, the dialog freezes its variant snapshot at open time
+    // and silently lies about what's on disk.
+    widget.controller.addListener(_onControllerChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onControllerChanged);
+    super.dispose();
+  }
+
+  void _onControllerChanged() {
+    if (!mounted) return;
+    setState(() {
+      // If the selected variant disappeared (file deleted externally
+      // while the dialog was open), pick the most-recently-found
+      // surviving variant of the same bucket as the new default.
+      // Falls back to widget.track as a last resort — the picker
+      // still renders even if all variants are gone.
+      final fresh = widget.controller.variantsFor(widget.track);
+      final stillExists = fresh.any(
+        (v) => v.path == _selectedVariant.path,
+      );
+      if (!stillExists && fresh.isNotEmpty) {
+        _selectedVariant = fresh.first;
+        _selectedDestIds.remove(_selectedVariant.sourceId);
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     final destinations = _validDestinations();
-    final currentSource = _findSource(widget.track.sourceId);
+    final currentSource = _findSource(_selectedVariant.sourceId);
     final canApply = !_busy && _selectedDestIds.isNotEmpty;
+    // Recompute each build — the dialog stays in sync with external
+    // file events via the controller listener above.
+    final variants = widget.controller.variantsFor(widget.track);
+    final hasMultipleVariants = variants.length > 1;
 
     return Center(
       child: Material(
@@ -80,16 +128,26 @@ class _MoveCopyDialogState extends State<_MoveCopyDialog> {
         elevation: 10,
         child: SizedBox(
           width: 620,
-          height: 560,
+          height: hasMultipleVariants ? 640 : 560,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               _Header(
-                track: widget.track,
+                track: _selectedVariant,
                 currentSource: currentSource,
                 onClose: () => Navigator.of(context).pop(),
               ),
               const Divider(height: 1, color: AppColors.border),
+              if (hasMultipleVariants) ...[
+                _VariantPicker(
+                  variants: variants,
+                  selected: _selectedVariant,
+                  resolveSourceName: (sourceId) =>
+                      _findSource(sourceId)?.displayName ?? '—',
+                  onChanged: _selectVariant,
+                ),
+                const Divider(height: 1, color: AppColors.border),
+              ],
               _ActionToggle(
                 isCopy: _isCopy,
                 onChanged: (copy) {
@@ -120,7 +178,8 @@ class _MoveCopyDialogState extends State<_MoveCopyDialog> {
                               source: dest,
                               checked: _selectedDestIds.contains(dest.id),
                               multiSelect: _isCopy,
-                              isCurrent: dest.id == widget.track.sourceId,
+                              isCurrent:
+                                  dest.id == _selectedVariant.sourceId,
                               onToggle: () => _toggle(dest.id),
                             ),
                         ],
@@ -140,6 +199,16 @@ class _MoveCopyDialogState extends State<_MoveCopyDialog> {
         ),
       ),
     );
+  }
+
+  void _selectVariant(Track v) {
+    setState(() {
+      _selectedVariant = v;
+      // If the previously-selected destination is now the variant's
+      // own source (copying to itself is rejected by the repo), drop
+      // it from the selection so the Apply button reflects reality.
+      _selectedDestIds.remove(v.sourceId);
+    });
   }
 
   void _toggle(String destId) {
@@ -198,7 +267,7 @@ class _MoveCopyDialogState extends State<_MoveCopyDialog> {
       // the user partial-success feedback if one destination fails.
       for (final dest in picked) {
         final r = await widget.controller.copyTrack(
-          track: widget.track,
+          track: _selectedVariant,
           destSource: dest,
         );
         if (r.success) {
@@ -215,7 +284,7 @@ class _MoveCopyDialogState extends State<_MoveCopyDialog> {
       // single-select toggle in _toggle).
       final dest = picked.single;
       final r = await widget.controller.moveTrack(
-        track: widget.track,
+        track: _selectedVariant,
         destSource: dest,
       );
       if (r.success) {
@@ -300,6 +369,141 @@ class _Header extends StatelessWidget {
             splashRadius: 14,
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Picker shown when the bucket has more than one physical variant
+/// (e.g. an MP3, an AIFF, and a WAV that all share one song
+/// identity). Codec choice is operationally meaningful — DJs pick
+/// lossless for home decks and MP3 for travel drives — so the user
+/// gets to choose which file the Move/Copy will actually act on,
+/// rather than silently defaulting to whichever variant happened to
+/// be the bucket's primary row.
+///
+/// One row per physical file. Codec label is the lead so the eye
+/// scans down the format column; the source + filename appear as
+/// secondary context to disambiguate same-codec siblings.
+class _VariantPicker extends StatelessWidget {
+  final List<Track> variants;
+  final Track selected;
+  final String Function(String sourceId) resolveSourceName;
+  final ValueChanged<Track> onChanged;
+
+  const _VariantPicker({
+    required this.variants,
+    required this.selected,
+    required this.resolveSourceName,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Text(
+                'VARIANT',
+                style: TextStyle(
+                  color: AppColors.textTertiary,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                  letterSpacing: 1.0,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                '${variants.length} variants of this song',
+                style: const TextStyle(
+                  color: AppColors.textTertiary,
+                  fontSize: 11,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          for (final v in variants)
+            _VariantRow(
+              variant: v,
+              selected: identical(v, selected) || v.path == selected.path,
+              sourceName: resolveSourceName(v.sourceId),
+              onTap: () => onChanged(v),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _VariantRow extends StatelessWidget {
+  final Track variant;
+  final bool selected;
+  final String sourceName;
+  final VoidCallback onTap;
+  const _VariantRow({
+    required this.variant,
+    required this.selected,
+    required this.sourceName,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final codec = fileFormatLabel(variant.filename);
+    final codecLabel = codec.isEmpty ? 'FILE' : codec;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        hoverColor: AppColors.hoverRow,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+          child: Row(
+            children: [
+              Icon(
+                selected
+                    ? Icons.radio_button_checked_rounded
+                    : Icons.radio_button_unchecked_rounded,
+                size: 14,
+                color: selected
+                    ? AppColors.accent
+                    : AppColors.textTertiary,
+              ),
+              const SizedBox(width: 10),
+              SizedBox(
+                width: 56,
+                child: Text(
+                  codecLabel,
+                  style: TextStyle(
+                    color: selected
+                        ? AppColors.textPrimary
+                        : AppColors.textSecondary,
+                    fontSize: 12,
+                    fontWeight:
+                        selected ? FontWeight.w600 : FontWeight.w500,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: Text(
+                  '$sourceName / ${variant.filename}',
+                  style: const TextStyle(
+                    color: AppColors.textTertiary,
+                    fontSize: 11,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

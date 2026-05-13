@@ -10,6 +10,7 @@ import '../utils/file_format.dart';
 import 'link_track_dialog.dart';
 import 'move_copy_dialog.dart';
 import 'track_artwork.dart';
+import 'track_history_popup.dart';
 import 'variant_metadata_dialog.dart';
 
 class TrackTable extends StatefulWidget {
@@ -934,6 +935,14 @@ class _TrackRow extends StatelessWidget {
         (aggView.titleDivergent || aggView.artistDivergent)) {
       items.add(_showVariantMetadataMenuItem());
     }
+    // View history — opens the per-row causal-inspection popup with
+    // the chronological event chain for this File Instance. Always
+    // available (the popup itself handles the "no events yet"
+    // empty state). Placed in the inspection group above Move/Copy
+    // so deliberate-action items stay clustered at the bottom of
+    // the menu.
+    items.add(_viewHistoryMenuItem());
+
     // Move/Copy entry — single item that opens a modal picker.
     // The old flat-list approach (one item per destination per
     // action) didn't scale past 3-4 sources; this single entry
@@ -1009,6 +1018,12 @@ class _TrackRow extends StatelessWidget {
       await showVariantMetadataDialog(
         context: context,
         view: view,
+      );
+    } else if (result == 'view-history' && context.mounted) {
+      await showTrackHistoryPopup(
+        context: context,
+        controller: controller,
+        track: track,
       );
     } else if (result == 'move-copy' && context.mounted) {
       // Open the modal picker. It owns the action toggle (Copy /
@@ -1234,6 +1249,31 @@ class _TrackRow extends StatelessWidget {
                 color: AppColors.textPrimary,
                 fontSize: 12,
               ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _viewHistoryMenuItem() {
+    return const PopupMenuItem<String>(
+      value: 'view-history',
+      height: 32,
+      child: Row(
+        children: [
+          Icon(
+            Icons.history_rounded,
+            size: 14,
+            color: AppColors.textSecondary,
+          ),
+          SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'View history',
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
               overflow: TextOverflow.ellipsis,
               maxLines: 1,
             ),

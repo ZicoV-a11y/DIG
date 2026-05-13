@@ -1823,6 +1823,124 @@ class LibraryRepository {
     return (row.first['c'] as int?) ?? 0;
   }
 
+  /// Full event chain for [path] in chronological order (newest
+  /// first). Powers the right-click "View history" popup over track
+  /// rows. Returns the causal record of how this File Instance came
+  /// to be in its current state.
+  ///
+  /// Two query passes, unioned and sorted in Dart so the SQL stays
+  /// straightforward:
+  ///
+  ///   1. Events whose `path` column equals [path] — content updates,
+  ///      manual relinks, app-move SOURCE side, supersession decisions
+  ///      where this row is the missing party, removals, purges.
+  ///   2. Events that *reference* [path] in their payload — auto-move
+  ///      and app-move events where this path appears as
+  ///      `successor_path` or `dest_path` (i.e. this row is the
+  ///      destination of a move). Found via LIKE matching against
+  ///      the JSON fragment that the canonical [jsonEncode]
+  ///      writer produces.
+  ///
+  /// Aggregate events (`path = NULL`) and unrelated rows are excluded
+  /// by construction. The reference-payload search depends on
+  /// consistent JSON serialization — [ActivityEvent]'s recorder
+  /// uses `jsonEncode` throughout, so the fragment matches without
+  /// custom escaping. If a future writer ever produces different
+  /// JSON for the same logical payload, this query under-counts.
+  /// (Live with that until it bites; the chance is small and tests
+  /// pin the current encoding.)
+  Future<List<ActivityEvent>> loadHistoryForPath(String path) async {
+    // Direct events.
+    final direct = await _db.rawQuery(
+      'SELECT id, recorded_at, event_type, path, source_id, payload '
+      'FROM events '
+      'WHERE path = ? '
+      'ORDER BY recorded_at DESC, id DESC',
+      [path],
+    );
+
+    // Reference events — payload has this path as successor or
+    // destination. The fragment includes the surrounding quotes and
+    // colon so we don't accidentally match a path that only appears
+    // as a substring of another field's value. Note we escape
+    // backslashes and quotes in the path the same way jsonEncode
+    // would have when the event was written — keeps the LIKE
+    // pattern in sync with the stored payload.
+    final encodedPath = _encodePathForJsonFragment(path);
+    final successorPattern = '%"successor_path":"$encodedPath"%';
+    final destPattern = '%"dest_path":"$encodedPath"%';
+    final referencing = await _db.rawQuery(
+      'SELECT id, recorded_at, event_type, path, source_id, payload '
+      'FROM events '
+      // ESCAPE '|' makes the pipe-escaped LIKE wildcards (|% and
+      // |_) match literal % and _ — needed because real filenames
+      // routinely contain underscores. We deliberately do NOT use
+      // backslash as the escape character because jsonEncode emits
+      // backslashes for its own string escaping (\\ for a literal
+      // backslash, \" for a literal quote); using \ as the LIKE
+      // escape would collide with those bytes and produce false
+      // negatives on any path containing a quote or backslash.
+      "WHERE (payload LIKE ? ESCAPE '|' OR payload LIKE ? ESCAPE '|') "
+      // Don't double-count events that already came from the direct
+      // query (path = ? side). A real-world collision would be a
+      // move event whose source path happens to equal its dest path,
+      // which the FS layer rejects — but the guard is cheap.
+      'AND (path IS NULL OR path <> ?) '
+      'ORDER BY recorded_at DESC, id DESC',
+      [successorPattern, destPattern, path],
+    );
+
+    // Merge + de-dupe by event id (the queries are disjoint by
+    // construction, but ids are the safe key if that ever changes).
+    final seen = <int>{};
+    final out = <ActivityEvent>[];
+    for (final r in [...direct, ...referencing]) {
+      final id = r['id'] as int;
+      if (!seen.add(id)) continue;
+      out.add(ActivityEvent.fromRow(r));
+    }
+    // Direct + referencing each came pre-sorted, but the merged set
+    // may not be. Sort once at the end.
+    out.sort((a, b) {
+      final byTime = b.recordedAt.compareTo(a.recordedAt);
+      if (byTime != 0) return byTime;
+      return b.id.compareTo(a.id);
+    });
+    return out;
+  }
+
+  /// Mirror of [jsonEncode]'s string escaping for the subset of
+  /// characters that can appear in a filesystem path, then escape
+  /// LIKE wildcards so the resulting fragment matches the literal
+  /// bytes stored in `events.payload`.
+  ///
+  /// Two stages, applied in order:
+  ///   1. JSON escapes — `\` → `\\`, `"` → `\"`. These are the
+  ///      exact two-character sequences `jsonEncode` writes to the
+  ///      payload column for those characters in a string value.
+  ///      Path-relevant control chars (newline, tab) aren't
+  ///      expected in real-world basenames so they're omitted.
+  ///   2. LIKE escapes — `|` → `||`, `%` → `|%`, `_` → `|_`. The
+  ///      escape character is `|` (NOT `\`) because stage 1 has
+  ///      already introduced backslashes; using `\` as the LIKE
+  ///      escape would collide with them and produce false
+  ///      negatives. `|` is rare in paths and not produced by JSON
+  ///      escaping, so it's a safe sentinel.
+  ///
+  /// The `|` escapes are emitted in pairs that SQLite collapses to
+  /// a literal character under `ESCAPE '|'`. The caller must thread
+  /// `ESCAPE '|'` to the LIKE clause for this to work.
+  String _encodePathForJsonFragment(String path) {
+    var s = path.replaceAll(r'\', r'\\');
+    s = s.replaceAll('"', r'\"');
+    // LIKE escapes — | first so we don't double-escape the escape
+    // character we're about to introduce on the next two lines.
+    s = s.replaceAll('|', '||');
+    s = s.replaceAll('%', '|%');
+    s = s.replaceAll('_', '|_');
+    return s;
+  }
+
   /// Most recent lifecycle event affecting [path], or `null` when
   /// none has been recorded. Used by lineage-narration surfaces
   /// (currently: Review-missing dialog) to render *why* a row is in

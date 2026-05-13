@@ -16,7 +16,7 @@ class AppDatabase {
   // v7 adds `sources.parent_source_id` + `sources.path_prefix` so a
   // folder picked inside an already-watched source becomes a virtual
   // "sub-view" instead of a duplicate scanning source.
-  static const _schemaVersion = 12;
+  static const _schemaVersion = 13;
 
   late final Database _db;
 
@@ -140,6 +140,7 @@ class AppDatabase {
         is_available INTEGER NOT NULL DEFAULT 1,
         availability_state TEXT NOT NULL DEFAULT 'available',
         last_seen_at INTEGER NOT NULL,
+        first_seen_at INTEGER NOT NULL DEFAULT 0,
         title TEXT NOT NULL,
         artist TEXT NOT NULL DEFAULT '',
         album TEXT NOT NULL DEFAULT '',
@@ -253,6 +254,55 @@ class AppDatabase {
     if (oldVersion < 12) {
       await _migrateV11toV12(db);
     }
+    if (oldVersion < 13) {
+      await _migrateV12toV13(db);
+    }
+  }
+
+  /// Add `indexed_files.first_seen_at` — the temporal anchor for
+  /// every File Instance. Records when the row was first observed
+  /// at its current path. Future supersession (Phase 2) uses this
+  /// for the temporal-after check: a successor's `first_seen_at`
+  /// must be ≥ the missing row's `last_seen_at` for an auto-
+  /// supersession decision to be safe.
+  ///
+  /// This slice ships the column only. No behavioral consumer
+  /// lands until Phase 2 — keeping the temporal infrastructure
+  /// stable in isolation, debuggable independently from
+  /// supersession heuristics.
+  ///
+  /// Idempotent — safe to retry after a partial migration.
+  /// Backfill rule: pre-existing rows have `first_seen_at = 0`
+  /// from the default; we bring them forward to `last_seen_at`
+  /// as a conservative "we don't know any earlier than the last
+  /// observation." This is intentionally weak — the temporal-
+  /// after check will tighten naturally as new INSERT-time
+  /// values accumulate over real-world use.
+  static Future<void> _migrateV12toV13(Database db) async {
+    debugPrint(
+      '[db] starting v12 → v13 migration (indexed_files.first_seen_at)',
+    );
+    final stopwatch = Stopwatch()..start();
+
+    final columns = await db.rawQuery('PRAGMA table_info(indexed_files)');
+    final hasColumn =
+        columns.any((c) => c['name'] == 'first_seen_at');
+    if (!hasColumn) {
+      await db.execute(
+        'ALTER TABLE indexed_files '
+        'ADD COLUMN first_seen_at INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+    final backfilled = await db.rawUpdate(
+      'UPDATE indexed_files '
+      'SET first_seen_at = last_seen_at '
+      'WHERE first_seen_at = 0',
+    );
+
+    debugPrint(
+      '[db] v12 → v13 done in ${stopwatch.elapsedMilliseconds}ms '
+      '($backfilled rows backfilled).',
+    );
   }
 
   /// Data-only migration: dedupe `indexed_files.uid` collisions

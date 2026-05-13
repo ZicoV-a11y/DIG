@@ -310,6 +310,7 @@ class LibraryRepository {
             'is_available': 1,
             'availability_state': 'available',
             'last_seen_at': now,
+            'first_seen_at': now,
             'title': f.fallbackTitle,
           });
           inserted++;
@@ -561,6 +562,7 @@ class LibraryRepository {
           'intel_uid': null,
           'is_available': 1,
           'last_seen_at': now,
+          'first_seen_at': now,
           'title': file.fallbackTitle,
         });
         return;
@@ -1300,10 +1302,18 @@ class LibraryRepository {
         newRow['path'] = destPath;
         newRow['source_id'] = destSource.id;
         newRow['filename'] = basename;
-        // last_seen_at bumped to NOW — the file was just observed
-        // at the new path by us, not by a scan, so this counts as
-        // a fresh sighting.
-        newRow['last_seen_at'] = DateTime.now().millisecondsSinceEpoch;
+        // last_seen_at + first_seen_at bumped to NOW — the file was
+        // just observed at the new path by us, not by a scan, so
+        // this counts as a fresh sighting. `first_seen_at` is per
+        // File Instance (path-bound), not per Track Identity — the
+        // destination is a new Instance even if the underlying
+        // bytes were already known elsewhere. This is also what
+        // makes Phase 2's temporal-after check work cleanly: the
+        // missing source row's `last_seen_at` will be ≤ the dest
+        // row's `first_seen_at` for any well-formed move.
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        newRow['last_seen_at'] = nowMs;
+        newRow['first_seen_at'] = nowMs;
         // is_available + availability_state: file IS available now,
         // ensure both reflect that even if the source row was
         // somehow in a non-available state (which shouldn't happen
@@ -1550,7 +1560,12 @@ class LibraryRepository {
         // intel at the song-identity layer.
         newRow['is_available'] = 1;
         newRow['availability_state'] = 'available';
-        newRow['last_seen_at'] = DateTime.now().millisecondsSinceEpoch;
+        // Fresh sighting at a new path; see the Move destination
+        // comment in moveTrackFile for the per-File-Instance
+        // first_seen_at rationale.
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        newRow['last_seen_at'] = nowMs;
+        newRow['first_seen_at'] = nowMs;
         await txn.insert('indexed_files', newRow);
         await recordEvent(
           type: EventType.appInitiatedCopy,

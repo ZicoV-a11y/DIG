@@ -183,7 +183,7 @@ class _ReviewMissingDialogState extends State<_ReviewMissingDialog> {
                                       "detected in any watched folder — so "
                                       'it was removed from the library\'s '
                                       'view (intel preserved). Purge if you '
-                                      'intended to lose it; restore the file '
+                                      'intended to lose it; put the file back '
                                       'or add its new folder as a source if '
                                       'not.',
                                   count: missing.length,

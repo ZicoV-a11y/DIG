@@ -239,8 +239,8 @@ class _Header extends StatelessWidget {
                 const SizedBox(height: 2),
                 Text(
                   'Switch the running app to a different library reality. '
-                  'Your current state is saved as a snapshot first; you '
-                  'can always return to it.',
+                  'Your current state is saved as a lineage point first; '
+                  'you can always return to it.',
                   style: const TextStyle(
                     color: AppColors.textSecondary,
                     fontSize: 11,

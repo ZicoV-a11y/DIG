@@ -188,9 +188,16 @@ void main() {
     expect(list.first.source, OperationalStateSource.currentDevice);
   });
 
-  test('enrichPreview returns failure on non-SQLite file', () async {
-    // Plain text file is NOT a valid SQLite DB. enrichPreview
-    // should return StatePreview.failure instead of throwing.
+  test('enrichPreview degrades gracefully on non-SQLite content',
+      () async {
+    // Plain text file with a `.library` extension. Two valid
+    // outcomes depending on platform sqflite behavior:
+    //   (a) open succeeds → all per-query stats return null;
+    //       errored stays false (UI renders "—" for each stat).
+    //   (b) open fails    → errored is true with a SANITISED
+    //       message — never a raw SqliteException dump.
+    // In both cases the user-facing UI never sees SQL exception
+    // text.
     final f = await placeFile(root.systemsDir, 'MACNEO.library');
     final list = await browser.listOperationalStates(
       currentMachineId: 'MACNEO',
@@ -198,7 +205,20 @@ void main() {
     final state = list.first;
     expect(state.filePath, f.path);
     final preview = await browser.enrichPreview(state);
-    expect(preview.errored, isTrue);
-    expect(preview.errorMessage, isNotNull);
+    if (preview.errored) {
+      // (b) — when open failed, the message must NOT leak SQL
+      // exception internals.
+      expect(preview.errorMessage, isNotNull);
+      expect(preview.errorMessage!.toLowerCase(),
+          isNot(contains('sqfliteffiexception')));
+      expect(preview.errorMessage!.toLowerCase(),
+          isNot(contains('sqliteexception')));
+    } else {
+      // (a) — open succeeded; individual queries failed silently.
+      // All stats null, recentEvents null, no error surfaced.
+      expect(preview.trackCount, isNull);
+      expect(preview.favoriteCount, isNull);
+      expect(preview.recentEvents, isNull);
+    }
   });
 }

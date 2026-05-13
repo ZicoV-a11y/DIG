@@ -134,10 +134,14 @@ class LibraryStateBrowser {
   }
 
   /// Open the selected `.library` file READ-ONLY and fetch a fixed
-  /// set of stats: track count, favorite count, reviewed count,
-  /// total plays, last-played timestamp. Returns
-  /// [StatePreview.failure] gracefully if the file is from an
-  /// incompatible schema version or otherwise unreadable.
+  /// set of stats + recent activity. The preview is the right pane
+  /// of the Load Operational State dialog — it's user-facing, NOT
+  /// developer diagnostics. Each individual query is wrapped in its
+  /// own try/catch so a schema mismatch on ONE column doesn't
+  /// torpedo the entire preview. Raw SQL exception strings are
+  /// kept out of `errorMessage` — users see a calm "Some details
+  /// unavailable" if absolutely necessary, never an SqliteException
+  /// dump.
   ///
   /// Read-only open intentionally — no migrations run, no chance
   /// of mutating the source file just by inspecting it.
@@ -156,23 +160,35 @@ class LibraryStateBrowser {
         state.filePath,
         options: OpenDatabaseOptions(readOnly: true),
       );
-      final trackCount = await _scalarInt(
+    } catch (e) {
+      debugPrint('[browser] open failed for ${state.filePath}: $e');
+      // The file is fundamentally unreadable — not a stats issue,
+      // it's that we can't open it at all. User-facing message
+      // stays generic; the raw exception goes to debug logs.
+      return const StatePreview.failure('Could not read this state file.');
+    }
+    try {
+      // Each scalar query is independently safe — a missing column
+      // on an older schema produces null for THAT stat only, the
+      // rest still render. This is the "preview gracefully degrades"
+      // contract.
+      final trackCount = await _scalarIntSafe(
         db,
         'SELECT COUNT(*) FROM indexed_files',
       );
-      final favoriteCount = await _scalarInt(
+      final favoriteCount = await _scalarIntSafe(
         db,
         'SELECT COUNT(*) FROM tracks WHERE favorite = 1',
       );
-      final reviewedCount = await _scalarInt(
+      final reviewedCount = await _scalarIntSafe(
         db,
-        'SELECT COUNT(*) FROM tracks WHERE cumulative_listened_ms >= 10000',
+        'SELECT COUNT(*) FROM tracks WHERE cumulative_ms >= 10000',
       );
-      final totalPlays = await _scalarInt(
+      final totalPlays = await _scalarIntSafe(
         db,
         'SELECT COALESCE(SUM(play_count), 0) FROM tracks',
       );
-      final lastPlayedMs = await _scalarInt(
+      final lastPlayedMs = await _scalarIntSafe(
         db,
         'SELECT COALESCE(MAX(last_played_at), 0) FROM tracks',
       );
@@ -181,10 +197,10 @@ class LibraryStateBrowser {
         lastPlayedAt =
             DateTime.fromMillisecondsSinceEpoch(lastPlayedMs);
       }
-      // Recent activity — the right pane's narrative. Wrapped in its
-      // own try/catch so a missing `events` table on an old-schema
-      // file degrades gracefully (rest of the preview still
-      // succeeds; UI shows "No recorded activity").
+      // Operational activity — the right pane's narrative. Same
+      // per-query safety: a missing `events` table on an older
+      // schema produces null (UI renders "No recorded activity")
+      // rather than failing the whole preview.
       List<ActivityEvent>? recentEvents;
       try {
         final eventRows = await db.rawQuery(
@@ -208,22 +224,28 @@ class LibraryStateBrowser {
         lastPlayedAt: lastPlayedAt,
         recentEvents: recentEvents,
       );
-    } catch (e) {
-      debugPrint('[browser] preview failed for ${state.filePath}: $e');
-      return StatePreview.failure('Preview unavailable: $e');
     } finally {
       try {
-        await db?.close();
+        await db.close();
       } catch (_) {/* best-effort */}
     }
   }
 
-  Future<int?> _scalarInt(Database db, String sql) async {
-    final rows = await db.rawQuery(sql);
-    if (rows.isEmpty) return null;
-    final value = rows.first.values.first;
-    if (value is int) return value;
-    if (value is num) return value.toInt();
-    return null;
+  /// Per-query safe scalar fetch. Returns null on ANY failure —
+  /// missing column, syntax error, locked file — without
+  /// propagating the exception. Callers treat null as "stat
+  /// unavailable" and render "—".
+  Future<int?> _scalarIntSafe(Database db, String sql) async {
+    try {
+      final rows = await db.rawQuery(sql);
+      if (rows.isEmpty) return null;
+      final value = rows.first.values.first;
+      if (value is int) return value;
+      if (value is num) return value.toInt();
+      return null;
+    } catch (e) {
+      debugPrint('[browser] scalar query failed: $sql — $e');
+      return null;
+    }
   }
 }

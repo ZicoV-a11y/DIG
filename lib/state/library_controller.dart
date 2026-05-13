@@ -327,6 +327,17 @@ class LibraryController extends ChangeNotifier {
   /// check that avoids 20 identical files when nothing changed.
   DateTime? _lastSnapshotDbMtime;
 
+  // Lightweight operational-journal accumulators. Counters
+  // increment as user actions happen; at every `_snapshotNow`
+  // tick the non-zero values are flushed into the `events` table
+  // as aggregate entries (e.g. `tracks_played` with
+  // `{"count": 14}`), then reset. Drives the "Changes in this
+  // save period" narrative in the Load Operational State dialog
+  // without building full event sourcing. See `activity_event.dart`
+  // EventType.tracksPlayed / favoritesAdded.
+  int _playsSinceSnapshot = 0;
+  int _favoritesAddedSinceSnapshot = 0;
+
   LibraryController({
     required this.engine,
     required this.repo,
@@ -609,6 +620,11 @@ class LibraryController extends ChangeNotifier {
     final root = libraryRoot;
     if (mgr == null || root == null) return;
     final liveDbPath = root.deviceLiveDbPath(_machineId);
+    // Flush the operational-journal accumulators FIRST so any
+    // aggregate entries land in the live DB before the snapshot
+    // copy captures it. Each non-zero counter becomes one row in
+    // the `events` table with a count payload; counters reset.
+    await _flushJournalAccumulators();
     try {
       final file = await mgr.snapshot(
         libraryName: _libraryName,
@@ -628,6 +644,43 @@ class LibraryController extends ChangeNotifier {
       );
     } catch (e) {
       debugPrint('[autosave] compatibility mirror failed: $e');
+    }
+  }
+
+  /// Drain the operational-journal accumulators into the `events`
+  /// table as aggregate entries, then reset the counters. Called
+  /// at the top of `_snapshotNow` so each save period gets one
+  /// row per non-zero counter (e.g. `tracks_played` with
+  /// `{"count": 14}`), rendered in the Load Operational State
+  /// dialog as "Played 14 tracks" / "Added 3 favorites".
+  ///
+  /// Failures are best-effort and logged — the journal is
+  /// observability, not critical data. We never block the
+  /// snapshot waiting for a journal write.
+  Future<void> _flushJournalAccumulators() async {
+    final plays = _playsSinceSnapshot;
+    final favorites = _favoritesAddedSinceSnapshot;
+    _playsSinceSnapshot = 0;
+    _favoritesAddedSinceSnapshot = 0;
+    if (plays > 0) {
+      try {
+        await repo.recordEvent(
+          type: EventType.tracksPlayed,
+          payload: {'count': plays},
+        );
+      } catch (e) {
+        debugPrint('[journal] tracks_played flush failed: $e');
+      }
+    }
+    if (favorites > 0) {
+      try {
+        await repo.recordEvent(
+          type: EventType.favoritesAdded,
+          payload: {'count': favorites},
+        );
+      } catch (e) {
+        debugPrint('[journal] favorites_added flush failed: $e');
+      }
     }
   }
 
@@ -2272,6 +2325,20 @@ class LibraryController extends ChangeNotifier {
       // unhashed.
       _backfillWorker.start();
       notifyListeners();
+      // Record a journal entry first — single event per scan
+      // completion, not aggregated. Surfaces in the Load
+      // Operational State dialog as "Library scan completed —
+      // {source}". Best-effort; failure doesn't block the
+      // lifecycle save below.
+      try {
+        await repo.recordEvent(
+          type: EventType.scanCompleted,
+          sourceId: source.id,
+          payload: {'source_name': source.displayName},
+        );
+      } catch (e) {
+        debugPrint('[journal] scan_completed write failed: $e');
+      }
       // Lifecycle save: a scan is a meaningful checkpoint — new
       // rows, new content_hash, often new artwork/metadata. Save
       // even if the autosave tick wouldn't fire for another few
@@ -2677,6 +2744,13 @@ class LibraryController extends ChangeNotifier {
     // sibling expects to turn the star ON, not OFF, and toggling
     // against the aggregate would silently un-favorite.
     final next = !t.favorite;
+
+    // Operational journal accumulator — only direction false→true
+    // counts as "favorited" for the save period narrative.
+    // Toggling back off doesn't decrement.
+    if (next && !t.favorite) {
+      _favoritesAddedSinceSnapshot += 1;
+    }
 
     // Optimistic in-memory flip on every bucket variant so the UI
     // updates instantly. _writeBucketIntelligence below will
@@ -3149,6 +3223,10 @@ class LibraryController extends ChangeNotifier {
           if (shouldCountSession) {
             _sessionPlayCounted = true;
             track.playCount += 1;
+            // Operational journal accumulator — increment the
+            // per-save-period "tracks played" counter. Flushed
+            // to the events table at the next autosave tick.
+            _playsSinceSnapshot += 1;
           }
           _pushRecentReviewed(track.uid);
           _markLibraryDirty();

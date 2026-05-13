@@ -76,6 +76,32 @@ abstract class EventType {
   /// Payload: `{"old_content_hash_prefix": "abc12345",
   ///            "new_content_hash_prefix": "def67890"}`.
   static const contentUpdatedExternal = 'content_updated_external';
+
+  // -------------------------------------------------------------
+  // Lightweight operational-journal entries — aggregate user-
+  // activity summaries written at autosave boundaries. NOT full
+  // event sourcing; just human-readable counts so the Load
+  // Operational State dialog can answer "what happened during
+  // this save period?" without parsing low-level state.
+  // -------------------------------------------------------------
+
+  /// One or more tracks were played during this save period.
+  /// Aggregated at autosave time. Path is null (multi-subject).
+  /// Payload: `{"count": <int>}`.
+  static const tracksPlayed = 'tracks_played';
+
+  /// One or more favorites were added during this save period
+  /// (favorite flag went `false → true`). Aggregated at autosave
+  /// time. Path is null (multi-subject). Toggling OFF doesn't
+  /// decrement the count — direction-only.
+  /// Payload: `{"count": <int>}`.
+  static const favoritesAdded = 'favorites_added';
+
+  /// A library scan finished. Single event per scan completion,
+  /// not aggregated. Path is null; source attribution lives in
+  /// payload.
+  /// Payload: `{"source_name": "Afro:Tech:Deep"}`.
+  static const scanCompleted = 'scan_completed';
 }
 
 /// Hydrated event row. Constructed by [LibraryRepository.loadRecentEvents]

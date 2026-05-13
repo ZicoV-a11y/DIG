@@ -616,26 +616,32 @@ class _PreviewPane extends StatelessWidget {
           ),
           const SizedBox(height: 14),
           const Divider(height: 1, color: AppColors.border),
-          const SizedBox(height: 12),
+          const SizedBox(height: 14),
+          // "Changes in this save period" — the right pane's
+          // narrative is what happened during this operational
+          // reality, not database diagnostics or file paths.
+          const _SectionLabel('CHANGES IN THIS SAVE PERIOD'),
+          const SizedBox(height: 2),
+          const Text(
+            'Last 25 operational changes',
+            style: TextStyle(
+              color: AppColors.textTertiary,
+              fontSize: 10,
+            ),
+          ),
+          const SizedBox(height: 10),
           if (loading)
             const _PreviewLoading()
           else if (preview == null)
             const SizedBox.shrink()
           else if (preview!.errored)
             _PreviewError(message: preview!.errorMessage ?? '')
-          else ...[
-            // Compact stats band — small, top of the pane. The
-            // *activity timeline* below is the main attraction.
-            _PreviewStatsBand(preview: preview!),
-            const SizedBox(height: 16),
-            const _SectionLabel('OPERATIONAL ACTIVITY'),
-            const SizedBox(height: 6),
+          else
             Expanded(
               child: _ActivityTimeline(
                 events: preview!.recentEvents,
               ),
             ),
-          ],
         ],
       ),
     );
@@ -656,78 +662,6 @@ class _SectionLabel extends StatelessWidget {
         fontWeight: FontWeight.w600,
         letterSpacing: 1.2,
       ),
-    );
-  }
-}
-
-class _PreviewStatsBand extends StatelessWidget {
-  final StatePreview preview;
-  const _PreviewStatsBand({required this.preview});
-
-  @override
-  Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 18,
-      runSpacing: 6,
-      children: [
-        _StatChip(
-          label: 'Tracks',
-          value: _intOrDash(preview.trackCount),
-        ),
-        _StatChip(
-          label: 'Favorites',
-          value: _intOrDash(preview.favoriteCount),
-        ),
-        _StatChip(
-          label: 'Reviewed',
-          value: _intOrDash(preview.reviewedCount),
-        ),
-        _StatChip(
-          label: 'Plays',
-          value: _intOrDash(preview.totalPlays),
-        ),
-        _StatChip(
-          label: 'Last played',
-          value: preview.lastPlayedAt == null
-              ? '—'
-              : _displayRelativeAge(preview.lastPlayedAt!),
-        ),
-      ],
-    );
-  }
-}
-
-class _StatChip extends StatelessWidget {
-  final String label;
-  final String value;
-  const _StatChip({required this.label, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          label.toUpperCase(),
-          style: const TextStyle(
-            color: AppColors.textTertiary,
-            fontSize: 9,
-            fontWeight: FontWeight.w600,
-            letterSpacing: 1.0,
-          ),
-        ),
-        const SizedBox(height: 1),
-        Text(
-          value,
-          style: const TextStyle(
-            color: AppColors.textPrimary,
-            fontSize: 13,
-            fontWeight: FontWeight.w500,
-            fontFeatures: [FontFeature.tabularFigures()],
-          ),
-        ),
-      ],
     );
   }
 }
@@ -779,7 +713,7 @@ class _ActivityRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final descriptor = _describeEvent(event.eventType);
+    final descriptor = _describeEvent(event);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
@@ -845,8 +779,38 @@ class _EventDescriptor {
   });
 }
 
-_EventDescriptor _describeEvent(String type) {
-  switch (type) {
+_EventDescriptor _describeEvent(ActivityEvent event) {
+  switch (event.eventType) {
+    // Aggregate operational-journal entries written at each
+    // autosave tick. Counts come from the payload, formatted with
+    // thousands separators so "Played 1,420 tracks" still reads
+    // cleanly during long sessions.
+    case 'tracks_played':
+      final count = _countFrom(event);
+      return _EventDescriptor(
+        label: 'Played ${_formatNumber(count)} '
+            '${count == 1 ? "track" : "tracks"}',
+        icon: Icons.play_circle_filled_rounded,
+        color: AppColors.accent,
+      );
+    case 'favorites_added':
+      final count = _countFrom(event);
+      return _EventDescriptor(
+        label: 'Added ${_formatNumber(count)} '
+            '${count == 1 ? "favorite" : "favorites"}',
+        icon: Icons.star_rounded,
+        color: AppColors.favorite,
+      );
+    case 'scan_completed':
+      final source = event.payload['source_name'] as String?;
+      return _EventDescriptor(
+        label: source == null
+            ? 'Library scan completed'
+            : 'Library scan completed — $source',
+        icon: Icons.refresh_rounded,
+        color: AppColors.reviewed,
+      );
+    // File-lifecycle events — single occurrences with a path.
     case 'removed_external':
       return const _EventDescriptor(
         label: 'File removed externally',
@@ -903,11 +867,18 @@ _EventDescriptor _describeEvent(String type) {
       );
     default:
       return _EventDescriptor(
-        label: type,
+        label: event.eventType,
         icon: Icons.fiber_manual_record,
         color: AppColors.textTertiary,
       );
   }
+}
+
+int _countFrom(ActivityEvent event) {
+  final raw = event.payload['count'];
+  if (raw is int) return raw;
+  if (raw is num) return raw.toInt();
+  return 0;
 }
 
 String _basename(String path) {
@@ -1040,13 +1011,9 @@ class _Footer extends StatelessWidget {
   }
 }
 
-String _intOrDash(int? v) {
-  if (v == null) return '—';
-  return _formatNumber(v);
-}
-
+/// Thousands separator, no locale dependency. Used by activity-row
+/// labels that render aggregate counts ("Played 14 tracks").
 String _formatNumber(int v) {
-  // Thousands separator, no locale dependency.
   final s = v.toString();
   final out = StringBuffer();
   var count = 0;

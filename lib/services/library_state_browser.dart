@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import '../models/activity_event.dart';
 import '../models/operational_state.dart';
 import '../models/save_snapshot.dart';
 import '../models/state_preview.dart';
@@ -180,12 +181,32 @@ class LibraryStateBrowser {
         lastPlayedAt =
             DateTime.fromMillisecondsSinceEpoch(lastPlayedMs);
       }
+      // Recent activity — the right pane's narrative. Wrapped in its
+      // own try/catch so a missing `events` table on an old-schema
+      // file degrades gracefully (rest of the preview still
+      // succeeds; UI shows "No recorded activity").
+      List<ActivityEvent>? recentEvents;
+      try {
+        final eventRows = await db.rawQuery(
+          'SELECT id, recorded_at, event_type, path, source_id, payload '
+          'FROM events '
+          'ORDER BY recorded_at DESC, id DESC '
+          'LIMIT 25',
+        );
+        recentEvents = eventRows.map(ActivityEvent.fromRow).toList();
+      } catch (e) {
+        debugPrint(
+          '[browser] events table unavailable for ${state.filePath}: $e',
+        );
+        recentEvents = null;
+      }
       return StatePreview(
         trackCount: trackCount,
         favoriteCount: favoriteCount,
         reviewedCount: reviewedCount,
         totalPlays: totalPlays,
         lastPlayedAt: lastPlayedAt,
+        recentEvents: recentEvents,
       );
     } catch (e) {
       debugPrint('[browser] preview failed for ${state.filePath}: $e');

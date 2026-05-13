@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../models/activity_event.dart';
 import '../models/operational_state.dart';
 import '../models/state_preview.dart';
 import '../services/library_state_browser.dart';
@@ -414,6 +415,10 @@ class _StateRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final disabled = onTap == null;
     final accent = isSelected ? AppColors.accent : Colors.transparent;
+    final at = state.capturedAt;
+    // Time is identity in this system — render date + time as the
+    // dominant element. Device label is supporting metadata; age
+    // and filesize live below as smaller hint text.
     return Material(
       color: Colors.transparent,
       child: InkWell(
@@ -425,57 +430,90 @@ class _StateRow extends StatelessWidget {
               left: BorderSide(color: accent, width: 3),
             ),
           ),
-          padding: const EdgeInsets.fromLTRB(15, 10, 18, 10),
-          child: Row(
+          padding: const EdgeInsets.fromLTRB(15, 12, 18, 12),
+          child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Row(
-                      children: [
-                        Text(
-                          state.machineId,
-                          style: TextStyle(
-                            color: disabled
-                                ? AppColors.textTertiary
-                                : AppColors.textPrimary,
-                            fontSize: 12,
-                            fontWeight: isSelected
-                                ? FontWeight.w600
-                                : FontWeight.w500,
-                          ),
-                        ),
-                        if (state.source ==
-                            OperationalStateSource.currentDevice) ...[
-                          const SizedBox(width: 8),
-                          const _Pill(label: 'LIVE'),
-                        ],
-                      ],
+              // Date — dominant, uppercase, "MAY 12, 2026" form.
+              Text(
+                _displayDateLong(at),
+                style: TextStyle(
+                  color: disabled
+                      ? AppColors.textTertiary
+                      : AppColors.textPrimary,
+                  fontSize: 13,
+                  fontWeight:
+                      isSelected ? FontWeight.w700 : FontWeight.w600,
+                  letterSpacing: 0.6,
+                  height: 1.1,
+                ),
+              ),
+              const SizedBox(height: 2),
+              // Time — strong, second-most-prominent.
+              Row(
+                children: [
+                  Text(
+                    _displayTime(at),
+                    style: TextStyle(
+                      color: disabled
+                          ? AppColors.textTertiary
+                          : AppColors.textPrimary,
+                      fontSize: 16,
+                      fontWeight: isSelected
+                          ? FontWeight.w600
+                          : FontWeight.w500,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                      height: 1.0,
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      '${_displayCapturedAt(state.capturedAt)} '
-                      '• ${_displayFileSize(state.fileSize)}',
-                      style: const TextStyle(
-                        color: AppColors.textSecondary,
-                        fontSize: 11,
-                      ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    _displayRelativeAge(at),
+                    style: const TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 11,
                     ),
-                    if (state.libraryName != null) ...[
-                      const SizedBox(height: 2),
-                      Text(
-                        state.libraryName!,
-                        style: const TextStyle(
-                          color: AppColors.textTertiary,
-                          fontSize: 10,
-                          letterSpacing: 0.5,
-                        ),
-                      ),
-                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              // Device + library + filesize — supporting metadata.
+              Row(
+                children: [
+                  Text(
+                    state.machineId,
+                    style: const TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w500,
+                      letterSpacing: 0.4,
+                    ),
+                  ),
+                  if (state.source ==
+                      OperationalStateSource.currentDevice) ...[
+                    const SizedBox(width: 8),
+                    const _Pill(label: 'LIVE'),
                   ],
+                ],
+              ),
+              if (state.libraryName != null) ...[
+                const SizedBox(height: 1),
+                Text(
+                  state.libraryName!,
+                  style: const TextStyle(
+                    color: AppColors.textTertiary,
+                    fontSize: 10,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 2),
+              Text(
+                _displayFileSize(state.fileSize),
+                style: const TextStyle(
+                  color: AppColors.textTertiary,
+                  fontSize: 10,
                 ),
               ),
             ],
@@ -533,64 +571,349 @@ class _PreviewPane extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // Header — date dominant, then time + library + device.
           Text(
-            s.machineId,
+            _displayDateLong(s.capturedAt),
             style: const TextStyle(
               color: AppColors.textPrimary,
-              fontSize: 14,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 0.4,
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.6,
             ),
           ),
           const SizedBox(height: 4),
           Text(
-            _displayCapturedAt(s.capturedAt),
+            '${_displayTime(s.capturedAt)} • '
+            '${_displayRelativeAge(s.capturedAt)}',
             style: const TextStyle(
               color: AppColors.textSecondary,
-              fontSize: 12,
+              fontSize: 13,
             ),
           ),
-          const SizedBox(height: 2),
-          if (s.libraryName != null)
-            Text(
-              s.libraryName!,
-              style: const TextStyle(
-                color: AppColors.textTertiary,
-                fontSize: 10,
-                letterSpacing: 0.5,
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              Text(
+                s.machineId,
+                style: const TextStyle(
+                  color: AppColors.textTertiary,
+                  fontSize: 11,
+                  letterSpacing: 0.5,
+                ),
               ),
-            ),
-          const SizedBox(height: 18),
+              if (s.libraryName != null) ...[
+                const SizedBox(width: 8),
+                Text(
+                  '• ${s.libraryName!}',
+                  style: const TextStyle(
+                    color: AppColors.textTertiary,
+                    fontSize: 11,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 14),
+          const Divider(height: 1, color: AppColors.border),
+          const SizedBox(height: 12),
           if (loading)
             const _PreviewLoading()
           else if (preview == null)
             const SizedBox.shrink()
           else if (preview!.errored)
             _PreviewError(message: preview!.errorMessage ?? '')
-          else
-            _PreviewStats(preview: preview!),
-          const Spacer(),
+          else ...[
+            // Compact stats band — small, top of the pane. The
+            // *activity timeline* below is the main attraction.
+            _PreviewStatsBand(preview: preview!),
+            const SizedBox(height: 16),
+            const _SectionLabel('OPERATIONAL ACTIVITY'),
+            const SizedBox(height: 6),
+            Expanded(
+              child: _ActivityTimeline(
+                events: preview!.recentEvents,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _SectionLabel extends StatelessWidget {
+  final String label;
+  const _SectionLabel(this.label);
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      label,
+      style: const TextStyle(
+        color: AppColors.textTertiary,
+        fontSize: 10,
+        fontWeight: FontWeight.w600,
+        letterSpacing: 1.2,
+      ),
+    );
+  }
+}
+
+class _PreviewStatsBand extends StatelessWidget {
+  final StatePreview preview;
+  const _PreviewStatsBand({required this.preview});
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 18,
+      runSpacing: 6,
+      children: [
+        _StatChip(
+          label: 'Tracks',
+          value: _intOrDash(preview.trackCount),
+        ),
+        _StatChip(
+          label: 'Favorites',
+          value: _intOrDash(preview.favoriteCount),
+        ),
+        _StatChip(
+          label: 'Reviewed',
+          value: _intOrDash(preview.reviewedCount),
+        ),
+        _StatChip(
+          label: 'Plays',
+          value: _intOrDash(preview.totalPlays),
+        ),
+        _StatChip(
+          label: 'Last played',
+          value: preview.lastPlayedAt == null
+              ? '—'
+              : _displayRelativeAge(preview.lastPlayedAt!),
+        ),
+      ],
+    );
+  }
+}
+
+class _StatChip extends StatelessWidget {
+  final String label;
+  final String value;
+  const _StatChip({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          label.toUpperCase(),
+          style: const TextStyle(
+            color: AppColors.textTertiary,
+            fontSize: 9,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 1.0,
+          ),
+        ),
+        const SizedBox(height: 1),
+        Text(
+          value,
+          style: const TextStyle(
+            color: AppColors.textPrimary,
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+            fontFeatures: [FontFeature.tabularFigures()],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _ActivityTimeline extends StatelessWidget {
+  final List<ActivityEvent>? events;
+  const _ActivityTimeline({required this.events});
+
+  @override
+  Widget build(BuildContext context) {
+    final list = events;
+    if (list == null) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8),
+        child: Text(
+          'No recorded activity (older state file).',
+          style: TextStyle(
+            color: AppColors.textTertiary,
+            fontSize: 11,
+            fontStyle: FontStyle.italic,
+          ),
+        ),
+      );
+    }
+    if (list.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8),
+        child: Text(
+          'No activity has been logged in this state yet.',
+          style: TextStyle(
+            color: AppColors.textTertiary,
+            fontSize: 11,
+            fontStyle: FontStyle.italic,
+          ),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: EdgeInsets.zero,
+      itemCount: list.length,
+      itemBuilder: (_, i) => _ActivityRow(event: list[i]),
+    );
+  }
+}
+
+class _ActivityRow extends StatelessWidget {
+  final ActivityEvent event;
+  const _ActivityRow({required this.event});
+
+  @override
+  Widget build(BuildContext context) {
+    final descriptor = _describeEvent(event.eventType);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            descriptor.icon,
+            size: 13,
+            color: descriptor.color,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  descriptor.label,
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                if (event.path != null) ...[
+                  const SizedBox(height: 1),
+                  Text(
+                    _basename(event.path!),
+                    style: const TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 10,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
           Text(
-            'File: ${_displayFileSize(s.fileSize)}',
+            _displayRelativeAge(event.recordedAt),
             style: const TextStyle(
               color: AppColors.textTertiary,
               fontSize: 10,
+              fontFeatures: [FontFeature.tabularFigures()],
             ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            s.filePath,
-            style: const TextStyle(
-              color: AppColors.textTertiary,
-              fontSize: 9,
-            ),
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
           ),
         ],
       ),
     );
   }
+}
+
+class _EventDescriptor {
+  final String label;
+  final IconData icon;
+  final Color color;
+  const _EventDescriptor({
+    required this.label,
+    required this.icon,
+    required this.color,
+  });
+}
+
+_EventDescriptor _describeEvent(String type) {
+  switch (type) {
+    case 'removed_external':
+      return const _EventDescriptor(
+        label: 'File removed externally',
+        icon: Icons.link_off_rounded,
+        color: AppColors.favorite,
+      );
+    case 'auto_move_same_source':
+      return const _EventDescriptor(
+        label: 'Auto-resolved as moved (same source)',
+        icon: Icons.drive_file_move_rounded,
+        color: AppColors.reviewed,
+      );
+    case 'auto_move_cross_source':
+      return const _EventDescriptor(
+        label: 'Auto-resolved as moved (across sources)',
+        icon: Icons.swap_horiz_rounded,
+        color: AppColors.reviewed,
+      );
+    case 'found_elsewhere':
+      return const _EventDescriptor(
+        label: 'Found coexisting copy elsewhere',
+        icon: Icons.content_copy_rounded,
+        color: AppColors.reviewed,
+      );
+    case 'purged':
+      return const _EventDescriptor(
+        label: 'Purged from library',
+        icon: Icons.delete_sweep_rounded,
+        color: AppColors.textSecondary,
+      );
+    case 'manual_relink':
+      return const _EventDescriptor(
+        label: 'Manually linked',
+        icon: Icons.link_rounded,
+        color: AppColors.accent,
+      );
+    case 'content_updated_external':
+      return const _EventDescriptor(
+        label: 'Tags / content edited externally',
+        icon: Icons.edit_note_rounded,
+        color: AppColors.textSecondary,
+      );
+    case 'app_initiated_move':
+      return const _EventDescriptor(
+        label: 'Moved via app',
+        icon: Icons.drive_file_move_outlined,
+        color: AppColors.accent,
+      );
+    case 'app_initiated_copy':
+      return const _EventDescriptor(
+        label: 'Copied via app',
+        icon: Icons.file_copy_rounded,
+        color: AppColors.accent,
+      );
+    default:
+      return _EventDescriptor(
+        label: type,
+        icon: Icons.fiber_manual_record,
+        color: AppColors.textTertiary,
+      );
+  }
+}
+
+String _basename(String path) {
+  final i = path.lastIndexOf('/');
+  if (i < 0 || i == path.length - 1) return path;
+  return path.substring(i + 1);
 }
 
 class _EmptyPreview extends StatelessWidget {
@@ -652,79 +975,6 @@ class _PreviewError extends StatelessWidget {
         color: AppColors.textSecondary,
         fontSize: 11,
         fontStyle: FontStyle.italic,
-      ),
-    );
-  }
-}
-
-class _PreviewStats extends StatelessWidget {
-  final StatePreview preview;
-  const _PreviewStats({required this.preview});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _StatRow(
-          label: 'Tracks indexed',
-          value: _intOrDash(preview.trackCount),
-        ),
-        _StatRow(
-          label: 'Favorites',
-          value: _intOrDash(preview.favoriteCount),
-        ),
-        _StatRow(
-          label: 'Reviewed',
-          value: _intOrDash(preview.reviewedCount),
-        ),
-        _StatRow(
-          label: 'Total plays',
-          value: _intOrDash(preview.totalPlays),
-        ),
-        _StatRow(
-          label: 'Last played',
-          value: preview.lastPlayedAt == null
-              ? '—'
-              : _displayCapturedAt(preview.lastPlayedAt!),
-        ),
-      ],
-    );
-  }
-}
-
-class _StatRow extends StatelessWidget {
-  final String label;
-  final String value;
-  const _StatRow({required this.label, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 110,
-            child: Text(
-              label,
-              style: const TextStyle(
-                color: AppColors.textTertiary,
-                fontSize: 11,
-                letterSpacing: 0.4,
-              ),
-            ),
-          ),
-          Text(
-            value,
-            style: const TextStyle(
-              color: AppColors.textPrimary,
-              fontSize: 12,
-              fontWeight: FontWeight.w500,
-              fontFeatures: [FontFeature.tabularFigures()],
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -819,21 +1069,18 @@ String _displayFileSize(int bytes) {
   return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
 }
 
-String _displayCapturedAt(DateTime at) {
-  final now = DateTime.now();
-  final diff = now.difference(at);
-  String rel;
-  if (diff.inMinutes < 1) {
-    rel = 'just now';
-  } else if (diff.inMinutes < 60) {
-    rel = '${diff.inMinutes} min ago';
-  } else if (diff.inHours < 24) {
-    rel = '${diff.inHours}h ago';
-  } else if (diff.inDays < 7) {
-    rel = '${diff.inDays}d ago';
-  } else {
-    rel = '${at.month}/${at.day}/${(at.year % 100).toString().padLeft(2, '0')}';
-  }
+const _monthsLong = [
+  'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+  'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC',
+];
+
+/// "MAY 12, 2026" — date as identity, dominant in the left list.
+String _displayDateLong(DateTime at) {
+  return '${_monthsLong[at.month - 1]} ${at.day}, ${at.year}';
+}
+
+/// "3:44 PM" — time, second-most-dominant.
+String _displayTime(DateTime at) {
   final hour12 = at.hour == 0
       ? 12
       : at.hour > 12
@@ -841,5 +1088,19 @@ String _displayCapturedAt(DateTime at) {
           : at.hour;
   final ampm = at.hour >= 12 ? 'PM' : 'AM';
   final minute = at.minute.toString().padLeft(2, '0');
-  return '$hour12:$minute $ampm • $rel';
+  return '$hour12:$minute $ampm';
 }
+
+/// "6h ago" / "just now" / "2d ago" / fallback short date. Used as
+/// soft supporting hint next to the dominant time.
+String _displayRelativeAge(DateTime at) {
+  final now = DateTime.now();
+  final diff = now.difference(at);
+  if (diff.inMinutes < 1) return 'just now';
+  if (diff.inMinutes < 60) return '${diff.inMinutes} min ago';
+  if (diff.inHours < 24) return '${diff.inHours}h ago';
+  if (diff.inDays < 7) return '${diff.inDays}d ago';
+  return '${at.month}/${at.day}/'
+      '${(at.year % 100).toString().padLeft(2, '0')}';
+}
+

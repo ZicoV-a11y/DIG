@@ -1,10 +1,9 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 
 import '../models/activity_event.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
+import 'event_log_format.dart';
 
 /// Activity log dialog — a chronological feed of the lifecycle
 /// decisions the system has made (rows going missing, auto-
@@ -245,9 +244,9 @@ class _EventRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final desc = _eventDescriptorFor(event.eventType);
-    final basename = event.path?.split(Platform.pathSeparator).last;
-    final detail = _detailLineFor(event);
+    final desc = eventDescriptorFor(event);
+    final basename = _basenameOrNull(event.path);
+    final detail = eventDetailLineFor(event);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       child: Row(
@@ -264,7 +263,7 @@ class _EventRow extends StatelessWidget {
               ),
             ),
           ),
-          Icon(desc.icon, size: 14, color: desc.iconColor),
+          Icon(desc.icon, size: 14, color: desc.color),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
@@ -312,103 +311,16 @@ class _EventRow extends StatelessWidget {
   }
 }
 
-/// Per-event-type display metadata. New types are added here; an
-/// unknown type renders with a generic label + icon so the panel
-/// keeps working when the DB carries event types that the current
-/// build doesn't recognise (forward-compat after a downgrade).
-class _EventDescriptor {
-  final String label;
-  final IconData icon;
-  final Color iconColor;
-  const _EventDescriptor({
-    required this.label,
-    required this.icon,
-    required this.iconColor,
-  });
-}
-
-_EventDescriptor _eventDescriptorFor(String type) {
-  switch (type) {
-    case EventType.removedExternal:
-      return const _EventDescriptor(
-        label: 'Removed (file no longer on disk)',
-        icon: Icons.link_off_rounded,
-        iconColor: AppColors.favorite,
-      );
-    case EventType.autoMoveSameSource:
-      return const _EventDescriptor(
-        label: 'Auto-resolved as move (same source)',
-        icon: Icons.drive_file_move_rounded,
-        iconColor: AppColors.reviewed,
-      );
-    case EventType.autoMoveCrossSource:
-      return const _EventDescriptor(
-        label: 'Auto-resolved as move (across sources)',
-        icon: Icons.swap_horiz_rounded,
-        iconColor: AppColors.reviewed,
-      );
-    case EventType.foundElsewhere:
-      return const _EventDescriptor(
-        label: 'Found elsewhere (coexisting copy detected)',
-        icon: Icons.content_copy_rounded,
-        iconColor: AppColors.reviewed,
-      );
-    case EventType.purged:
-      return const _EventDescriptor(
-        label: 'Purged from library',
-        icon: Icons.delete_sweep_rounded,
-        iconColor: AppColors.textSecondary,
-      );
-    case EventType.manualRelink:
-      return const _EventDescriptor(
-        label: 'Manually linked',
-        icon: Icons.link_rounded,
-        iconColor: AppColors.accent,
-      );
-    case EventType.contentUpdatedExternal:
-      return const _EventDescriptor(
-        label: 'Content updated externally',
-        icon: Icons.edit_note_rounded,
-        iconColor: AppColors.textSecondary,
-      );
-    default:
-      return _EventDescriptor(
-        label: type,
-        icon: Icons.help_outline_rounded,
-        iconColor: AppColors.textTertiary,
-      );
+/// Returns the basename portion of [path], or `null` if [path] is
+/// null/empty. POSIX/Windows aware (sqflite paths arrive in their
+/// native separator).
+String? _basenameOrNull(String? path) {
+  if (path == null || path.isEmpty) return null;
+  for (final sep in const ['/', r'\\']) {
+    final i = path.lastIndexOf(sep);
+    if (i >= 0 && i < path.length - 1) return path.substring(i + 1);
   }
-}
-
-String? _detailLineFor(ActivityEvent event) {
-  switch (event.eventType) {
-    case EventType.autoMoveSameSource:
-    case EventType.autoMoveCrossSource:
-      final successor = event.payload['successor_path'] as String?;
-      final matched = event.payload['matched_on'] as String?;
-      if (successor == null) return null;
-      final successorBase =
-          successor.split(Platform.pathSeparator).last;
-      if (matched != null) {
-        return '→ $successorBase  ·  matched on $matched';
-      }
-      return '→ $successorBase';
-    case EventType.purged:
-      final prior = event.payload['prior_state'] as String?;
-      if (prior == null) return null;
-      return 'prior state: $prior';
-    case EventType.manualRelink:
-      final linked = event.payload['linked_to'] as String?;
-      if (linked == null) return null;
-      return 'linked to ${linked.split(Platform.pathSeparator).last}';
-    case EventType.contentUpdatedExternal:
-      final oldHash = event.payload['old_content_hash_prefix'] as String?;
-      final newHash = event.payload['new_content_hash_prefix'] as String?;
-      if (oldHash == null || newHash == null) return null;
-      return 'sha: $oldHash… → $newHash…';
-    default:
-      return null;
-  }
+  return path;
 }
 
 String _formatTime(DateTime t) {

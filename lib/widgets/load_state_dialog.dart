@@ -6,6 +6,7 @@ import '../models/state_preview.dart';
 import '../services/library_state_browser.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
+import 'event_log_format.dart';
 
 /// Load Operational State dialog. Browse and switch the running
 /// app's operational reality.
@@ -713,7 +714,8 @@ class _ActivityRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final descriptor = _describeEvent(event);
+    final descriptor = eventDescriptorFor(event);
+    final detail = eventDetailLineFor(event);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
@@ -750,6 +752,18 @@ class _ActivityRow extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                   ),
                 ],
+                if (detail != null) ...[
+                  const SizedBox(height: 1),
+                  Text(
+                    detail,
+                    style: const TextStyle(
+                      color: AppColors.textTertiary,
+                      fontSize: 10,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
               ],
             ),
           ),
@@ -766,119 +780,6 @@ class _ActivityRow extends StatelessWidget {
       ),
     );
   }
-}
-
-class _EventDescriptor {
-  final String label;
-  final IconData icon;
-  final Color color;
-  const _EventDescriptor({
-    required this.label,
-    required this.icon,
-    required this.color,
-  });
-}
-
-_EventDescriptor _describeEvent(ActivityEvent event) {
-  switch (event.eventType) {
-    // Aggregate operational-journal entries written at each
-    // autosave tick. Counts come from the payload, formatted with
-    // thousands separators so "Played 1,420 tracks" still reads
-    // cleanly during long sessions.
-    case 'tracks_played':
-      final count = _countFrom(event);
-      return _EventDescriptor(
-        label: 'Played ${_formatNumber(count)} '
-            '${count == 1 ? "track" : "tracks"}',
-        icon: Icons.play_circle_filled_rounded,
-        color: AppColors.accent,
-      );
-    case 'favorites_added':
-      final count = _countFrom(event);
-      return _EventDescriptor(
-        label: 'Added ${_formatNumber(count)} '
-            '${count == 1 ? "favorite" : "favorites"}',
-        icon: Icons.star_rounded,
-        color: AppColors.favorite,
-      );
-    case 'scan_completed':
-      final source = event.payload['source_name'] as String?;
-      return _EventDescriptor(
-        label: source == null
-            ? 'Library scan completed'
-            : 'Library scan completed — $source',
-        icon: Icons.refresh_rounded,
-        color: AppColors.reviewed,
-      );
-    // File-lifecycle events — single occurrences with a path.
-    case 'removed_external':
-      return const _EventDescriptor(
-        label: 'File removed externally',
-        icon: Icons.link_off_rounded,
-        color: AppColors.favorite,
-      );
-    case 'auto_move_same_source':
-      return const _EventDescriptor(
-        label: 'Auto-resolved as moved (same source)',
-        icon: Icons.drive_file_move_rounded,
-        color: AppColors.reviewed,
-      );
-    case 'auto_move_cross_source':
-      return const _EventDescriptor(
-        label: 'Auto-resolved as moved (across sources)',
-        icon: Icons.swap_horiz_rounded,
-        color: AppColors.reviewed,
-      );
-    case 'found_elsewhere':
-      return const _EventDescriptor(
-        label: 'Found coexisting copy elsewhere',
-        icon: Icons.content_copy_rounded,
-        color: AppColors.reviewed,
-      );
-    case 'purged':
-      return const _EventDescriptor(
-        label: 'Purged from library',
-        icon: Icons.delete_sweep_rounded,
-        color: AppColors.textSecondary,
-      );
-    case 'manual_relink':
-      return const _EventDescriptor(
-        label: 'Manually linked',
-        icon: Icons.link_rounded,
-        color: AppColors.accent,
-      );
-    case 'content_updated_external':
-      return const _EventDescriptor(
-        label: 'Tags / content edited externally',
-        icon: Icons.edit_note_rounded,
-        color: AppColors.textSecondary,
-      );
-    case 'app_initiated_move':
-      return const _EventDescriptor(
-        label: 'Moved via app',
-        icon: Icons.drive_file_move_outlined,
-        color: AppColors.accent,
-      );
-    case 'app_initiated_copy':
-      return const _EventDescriptor(
-        label: 'Copied via app',
-        icon: Icons.file_copy_rounded,
-        color: AppColors.accent,
-      );
-    default:
-      return _EventDescriptor(
-        label: event.eventType,
-        icon: Icons.fiber_manual_record,
-        color: AppColors.textTertiary,
-      );
-  }
-}
-
-int _countFrom(ActivityEvent event) {
-  final raw = event.payload['count'];
-  if (raw is int) return raw;
-  if (raw is num) return raw.toInt();
-  return 0;
 }
 
 String _basename(String path) {
@@ -1009,23 +910,6 @@ class _Footer extends StatelessWidget {
       ),
     );
   }
-}
-
-/// Thousands separator, no locale dependency. Used by activity-row
-/// labels that render aggregate counts ("Played 14 tracks").
-String _formatNumber(int v) {
-  final s = v.toString();
-  final out = StringBuffer();
-  var count = 0;
-  for (var i = s.length - 1; i >= 0; i--) {
-    out.write(s[i]);
-    count++;
-    if (count == 3 && i > 0 && s[i - 1] != '-') {
-      out.write(',');
-      count = 0;
-    }
-  }
-  return out.toString().split('').reversed.join();
 }
 
 String _displayFileSize(int bytes) {

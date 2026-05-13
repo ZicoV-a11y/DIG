@@ -156,9 +156,23 @@ class LibraryStateBrowser {
     final factory = databaseFactoryFfi;
     Database? db;
     try {
+      // CRITICAL: `singleInstance: false` here. sqflite defaults to
+      // `singleInstance: true`, which means opening the same file
+      // path twice returns the SAME Database object — and closing
+      // this preview handle would also close the running app's
+      // live DB. Forcing a separate instance for the read-only
+      // inspection means our `.close()` in finally only touches
+      // our own handle, never the live one.
+      //
+      // The current-device state file IS the running app's live
+      // DB, so this case is the most common collision path. With
+      // singleInstance:false the read-only peek is isolated.
       db = await factory.openDatabase(
         state.filePath,
-        options: OpenDatabaseOptions(readOnly: true),
+        options: OpenDatabaseOptions(
+          readOnly: true,
+          singleInstance: false,
+        ),
       );
     } catch (e) {
       debugPrint('[browser] open failed for ${state.filePath}: $e');

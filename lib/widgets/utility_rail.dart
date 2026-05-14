@@ -5,6 +5,7 @@ import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
 import 'activity_log_dialog.dart';
 import 'duplicates_audit_dialog.dart';
+import 'load_state_dialog.dart';
 import 'move_copy_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
@@ -120,6 +121,8 @@ Widget _moduleFor(String key, LibraryController controller) {
       return _MoveCopyModule(controller: controller);
     case 'finder':
       return _ShowInFinderModule(controller: controller);
+    case 'loadstate':
+      return _LoadStateModule(controller: controller);
     default:
       return const SizedBox.shrink();
   }
@@ -580,6 +583,48 @@ class _ShowInFinderModuleState extends State<_ShowInFinderModule> {
   }
 }
 
+
+// ---------- LOAD OPERATIONAL STATE ----------
+
+/// Opens the Load Operational State dialog. Was previously part of
+/// the deleted `_DataModule` (Save / Export / Load / Import). The
+/// other three actions still belong on dedicated operational-state
+/// surfaces, but Load earns a rail slot because it's the entry
+/// point to the most common operational-state navigation gesture
+/// (switching between Systems / Saves / Shared Libraries).
+///
+/// Per [feedback_operational_state_language] the user-visible
+/// vocabulary stays operational — "Load operational state", not
+/// "Restore from backup" / "Open snapshot" / etc.
+class _LoadStateModule extends StatelessWidget {
+  final LibraryController controller;
+  const _LoadStateModule({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    return _RailButton(
+      tooltip:
+          'Switch the running app to a different library reality '
+          '— Systems / Saves / Shared Libraries.',
+      onPressed: () => showLoadStateDialog(
+        context: context,
+        controller: controller,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const _SectionLabel('LOAD'),
+          const SizedBox(height: 6),
+          Icon(
+            Icons.swap_horiz_rounded,
+            size: 22,
+            color: AppColors.textSecondary,
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 // ---------- VOLUME (pinned anchor at the top of the rail) ----------
 

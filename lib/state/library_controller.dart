@@ -203,6 +203,7 @@ class LibraryController extends ChangeNotifier {
     'history',
     'movecopy',
     'finder',
+    'loadstate',
   ];
   List<String> _utilityRailOrder = List.of(_defaultUtilityRailOrder);
   // When locked, drag handles are hidden and reordering is disabled.

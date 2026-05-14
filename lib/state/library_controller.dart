@@ -187,6 +187,28 @@ class LibraryController extends ChangeNotifier {
     'lastPlayed',
   ];
   List<String> _columnOrder = List.of(_defaultColumnOrder);
+
+  // ---------------------------------------------------------------------
+  // Utility-rail order + lock
+  // ---------------------------------------------------------------------
+  // The right-edge utility rail's middle section is user-reorderable.
+  // Volume stays pinned at the top (not in this list); these are the
+  // reorderable cards beneath it. Persisted as a comma-joined string
+  // under `utility_rail_order`. Unknown keys are dropped at hydrate;
+  // missing keys are appended in their default-order position.
+  static const _defaultUtilityRailOrder = <String>[
+    'threshold',
+    'mode',
+    'audit',
+    'history',
+    'movecopy',
+    'finder',
+  ];
+  List<String> _utilityRailOrder = List.of(_defaultUtilityRailOrder);
+  // When locked, drag handles are hidden and reordering is disabled.
+  // Persisted as '0' / '1' under `utility_rail_locked`.
+  bool _utilityRailLocked = false;
+
   final ValueNotifier<Duration> _positionNotifier = ValueNotifier(
     Duration.zero,
   );
@@ -521,6 +543,30 @@ class LibraryController extends ChangeNotifier {
           .map((s) => s.trim())
           .where((s) => s.isNotEmpty)
           .toList();
+    }
+    // Utility rail: load persisted order + lock state. Reconcile
+    // against the canonical default-order so unknown / removed keys
+    // don't poison the list, and newly-added keys (future modules)
+    // get appended in default-order position.
+    final railOrderStr = settings['utility_rail_order'];
+    if (railOrderStr != null && railOrderStr.isNotEmpty) {
+      final saved = railOrderStr
+          .split(',')
+          .map((s) => s.trim())
+          .where((s) => s.isNotEmpty)
+          .where(_defaultUtilityRailOrder.contains)
+          .toList();
+      // Append any default keys missing from the saved order so a
+      // new module added in code lands at a sensible default
+      // position rather than vanishing.
+      for (final key in _defaultUtilityRailOrder) {
+        if (!saved.contains(key)) saved.add(key);
+      }
+      _utilityRailOrder = saved;
+    }
+    final railLockedStr = settings['utility_rail_locked'];
+    if (railLockedStr != null) {
+      _utilityRailLocked = railLockedStr == '1';
     }
 
     final sources = await repo.loadSources();
@@ -1087,6 +1133,45 @@ class LibraryController extends ChangeNotifier {
     _sourceOrder = ordered;
     notifyListeners();
     await repo.setSetting('source_order', _sourceOrder.join(','));
+  }
+
+  // ---------------------------------------------------------------------
+  // Utility-rail order + lock — public surface
+  // ---------------------------------------------------------------------
+
+  /// Current order of the reorderable utility-rail cards. Defensive
+  /// copy so callers can't mutate internal state. Volume is
+  /// intentionally NOT in this list (it stays pinned above the
+  /// reorderable section).
+  List<String> get utilityRailOrder => List.unmodifiable(_utilityRailOrder);
+
+  /// Whether the utility rail's reorder behavior is currently
+  /// disabled. UI uses this to hide drag handles and refuse
+  /// reorder gestures.
+  bool get utilityRailLocked => _utilityRailLocked;
+
+  /// Persist a new utility-rail order. Filtered against the canonical
+  /// default-order so callers can't sneak unknown keys in; missing
+  /// keys are appended so the persisted list stays exhaustive.
+  Future<void> setUtilityRailOrder(List<String> order) async {
+    final filtered = order
+        .where(_defaultUtilityRailOrder.contains)
+        .toList();
+    for (final key in _defaultUtilityRailOrder) {
+      if (!filtered.contains(key)) filtered.add(key);
+    }
+    _utilityRailOrder = filtered;
+    notifyListeners();
+    await repo.setSetting('utility_rail_order', filtered.join(','));
+  }
+
+  /// Toggle the lock-order state. When `true`, the rail's drag
+  /// handles disappear and reorder gestures are refused.
+  Future<void> setUtilityRailLocked(bool locked) async {
+    if (_utilityRailLocked == locked) return;
+    _utilityRailLocked = locked;
+    notifyListeners();
+    await repo.setSetting('utility_rail_locked', locked ? '1' : '0');
   }
   String? get selectedSourceId => _selectedSourceId;
   String get searchQuery => _searchQuery;

@@ -1,79 +1,198 @@
-import 'dart:io';
-
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
-import '../services/intelligence_export.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
 import 'activity_log_dialog.dart';
 import 'duplicates_audit_dialog.dart';
-import 'import_confirm_dialog.dart';
-import 'load_state_dialog.dart';
 import 'move_copy_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
-/// Stacked modules (top → bottom): Play Threshold, Play Mode, Rescan,
-/// Audit, History, Move/Copy, Show in Finder, Data. Subtle horizontal
-/// dividers separate them. (Favorite toggle moved to a deck-artwork
-/// overlay on 2026-05-13; Volume strip moved into the deck's right
-/// zone alongside the artwork on the same date — both relocations
-/// put playback-adjacent controls where the eye already lives during
-/// playback instead of in this rail.)
+/// Three vertical sections:
+///
+///   1. **Volume** — pinned at the top. Tallest module. Anchors the
+///      rail visually and gives the user a persistent global-feeling
+///      control.
+///   2. **Reorderable utilities** — Threshold, Mode, Audit, History,
+///      Move/Copy, Finder. The user can drag-reorder these via the
+///      handle on each card; order persists per-user in
+///      `app_settings.utility_rail_order`. Volume is intentionally
+///      outside this section so it can never accidentally land
+///      mid-stack.
+///   3. **Lock-order toggle** — tiny control at the bottom. When
+///      locked, drag handles disappear and reorder gestures are
+///      refused; users who don't want to risk accidental drags can
+///      pin the order they like.
+///
+/// Layout philosophy ("persistent operational sidecar" rather than
+/// "miscellaneous buttons"): every card in the rail should feel
+/// intentional, persistent, spatially stable, and operationally
+/// important.
+///
+/// History of moves: Favorite → deck-artwork overlay (2026-05-13);
+/// Refresh + Save/Export/Load/Import → removed from rail entirely
+/// (Refresh is now a rescan-on-source flow; Save/Export/Load/Import
+/// live in dedicated operational-state surfaces, not the persistent
+/// rail).
 class UtilityRail extends StatelessWidget {
   final LibraryController controller;
   const UtilityRail({super.key, required this.controller});
 
   @override
   Widget build(BuildContext context) {
-    // The rail's stacked modules can overflow vertically when the
-    // window is short. Wrap in a SingleChildScrollView so the whole
-    // rail scrolls as a unit — never affecting the deck or workspace
-    // layout. Hide the platform scrollbar; the rail is narrow and the
-    // scroll is by drag/wheel, not by clicking a thumb.
     return Container(
       width: 100,
       color: AppColors.surface,
       child: ListenableBuilder(
         listenable: controller,
         builder: (ctx, _) {
-          return ScrollConfiguration(
-            behavior: ScrollConfiguration.of(ctx).copyWith(scrollbars: false),
-            child: SingleChildScrollView(
-              // Bouncing physics gives the macOS-native elastic feel
-              // when overscrolling top/bottom. Combined with letting
-              // the wheel event reach the rail (HomeScreen excludes
-              // this region from its table-forwarding handler), the
-              // rail now scrolls smoothly via trackpad/wheel.
-              physics: const BouncingScrollPhysics(
-                parent: AlwaysScrollableScrollPhysics(),
+          final order = controller.utilityRailOrder;
+          final locked = controller.utilityRailLocked;
+          return Column(
+            children: [
+              const SizedBox(height: 12),
+              _VolumeModule(controller: controller),
+              const _RailDivider(),
+              // Middle section: reorderable utility cards. ListView
+              // gives it independent scrolling so the Volume anchor
+              // and Lock toggle stay pinned to top/bottom of the
+              // rail at all window heights.
+              Expanded(
+                child: ScrollConfiguration(
+                  behavior: ScrollConfiguration.of(ctx)
+                      .copyWith(scrollbars: false),
+                  child: ReorderableListView.builder(
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    buildDefaultDragHandles: false,
+                    proxyDecorator: _railDragProxy,
+                    itemCount: order.length,
+                    onReorder: locked
+                        ? (_, _) {}
+                        : (oldIdx, newIdx) {
+                            final reordered = [...order];
+                            final item = reordered.removeAt(oldIdx);
+                            final insertAt =
+                                newIdx > oldIdx ? newIdx - 1 : newIdx;
+                            reordered.insert(insertAt, item);
+                            controller.setUtilityRailOrder(reordered);
+                          },
+                    itemBuilder: (ctx, i) {
+                      final key = order[i];
+                      return _RailCardSlot(
+                        key: ValueKey(key),
+                        index: i,
+                        locked: locked,
+                        child: _moduleFor(key, controller),
+                      );
+                    },
+                  ),
+                ),
               ),
-              child: Column(
-                children: [
-                  const SizedBox(height: 12),
-                  _ThresholdModule(controller: controller),
-                  const _RailDivider(),
-                  _ModeModule(controller: controller),
-                  const _RailDivider(),
-                  _RescanModule(controller: controller),
-                  const _RailDivider(),
-                  _AuditModule(controller: controller),
-                  const _RailDivider(),
-                  _HistoryModule(controller: controller),
-                  const _RailDivider(),
-                  _MoveCopyModule(controller: controller),
-                  const _RailDivider(),
-                  _ShowInFinderModule(controller: controller),
-                  const _RailDivider(),
-                  _DataModule(controller: controller),
-                  const SizedBox(height: 12),
-                ],
-              ),
-            ),
+              const _RailDivider(),
+              _LockOrderToggle(controller: controller),
+              const SizedBox(height: 12),
+            ],
           );
         },
       ),
+    );
+  }
+}
+
+/// Resolve a persisted utility-rail key to the corresponding module
+/// widget. Unknown keys (e.g. an old persisted key after a module
+/// got removed) render as `SizedBox.shrink()` — defensive null
+/// rendering so a stale setting never crashes the rail. Defaults
+/// + filtering at hydrate prevent this from happening in practice.
+Widget _moduleFor(String key, LibraryController controller) {
+  switch (key) {
+    case 'threshold':
+      return _ThresholdModule(controller: controller);
+    case 'mode':
+      return _ModeModule(controller: controller);
+    case 'audit':
+      return _AuditModule(controller: controller);
+    case 'history':
+      return _HistoryModule(controller: controller);
+    case 'movecopy':
+      return _MoveCopyModule(controller: controller);
+    case 'finder':
+      return _ShowInFinderModule(controller: controller);
+    default:
+      return const SizedBox.shrink();
+  }
+}
+
+/// Visual treatment applied to the card while it's being dragged
+/// (the "ghost" floating under the cursor). Slight elevation + a
+/// faintly brighter background reads as "this is being held".
+Widget _railDragProxy(
+  Widget child,
+  int index,
+  Animation<double> animation,
+) {
+  return AnimatedBuilder(
+    animation: animation,
+    builder: (ctx, _) {
+      return Material(
+        elevation: 6,
+        color: AppColors.surfaceAlt,
+        child: child,
+      );
+    },
+    child: child,
+  );
+}
+
+/// Wraps each reorderable utility card with its drag handle (visible
+/// only when the rail isn't locked) and a thin divider beneath. The
+/// divider mirrors the previous `_RailDivider` rhythm so the new
+/// reorderable layout reads identically to the old static one when
+/// the rail is locked.
+class _RailCardSlot extends StatelessWidget {
+  final int index;
+  final bool locked;
+  final Widget child;
+  const _RailCardSlot({
+    super.key,
+    required this.index,
+    required this.locked,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Stack(
+          children: [
+            child,
+            // Drag handle in the top-right corner. Subtle by design —
+            // the rail is narrow, anything bigger than a small icon
+            // would crowd the module's primary content.
+            if (!locked)
+              Positioned(
+                top: 2,
+                right: 2,
+                child: ReorderableDragStartListener(
+                  index: index,
+                  child: const Padding(
+                    padding: EdgeInsets.all(4),
+                    child: Icon(
+                      Icons.drag_indicator_rounded,
+                      size: 12,
+                      color: AppColors.textTertiary,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+        const _RailDivider(),
+      ],
     );
   }
 }
@@ -338,40 +457,6 @@ class _MoveCopyModule extends StatelessWidget {
   }
 }
 
-// ---------- RESCAN ----------
-
-class _RescanModule extends StatelessWidget {
-  final LibraryController controller;
-  const _RescanModule({required this.controller});
-
-  @override
-  Widget build(BuildContext context) {
-    final scanning = controller.isScanning;
-    return _RailButton(
-      tooltip: scanning
-          ? 'Rescanning library…'
-          : 'Rescan all sources (⌘R)',
-      // Disable while a scan is in flight so back-to-back clicks
-      // don't pile up redundant rescans on top of each other.
-      onPressed: scanning ? null : controller.rescanAllSources,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const _SectionLabel('REFRESH'),
-          const SizedBox(height: 6),
-          Icon(
-            Icons.refresh_rounded,
-            size: 22,
-            color: scanning
-                ? AppColors.accent
-                : AppColors.textSecondary,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 // ---------- SHOW IN FINDER ----------
 
 class _ShowInFinderModule extends StatefulWidget {
@@ -495,247 +580,133 @@ class _ShowInFinderModuleState extends State<_ShowInFinderModule> {
   }
 }
 
-// ---------- DATA (Export / Import) ----------
 
-class _DataModule extends StatelessWidget {
+// ---------- VOLUME (pinned anchor at the top of the rail) ----------
+
+/// Pinned at the top of the rail. Visually heavier than the
+/// reorderable cards beneath it so it reads as the persistent
+/// global anchor rather than one of the swappable utilities. The
+/// rail's "Lock Order" affordance and reorder gestures never touch
+/// this module — it sits outside the ReorderableListView entirely.
+class _VolumeModule extends StatelessWidget {
   final LibraryController controller;
-  const _DataModule({required this.controller});
+  const _VolumeModule({required this.controller});
 
-  /// Quick local save: overwrites the canonical snapshot at
-  /// `~/Documents/Music Tracker/intelligence.json`. Always the same
-  /// filename, so repeated saves don't pile up timestamped clones —
-  /// you have exactly one current-state file you can hand off,
-  /// version-control, or restore from. The timestamped variant is
-  /// still available via the picker-based EXPORT button below.
-  Future<void> _runSave(BuildContext context) async {
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    try {
-      final dir = await IntelligenceExportFile.defaultExportDirectory();
-      final path =
-          '${dir.path}/${IntelligenceExportFile.canonicalFilename}';
-      final file = await controller.exportIntelligence(toPath: path);
-      messenger?.showSnackBar(
-        SnackBar(
-          content: Text('Saved → ${file.path}'),
-          duration: const Duration(seconds: 5),
-          action: SnackBarAction(
-            label: 'Show',
-            onPressed: () {
-              try {
-                Process.run('open', ['-R', file.path]);
-              } catch (_) {/* best-effort */}
-            },
-          ),
-        ),
-      );
-    } catch (e) {
-      messenger?.showSnackBar(
-        SnackBar(content: Text('Save failed: $e')),
-      );
-    }
-  }
-
-  /// Picker-based export — useful when the user wants to write to a
-  /// specific drive or folder (e.g. handing the file to another
-  /// machine on a USB stick).
-  Future<void> _runExport(BuildContext context) async {
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    final defaultDir =
-        await IntelligenceExportFile.defaultExportDirectory();
-    final defaultName = IntelligenceExportFile.defaultFilename();
-    final chosen = await FilePicker.saveFile(
-      dialogTitle: 'Export intelligence',
-      fileName: defaultName,
-      initialDirectory: defaultDir.path,
-      type: FileType.custom,
-      allowedExtensions: const ['json'],
-    );
-    if (chosen == null) return;
-    final path = chosen.endsWith('.json') ? chosen : '$chosen.json';
-    try {
-      final file = await controller.exportIntelligence(toPath: path);
-      messenger?.showSnackBar(
-        SnackBar(
-          content: Text('Exported intelligence → ${file.path}'),
-          duration: const Duration(seconds: 4),
-        ),
-      );
-    } catch (e) {
-      messenger?.showSnackBar(
-        SnackBar(content: Text('Export failed: $e')),
-      );
-    }
-  }
-
-  Future<void> _runImport(BuildContext context) async {
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    final result = await FilePicker.pickFiles(
-      dialogTitle: 'Import intelligence',
-      type: FileType.custom,
-      allowedExtensions: const ['json'],
-    );
-    final picked = result?.files.singleOrNull?.path;
-    if (picked == null) return;
-    final file = File(picked);
-
-    try {
-      final preview = await controller.previewIntelligenceImport(file);
-      if (!context.mounted) return;
-      final confirmed = await ImportConfirmDialog.show(
-        context,
-        filename: file.uri.pathSegments.isNotEmpty
-            ? file.uri.pathSegments.last
-            : picked,
-        recordCount: preview.records.length,
-        parseErrors: preview.parseErrors.length,
-      );
-      if (confirmed != true) return;
-      final summary =
-          await controller.applyIntelligenceImport(preview.records);
-      messenger?.showSnackBar(
-        SnackBar(
-          content: Text(
-            'Imported ${summary.recordsRead} records '
-            '(merged ${summary.mergedByUid + summary.mergedByFingerprint}, '
-            'new ${summary.insertedAsGhost}'
-            '${summary.skippedErrors.isNotEmpty ? ", errors ${summary.skippedErrors.length}" : ""})',
-          ),
-          duration: const Duration(seconds: 4),
-        ),
-      );
-    } on FormatException catch (e) {
-      messenger?.showSnackBar(
-        SnackBar(content: Text('Import failed: ${e.message}')),
-      );
-    } catch (e) {
-      messenger?.showSnackBar(
-        SnackBar(content: Text('Import failed: $e')),
-      );
-    }
+  IconData _iconFor(double v) {
+    if (v <= 0.001) return Icons.volume_off_rounded;
+    if (v < 0.33) return Icons.volume_mute_rounded;
+    if (v < 0.66) return Icons.volume_down_rounded;
+    return Icons.volume_up_rounded;
   }
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        const _SectionLabel('DATA'),
-        const SizedBox(height: 4),
-        _RailButton(
-          tooltip:
-              'Quick local save → ~/Documents/Music Tracker/',
-          onPressed: () => _runSave(context),
-          child: const Padding(
-            padding: EdgeInsets.symmetric(vertical: 2),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.save_outlined,
-                  size: 20,
-                  color: AppColors.textSecondary,
-                ),
-                SizedBox(height: 2),
-                Text(
-                  'SAVE',
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 1.0,
-                    color: AppColors.textPrimary,
+    return ValueListenableBuilder<double>(
+      valueListenable: controller.volumeListenable,
+      builder: (ctx, volume, _) {
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _iconFor(volume),
+                size: 22,
+                color: AppColors.textSecondary,
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 140,
+                child: RotatedBox(
+                  quarterTurns: 3,
+                  child: SliderTheme(
+                    data: const SliderThemeData(
+                      trackHeight: 4,
+                      activeTrackColor: AppColors.accent,
+                      inactiveTrackColor: AppColors.border,
+                      thumbColor: AppColors.accent,
+                      thumbShape: RoundSliderThumbShape(
+                        enabledThumbRadius: 6,
+                      ),
+                      overlayShape: RoundSliderOverlayShape(
+                        overlayRadius: 14,
+                      ),
+                    ),
+                    child: Slider(
+                      value: volume,
+                      onChanged: (v) =>
+                          controller.setVolume(v, commit: false),
+                      onChangeEnd: (v) =>
+                          controller.setVolume(v, commit: true),
+                    ),
                   ),
                 ),
-              ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '${(volume * 100).round()}%',
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.textPrimary,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ---------- LOCK ORDER (bottom-of-rail toggle) ----------
+
+/// Small toggle at the bottom of the rail that disables / enables
+/// the drag-reorder behavior. Locked is the safer default for users
+/// who don't want to risk an accidental drag rearranging their
+/// rail. The state persists across launches.
+class _LockOrderToggle extends StatelessWidget {
+  final LibraryController controller;
+  const _LockOrderToggle({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final locked = controller.utilityRailLocked;
+    return _RailButton(
+      tooltip: locked
+          ? 'Order locked — tap to allow reordering'
+          : 'Order unlocked — tap to lock the current arrangement',
+      onPressed: () => controller.setUtilityRailLocked(!locked),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              locked
+                  ? Icons.lock_outline_rounded
+                  : Icons.lock_open_rounded,
+              size: 16,
+              color: locked
+                  ? AppColors.textSecondary
+                  : AppColors.textTertiary,
             ),
-          ),
-        ),
-        _RailButton(
-          tooltip: 'Export to a chosen location',
-          onPressed: () => _runExport(context),
-          child: const Padding(
-            padding: EdgeInsets.symmetric(vertical: 2),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.file_upload_outlined,
-                  size: 20,
-                  color: AppColors.textSecondary,
-                ),
-                SizedBox(height: 2),
-                Text(
-                  'EXPORT',
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 1.0,
-                    color: AppColors.textPrimary,
-                  ),
-                ),
-              ],
+            const SizedBox(height: 4),
+            Text(
+              locked ? 'LOCKED' : 'UNLOCKED',
+              style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 1.0,
+                color: locked
+                    ? AppColors.textSecondary
+                    : AppColors.textTertiary,
+              ),
             ),
-          ),
+          ],
         ),
-        _RailButton(
-          tooltip:
-              'Switch the running app to a different library reality '
-              '— Systems / Saves / Shared Libraries.',
-          onPressed: () => showLoadStateDialog(
-            context: context,
-            controller: controller,
-          ),
-          child: const Padding(
-            padding: EdgeInsets.symmetric(vertical: 2),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.swap_horiz_rounded,
-                  size: 20,
-                  color: AppColors.textSecondary,
-                ),
-                SizedBox(height: 2),
-                Text(
-                  'LOAD',
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 1.0,
-                    color: AppColors.textPrimary,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        _RailButton(
-          tooltip: 'Import intelligence from a JSON file',
-          onPressed: () => _runImport(context),
-          child: const Padding(
-            padding: EdgeInsets.symmetric(vertical: 2),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  Icons.file_download_outlined,
-                  size: 20,
-                  color: AppColors.textSecondary,
-                ),
-                SizedBox(height: 2),
-                Text(
-                  'IMPORT',
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 1.0,
-                    color: AppColors.textPrimary,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ],
+      ),
     );
   }
 }

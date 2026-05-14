@@ -18,28 +18,55 @@ class PlaybackBar extends StatelessWidget {
       color: AppColors.surface,
       child: LayoutBuilder(
         builder: (ctx, deckConstraints) {
-          // Allocate horizontal space so the Now Playing block grows
-          // into the wide-window gap between itself and the -1m
-          // button instead of leaving it as dead air. Floor 280
-          // keeps the block readable at the 1180-min window width;
-          // ceiling 580 stops it from cannibalising the transport
-          // row's centered anchor at very wide windows. The
-          // _NowPlayingBlock has its own LayoutBuilder inside that
-          // scales font sizes against whatever width lands here, so
-          // the block doesn't just gain whitespace — its text grows
-          // with it (`feedback_fluid_typography.md`).
-          const fixedReserve = 16 * 4 + 130; // padding gaps + artwork
-          const nowPlayingMin = 280.0;
-          const nowPlayingMax = 580.0;
-          // 40% of the flex space gives a calm growth curve: at min
-          // window (1180) the block is ~394 (capped to 394), at
-          // ~1620 it hits the 580 ceiling. The transport row
-          // (Expanded) consumes the remainder, staying centered in
-          // whatever's left.
-          final flexSpace =
-              deckConstraints.maxWidth - fixedReserve;
-          final nowPlayingWidth =
-              (flexSpace * 0.40).clamp(nowPlayingMin, nowPlayingMax);
+          // Two coupled positioning rules:
+          //
+          // 1. The play button (centre of the transport row) sits at
+          //    the app's actual horizontal centre (W/2). Before this
+          //    change it centred inside the Expanded zone, which is
+          //    offset rightward because Now Playing eats space on
+          //    the left — so play landed ~75 px right of the app's
+          //    geometric centre. We re-anchor it via Align with a
+          //    computed alignment fraction inside the Expanded zone.
+          //
+          // 2. Now Playing's layout SLOT stays at 280 px so the
+          //    transport row's position is unaffected by Now
+          //    Playing's content. But Now Playing's CONTENT can
+          //    bleed rightward via OverflowBox, growing into the
+          //    empty space between the slot and the transport's
+          //    left edge. This means longer titles render without
+          //    truncating, with no font-size scaling — pure
+          //    horizontal expansion.
+          final W = deckConstraints.maxWidth;
+
+          // Where will the transport row's left edge sit when its
+          // centre is at W/2?
+          const transportButtonRowWidth = 552.0;
+          final transportLeftScreen =
+              W / 2 - transportButtonRowWidth / 2;
+
+          // Now Playing's render width can extend from the slot's
+          // left edge (x=16) up to the transport's left edge minus
+          // a breathing margin. Capped at 600 — beyond that the
+          // text feels stretched.
+          const breathingBeforeTransport = 24.0;
+          final maxNowPlayingRender =
+              (transportLeftScreen - 16 - breathingBeforeTransport)
+                  .clamp(280.0, 600.0);
+
+          // Alignment for the button row inside the Expanded zone:
+          // Expanded spans [312, W-162]. Width = W - 474. Its centre
+          // is at W/2 + 75 (75 px right of app centre because of the
+          // left-side Now Playing block). We want the button row
+          // centred at W/2, which is 75 px LEFT of Expanded's centre.
+          // Express that as an Alignment.x value:
+          //   alignment.x ∈ [-1, 1] where -1 = parent-left, 1 = parent-right
+          //   shift_distance_from_centre = alignment.x × (parent_width - child_width) / 2
+          //   -75 = alignment.x × (W - 474 - 552) / 2
+          //   alignment.x = -150 / (W - 1026)
+          // Clamp so we never pin past the edges if the window
+          // shrinks below the 1180 minimum.
+          final buttonAlignmentX =
+              (-150.0 / (W - 1026)).clamp(-1.0, 1.0);
 
           return ListenableBuilder(
             listenable: controller,
@@ -53,12 +80,21 @@ class PlaybackBar extends StatelessWidget {
                 children: [
                   const SizedBox(width: 16),
                   SizedBox(
-                    width: nowPlayingWidth,
-                    child: _NowPlayingBlock(
-                      track: track,
-                      onTap: hasTrack ? controller.revealCurrent : null,
-                      onPivotTap: (name) =>
-                          controller.setSearchQuery(name),
+                    width: 280,
+                    child: OverflowBox(
+                      // Slot width stays 280 (transport position is
+                      // unaffected) but the content can render up to
+                      // maxNowPlayingRender wide, bleeding right.
+                      maxWidth: maxNowPlayingRender,
+                      minWidth: 280,
+                      alignment: Alignment.centerLeft,
+                      child: _NowPlayingBlock(
+                        track: track,
+                        onTap:
+                            hasTrack ? controller.revealCurrent : null,
+                        onPivotTap: (name) =>
+                            controller.setSearchQuery(name),
+                      ),
                     ),
                   ),
                   const SizedBox(width: 16),
@@ -67,9 +103,15 @@ class PlaybackBar extends StatelessWidget {
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
+                    Align(
+                      // Anchor the button row's centre at the app's
+                      // horizontal centre (W/2). See the alignment
+                      // math at the top of this builder.
+                      alignment: Alignment(buttonAlignmentX, 0),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
                         SkipButton(
                           label: '-1m',
                           onPressed: hasTrack
@@ -141,6 +183,7 @@ class PlaybackBar extends StatelessWidget {
                               : null,
                         ),
                       ],
+                    ),
                     ),
                     const SizedBox(height: 12),
                     _PositionRow(
@@ -282,117 +325,98 @@ class _NowPlayingBlock extends StatelessWidget {
 
     final split = _splitTitleAndMix(t.displayTitle);
 
-    return LayoutBuilder(
-      builder: (ctx, c) {
-        // Fluid typography: font sizes interpolate linearly between
-        // (minW, minSize) and (maxW, maxSize). Anchored to the
-        // _NowPlayingBlock width bounds set by PlaybackBar's outer
-        // LayoutBuilder so the block doesn't just gain whitespace
-        // when the window stretches — its title grows with it.
-        // Pattern: `feedback_fluid_typography.md`.
-        const minW = 280.0;
-        const maxW = 580.0;
-        double scale(double minSize, double maxSize) {
-          final w = c.maxWidth.clamp(minW, maxW);
-          final t = (w - minW) / (maxW - minW);
-          return minSize + (maxSize - minSize) * t;
-        }
-
-        final titleSize = scale(22, 30);
-        final subtitleSize = scale(16, 22);
-        final artistSize = scale(14, 18);
-        final metaSize = scale(14, 16);
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisAlignment: MainAxisAlignment.center,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Tooltip(
-              message: 'Jump to current track',
-              waitDuration: const Duration(milliseconds: 600),
-              child: Material(
-                color: Colors.transparent,
-                child: InkWell(
-                  onTap: onTap,
-                  hoverColor: AppColors.hoverRow,
-                  focusColor: AppColors.focusOverlay,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 12,
-                      vertical: 10,
-                    ),
-                    child: SizedBox(
-                      width: double.infinity,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            split.primary,
-                            overflow: TextOverflow.ellipsis,
-                            maxLines: 1,
-                            style: TextStyle(
-                              color: AppColors.textPrimary,
-                              fontSize: titleSize,
-                              fontWeight: FontWeight.w600,
-                              height: 1.15,
-                            ),
-                          ),
-                          if (split.subtitle != null) ...[
-                            const SizedBox(height: 4),
-                            Text(
-                              split.subtitle!,
-                              overflow: TextOverflow.ellipsis,
-                              maxLines: 1,
-                              style: TextStyle(
-                                color: AppColors.textSecondary,
-                                fontSize: subtitleSize,
-                                height: 1.15,
-                              ),
-                            ),
-                          ],
-                          const SizedBox(height: 4),
-                          Text(
-                            t.displayArtist.isEmpty
-                                ? '—'
-                                : t.displayArtist,
-                            overflow: TextOverflow.ellipsis,
-                            maxLines: 1,
-                            style: TextStyle(
-                              color: AppColors.textSecondary,
-                              fontSize: artistSize,
-                              height: 1.15,
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            _formatTrackMeta(t),
-                            overflow: TextOverflow.ellipsis,
-                            maxLines: 1,
-                            style: TextStyle(
-                              color: AppColors.textTertiary,
-                              fontSize: metaSize,
-                              height: 1.15,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                            ),
-                          ),
-                        ],
+    // Fixed font sizes — the block's text rendering width can grow
+    // (OverflowBox in PlaybackBar lets longer titles render without
+    // truncating) but the typography itself stays calm. Earlier
+    // attempts at LayoutBuilder-driven font scaling here made the
+    // text grow with the block; user feedback was that the block
+    // should *use* the space, not balloon the text.
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisAlignment: MainAxisAlignment.center,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Tooltip(
+          message: 'Jump to current track',
+          waitDuration: const Duration(milliseconds: 600),
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: onTap,
+              hoverColor: AppColors.hoverRow,
+              focusColor: AppColors.focusOverlay,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        split.primary,
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        style: const TextStyle(
+                          color: AppColors.textPrimary,
+                          fontSize: 22,
+                          fontWeight: FontWeight.w600,
+                          height: 1.15,
+                        ),
                       ),
-                    ),
+                      if (split.subtitle != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          split.subtitle!,
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 1,
+                          style: const TextStyle(
+                            color: AppColors.textSecondary,
+                            fontSize: 16,
+                            height: 1.15,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 4),
+                      Text(
+                        t.displayArtist.isEmpty
+                            ? '—'
+                            : t.displayArtist,
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        style: const TextStyle(
+                          color: AppColors.textSecondary,
+                          fontSize: 14,
+                          height: 1.15,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _formatTrackMeta(t),
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        style: const TextStyle(
+                          color: AppColors.textTertiary,
+                          fontSize: 14,
+                          height: 1.15,
+                          fontFeatures: [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: _PeoplePivots(track: t, onTap: onPivotTap),
-            ),
-          ],
-        );
-      },
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: _PeoplePivots(track: t, onTap: onPivotTap),
+        ),
+      ],
     );
   }
 }

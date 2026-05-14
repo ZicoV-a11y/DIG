@@ -16,28 +16,54 @@ class PlaybackBar extends StatelessWidget {
     return Container(
       height: 180,
       color: AppColors.surface,
-      child: ListenableBuilder(
-        listenable: controller,
-        builder: (context, _) {
-          final track = controller.currentTrack;
-          final dur = track?.duration ?? Duration.zero;
-          final hasTrack = track != null;
+      child: LayoutBuilder(
+        builder: (ctx, deckConstraints) {
+          // Allocate horizontal space so the Now Playing block grows
+          // into the wide-window gap between itself and the -1m
+          // button instead of leaving it as dead air. Floor 280
+          // keeps the block readable at the 1180-min window width;
+          // ceiling 580 stops it from cannibalising the transport
+          // row's centered anchor at very wide windows. The
+          // _NowPlayingBlock has its own LayoutBuilder inside that
+          // scales font sizes against whatever width lands here, so
+          // the block doesn't just gain whitespace — its text grows
+          // with it (`feedback_fluid_typography.md`).
+          const fixedReserve = 16 * 4 + 130; // padding gaps + artwork
+          const nowPlayingMin = 280.0;
+          const nowPlayingMax = 580.0;
+          // 40% of the flex space gives a calm growth curve: at min
+          // window (1180) the block is ~394 (capped to 394), at
+          // ~1620 it hits the 580 ceiling. The transport row
+          // (Expanded) consumes the remainder, staying centered in
+          // whatever's left.
+          final flexSpace =
+              deckConstraints.maxWidth - fixedReserve;
+          final nowPlayingWidth =
+              (flexSpace * 0.40).clamp(nowPlayingMin, nowPlayingMax);
 
-          return Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              const SizedBox(width: 16),
-              SizedBox(
-                width: 280,
-                child: _NowPlayingBlock(
-                  track: track,
-                  onTap: hasTrack ? controller.revealCurrent : null,
-                  onPivotTap: (name) => controller.setSearchQuery(name),
-                ),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: _TransportSubZone(
+          return ListenableBuilder(
+            listenable: controller,
+            builder: (context, _) {
+              final track = controller.currentTrack;
+              final dur = track?.duration ?? Duration.zero;
+              final hasTrack = track != null;
+
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  const SizedBox(width: 16),
+                  SizedBox(
+                    width: nowPlayingWidth,
+                    child: _NowPlayingBlock(
+                      track: track,
+                      onTap: hasTrack ? controller.revealCurrent : null,
+                      onPivotTap: (name) =>
+                          controller.setSearchQuery(name),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: _TransportSubZone(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
@@ -126,10 +152,15 @@ class PlaybackBar extends StatelessWidget {
                 ),
                 ),
               ),
-              const SizedBox(width: 16),
-              _DeckArtwork(track: track),
-              const SizedBox(width: 16),
-            ],
+                  const SizedBox(width: 16),
+                  _DeckArtwork(
+                    track: track,
+                    controller: controller,
+                  ),
+                  const SizedBox(width: 16),
+                ],
+              );
+            },
           );
         },
       ),
@@ -251,87 +282,117 @@ class _NowPlayingBlock extends StatelessWidget {
 
     final split = _splitTitleAndMix(t.displayTitle);
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisAlignment: MainAxisAlignment.center,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Tooltip(
-          message: 'Jump to current track',
-          waitDuration: const Duration(milliseconds: 600),
-          child: Material(
-            color: Colors.transparent,
-            child: InkWell(
-              onTap: onTap,
-              hoverColor: AppColors.hoverRow,
-              focusColor: AppColors.focusOverlay,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                child: SizedBox(
-                  width: double.infinity,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        split.primary,
-                        overflow: TextOverflow.ellipsis,
-                        maxLines: 1,
-                        style: const TextStyle(
-                          color: AppColors.textPrimary,
-                          fontSize: 22,
-                          fontWeight: FontWeight.w600,
-                          height: 1.15,
-                        ),
-                      ),
-                      if (split.subtitle != null) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          split.subtitle!,
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 1,
-                          style: const TextStyle(
-                            color: AppColors.textSecondary,
-                            fontSize: 16,
-                            height: 1.15,
+    return LayoutBuilder(
+      builder: (ctx, c) {
+        // Fluid typography: font sizes interpolate linearly between
+        // (minW, minSize) and (maxW, maxSize). Anchored to the
+        // _NowPlayingBlock width bounds set by PlaybackBar's outer
+        // LayoutBuilder so the block doesn't just gain whitespace
+        // when the window stretches — its title grows with it.
+        // Pattern: `feedback_fluid_typography.md`.
+        const minW = 280.0;
+        const maxW = 580.0;
+        double scale(double minSize, double maxSize) {
+          final w = c.maxWidth.clamp(minW, maxW);
+          final t = (w - minW) / (maxW - minW);
+          return minSize + (maxSize - minSize) * t;
+        }
+
+        final titleSize = scale(22, 30);
+        final subtitleSize = scale(16, 22);
+        final artistSize = scale(14, 18);
+        final metaSize = scale(14, 16);
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Tooltip(
+              message: 'Jump to current track',
+              waitDuration: const Duration(milliseconds: 600),
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  onTap: onTap,
+                  hoverColor: AppColors.hoverRow,
+                  focusColor: AppColors.focusOverlay,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            split.primary,
+                            overflow: TextOverflow.ellipsis,
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: AppColors.textPrimary,
+                              fontSize: titleSize,
+                              fontWeight: FontWeight.w600,
+                              height: 1.15,
+                            ),
                           ),
-                        ),
-                      ],
-                      const SizedBox(height: 4),
-                      Text(
-                        t.displayArtist.isEmpty ? '—' : t.displayArtist,
-                        overflow: TextOverflow.ellipsis,
-                        maxLines: 1,
-                        style: const TextStyle(
-                          color: AppColors.textSecondary,
-                          fontSize: 14,
-                          height: 1.15,
-                        ),
+                          if (split.subtitle != null) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              split.subtitle!,
+                              overflow: TextOverflow.ellipsis,
+                              maxLines: 1,
+                              style: TextStyle(
+                                color: AppColors.textSecondary,
+                                fontSize: subtitleSize,
+                                height: 1.15,
+                              ),
+                            ),
+                          ],
+                          const SizedBox(height: 4),
+                          Text(
+                            t.displayArtist.isEmpty
+                                ? '—'
+                                : t.displayArtist,
+                            overflow: TextOverflow.ellipsis,
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: AppColors.textSecondary,
+                              fontSize: artistSize,
+                              height: 1.15,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            _formatTrackMeta(t),
+                            overflow: TextOverflow.ellipsis,
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: AppColors.textTertiary,
+                              fontSize: metaSize,
+                              height: 1.15,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                            ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 4),
-                      Text(
-                        _formatTrackMeta(t),
-                        overflow: TextOverflow.ellipsis,
-                        maxLines: 1,
-                        style: const TextStyle(
-                          color: AppColors.textTertiary,
-                          fontSize: 14,
-                          height: 1.15,
-                          fontFeatures: [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                    ],
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: _PeoplePivots(track: t, onTap: onPivotTap),
-        ),
-      ],
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: _PeoplePivots(track: t, onTap: onPivotTap),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -411,12 +472,15 @@ class _PivotChip extends StatelessWidget {
 
 class _DeckArtwork extends StatelessWidget {
   final Track? track;
-  const _DeckArtwork({required this.track});
+  final LibraryController controller;
+  const _DeckArtwork({required this.track, required this.controller});
 
   @override
   Widget build(BuildContext context) {
     final t = track;
     if (t == null) {
+      // Placeholder — no track loaded, so no favorite overlay
+      // either. Same neutral square as before.
       return Container(
         width: 130,
         height: 130,
@@ -426,9 +490,70 @@ class _DeckArtwork extends StatelessWidget {
         ),
       );
     }
-    return ClipRRect(
-      borderRadius: BorderRadius.zero,
-      child: TrackArtwork(seed: t.displayTitle, size: 130),
+    final isFav = t.favorite;
+    return SizedBox(
+      width: 130,
+      height: 130,
+      // Stack puts the favorite tap target ON the cover art instead
+      // of in the utility rail. The tinted backdrop behind the star
+      // is load-bearing for legibility — without it the star washes
+      // out against pastel artwork colours.
+      child: Stack(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.zero,
+            child: TrackArtwork(seed: t.displayTitle, size: 130),
+          ),
+          Positioned(
+            top: 6,
+            right: 6,
+            child: _ArtworkFavoriteButton(
+              isFav: isFav,
+              onPressed: () => controller.toggleFavorite(t.uid),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Favorite toggle rendered as an overlay on the deck artwork. Uses
+/// a slightly-translucent dark backdrop so the star stays legible
+/// against any cover colour. Replaces the utility-rail FAVORITE
+/// module: the action is now where the eye already lives (next to
+/// the track image) rather than tucked away in the rail.
+class _ArtworkFavoriteButton extends StatelessWidget {
+  final bool isFav;
+  final VoidCallback onPressed;
+  const _ArtworkFavoriteButton({
+    required this.isFav,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black.withValues(alpha: 0.45),
+      shape: const CircleBorder(),
+      clipBehavior: Clip.antiAlias,
+      child: Tooltip(
+        message: isFav ? 'Unfavorite' : 'Favorite',
+        waitDuration: const Duration(milliseconds: 400),
+        child: InkWell(
+          onTap: onPressed,
+          customBorder: const CircleBorder(),
+          child: SizedBox(
+            width: 30,
+            height: 30,
+            child: Icon(
+              isFav ? Icons.star_rounded : Icons.star_border_rounded,
+              size: 18,
+              color: isFav ? AppColors.favorite : Colors.white,
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

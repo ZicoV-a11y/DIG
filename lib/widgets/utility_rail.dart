@@ -14,8 +14,11 @@ import 'load_state_dialog.dart';
 import 'move_copy_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
-/// Stacked modules (top → bottom): Volume, Play Threshold, Favorite,
-/// Play Mode. Subtle horizontal dividers separate them.
+/// Stacked modules (top → bottom): Volume, Play Threshold, Play Mode,
+/// Rescan, Audit, History, Move/Copy, Show in Finder, Data. Subtle
+/// horizontal dividers separate them. (The Favorite toggle used to
+/// live here; as of 2026-05-13 it overlays the deck artwork
+/// instead — closer to where the eye already lives.)
 class UtilityRail extends StatelessWidget {
   final LibraryController controller;
   const UtilityRail({super.key, required this.controller});
@@ -50,8 +53,6 @@ class UtilityRail extends StatelessWidget {
                   _VolumeModule(controller: controller),
                   const _RailDivider(),
                   _ThresholdModule(controller: controller),
-                  const _RailDivider(),
-                  _FavoriteModule(controller: controller),
                   const _RailDivider(),
                   _ModeModule(controller: controller),
                   const _RailDivider(),
@@ -213,39 +214,6 @@ class _ThresholdModule extends StatelessWidget {
               color: AppColors.textPrimary,
               fontFeatures: [FontFeature.tabularFigures()],
             ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ---------- FAVORITE ----------
-
-class _FavoriteModule extends StatelessWidget {
-  final LibraryController controller;
-  const _FavoriteModule({required this.controller});
-
-  @override
-  Widget build(BuildContext context) {
-    final track = controller.currentTrack;
-    final isFav = track?.favorite ?? false;
-    return _RailButton(
-      tooltip: track == null
-          ? 'Favorite (no track)'
-          : (isFav ? 'Unfavorite' : 'Favorite'),
-      onPressed: track == null
-          ? null
-          : () => controller.toggleFavorite(track.uid),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const _SectionLabel('FAVORITE'),
-          const SizedBox(height: 6),
-          Icon(
-            isFav ? Icons.star_rounded : Icons.star_border_rounded,
-            size: 26,
-            color: isFav ? AppColors.favorite : AppColors.textSecondary,
           ),
         ],
       ),

@@ -14,11 +14,13 @@ import 'load_state_dialog.dart';
 import 'move_copy_dialog.dart';
 
 /// Persistent vertical operational rail on the right edge of the app.
-/// Stacked modules (top → bottom): Volume, Play Threshold, Play Mode,
-/// Rescan, Audit, History, Move/Copy, Show in Finder, Data. Subtle
-/// horizontal dividers separate them. (The Favorite toggle used to
-/// live here; as of 2026-05-13 it overlays the deck artwork
-/// instead — closer to where the eye already lives.)
+/// Stacked modules (top → bottom): Play Threshold, Play Mode, Rescan,
+/// Audit, History, Move/Copy, Show in Finder, Data. Subtle horizontal
+/// dividers separate them. (Favorite toggle moved to a deck-artwork
+/// overlay on 2026-05-13; Volume strip moved into the deck's right
+/// zone alongside the artwork on the same date — both relocations
+/// put playback-adjacent controls where the eye already lives during
+/// playback instead of in this rail.)
 class UtilityRail extends StatelessWidget {
   final LibraryController controller;
   const UtilityRail({super.key, required this.controller});
@@ -50,8 +52,6 @@ class UtilityRail extends StatelessWidget {
               child: Column(
                 children: [
                   const SizedBox(height: 12),
-                  _VolumeModule(controller: controller),
-                  const _RailDivider(),
                   _ThresholdModule(controller: controller),
                   const _RailDivider(),
                   _ModeModule(controller: controller),
@@ -108,78 +108,6 @@ class _SectionLabel extends StatelessWidget {
         letterSpacing: 1.0,
         color: AppColors.textTertiary,
       ),
-    );
-  }
-}
-
-// ---------- VOLUME ----------
-
-class _VolumeModule extends StatelessWidget {
-  final LibraryController controller;
-  const _VolumeModule({required this.controller});
-
-  IconData _iconFor(double v) {
-    if (v <= 0.001) return Icons.volume_off_rounded;
-    if (v < 0.33) return Icons.volume_mute_rounded;
-    if (v < 0.66) return Icons.volume_down_rounded;
-    return Icons.volume_up_rounded;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return ValueListenableBuilder<double>(
-      valueListenable: controller.volumeListenable,
-      builder: (ctx, volume, _) {
-        return Column(
-          children: [
-            const _SectionLabel('VOLUME'),
-            const SizedBox(height: 8),
-            Icon(
-              _iconFor(volume),
-              size: 20,
-              color: AppColors.textSecondary,
-            ),
-            const SizedBox(height: 6),
-            SizedBox(
-              height: 120,
-              child: RotatedBox(
-                quarterTurns: 3,
-                child: SliderTheme(
-                  data: const SliderThemeData(
-                    trackHeight: 4,
-                    activeTrackColor: AppColors.accent,
-                    inactiveTrackColor: AppColors.border,
-                    thumbColor: AppColors.accent,
-                    thumbShape: RoundSliderThumbShape(
-                      enabledThumbRadius: 6,
-                    ),
-                    overlayShape: RoundSliderOverlayShape(
-                      overlayRadius: 14,
-                    ),
-                  ),
-                  child: Slider(
-                    value: volume,
-                    onChanged: (v) =>
-                        controller.setVolume(v, commit: false),
-                    onChangeEnd: (v) =>
-                        controller.setVolume(v, commit: true),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              '${(volume * 100).round()}%',
-              style: const TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-                color: AppColors.textPrimary,
-                fontFeatures: [FontFeature.tabularFigures()],
-              ),
-            ),
-          ],
-        );
-      },
     );
   }
 }

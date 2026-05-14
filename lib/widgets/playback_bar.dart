@@ -38,8 +38,13 @@ class PlaybackBar extends StatelessWidget {
           //    horizontal expansion.
           final W = deckConstraints.maxWidth;
 
-          // Where will the transport row's left edge sit when its
-          // centre is at W/2?
+          // Right-zone now packs artwork + volume strip together:
+          //   artwork 110 + gap 8 + volume strip 32 + right pad 16
+          //     = 166 from right edge
+          // (Previously: artwork 130 + pad 16 = 146.) The 20 extra
+          // pixels of right-zone width are absorbed into the
+          // alignment math below — Expanded shrinks by 20, Expanded's
+          // centre shifts by 10, alignment-x compensates.
           const transportButtonRowWidth = 552.0;
           final transportLeftScreen =
               W / 2 - transportButtonRowWidth / 2;
@@ -54,19 +59,18 @@ class PlaybackBar extends StatelessWidget {
                   .clamp(280.0, 600.0);
 
           // Alignment for the button row inside the Expanded zone:
-          // Expanded spans [312, W-162]. Width = W - 474. Its centre
-          // is at W/2 + 75 (75 px right of app centre because of the
+          // Expanded spans [312, W-166]. Width = W - 478. Its centre
+          // is at W/2 + 73 (73 px right of app centre because of the
           // left-side Now Playing block). We want the button row
-          // centred at W/2, which is 75 px LEFT of Expanded's centre.
-          // Express that as an Alignment.x value:
+          // centred at W/2.
           //   alignment.x ∈ [-1, 1] where -1 = parent-left, 1 = parent-right
           //   shift_distance_from_centre = alignment.x × (parent_width - child_width) / 2
-          //   -75 = alignment.x × (W - 474 - 552) / 2
-          //   alignment.x = -150 / (W - 1026)
+          //   -73 = alignment.x × (W - 478 - 552) / 2
+          //   alignment.x = -146 / (W - 1030)
           // Clamp so we never pin past the edges if the window
           // shrinks below the 1180 minimum.
           final buttonAlignmentX =
-              (-150.0 / (W - 1026)).clamp(-1.0, 1.0);
+              (-146.0 / (W - 1030)).clamp(-1.0, 1.0);
 
           return ListenableBuilder(
             listenable: controller,
@@ -138,7 +142,7 @@ class PlaybackBar extends StatelessWidget {
                                   )
                               : null,
                         ),
-                        const SizedBox(width: 18),
+                        const SizedBox(width: 14),
                         _CircleIconButton(
                           tooltip: 'Previous',
                           icon: Icons.skip_previous_rounded,
@@ -155,7 +159,7 @@ class PlaybackBar extends StatelessWidget {
                           icon: Icons.skip_next_rounded,
                           onPressed: controller.next,
                         ),
-                        const SizedBox(width: 18),
+                        const SizedBox(width: 14),
                         SkipButton(
                           label: '+10',
                           onPressed: hasTrack
@@ -185,7 +189,7 @@ class PlaybackBar extends StatelessWidget {
                       ],
                     ),
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 6),
                     _PositionRow(
                       controller: controller,
                       duration: dur,
@@ -200,6 +204,8 @@ class PlaybackBar extends StatelessWidget {
                     track: track,
                     controller: controller,
                   ),
+                  const SizedBox(width: 8),
+                  _DeckVolumeStrip(controller: controller),
                   const SizedBox(width: 16),
                 ],
               );
@@ -506,8 +512,8 @@ class _DeckArtwork extends StatelessWidget {
       // Placeholder — no track loaded, so no favorite overlay
       // either. Same neutral square as before.
       return Container(
-        width: 130,
-        height: 130,
+        width: 110,
+        height: 110,
         decoration: BoxDecoration(
           color: AppColors.surfaceAlt,
           borderRadius: BorderRadius.zero,
@@ -526,7 +532,7 @@ class _DeckArtwork extends StatelessWidget {
         children: [
           ClipRRect(
             borderRadius: BorderRadius.zero,
-            child: TrackArtwork(seed: t.displayTitle, size: 130),
+            child: TrackArtwork(seed: t.displayTitle, size: 110),
           ),
           Positioned(
             top: 6,
@@ -578,6 +584,88 @@ class _ArtworkFavoriteButton extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Compact vertical volume strip integrated into the deck's right
+/// zone alongside the artwork. Replaces the larger _VolumeModule
+/// that used to live in the utility rail — moving it here makes
+/// volume part of the playback console rather than a sidebar
+/// utility, per the right-zone-rebalance UX pass.
+///
+/// Height matches the artwork (110) so the right-zone reads as
+/// one cohesive playback panel. Slim 32 px footprint (rotated
+/// Slider + percentage text) keeps it visually quiet.
+class _DeckVolumeStrip extends StatelessWidget {
+  final LibraryController controller;
+  const _DeckVolumeStrip({required this.controller});
+
+  IconData _iconFor(double v) {
+    if (v <= 0.001) return Icons.volume_off_rounded;
+    if (v < 0.33) return Icons.volume_mute_rounded;
+    if (v < 0.66) return Icons.volume_down_rounded;
+    return Icons.volume_up_rounded;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<double>(
+      valueListenable: controller.volumeListenable,
+      builder: (ctx, volume, _) {
+        return SizedBox(
+          width: 32,
+          height: 110,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Icon(
+                _iconFor(volume),
+                size: 16,
+                color: AppColors.textSecondary,
+              ),
+              const SizedBox(height: 2),
+              Expanded(
+                child: RotatedBox(
+                  quarterTurns: 3,
+                  child: SliderTheme(
+                    data: const SliderThemeData(
+                      trackHeight: 3,
+                      activeTrackColor: AppColors.accent,
+                      inactiveTrackColor: AppColors.border,
+                      thumbColor: AppColors.accent,
+                      thumbShape: RoundSliderThumbShape(
+                        enabledThumbRadius: 5,
+                      ),
+                      overlayShape: RoundSliderOverlayShape(
+                        overlayRadius: 12,
+                      ),
+                    ),
+                    child: Slider(
+                      value: volume,
+                      onChanged: (v) =>
+                          controller.setVolume(v, commit: false),
+                      onChangeEnd: (v) =>
+                          controller.setVolume(v, commit: true),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                '${(volume * 100).round()}',
+                style: const TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.textTertiary,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }

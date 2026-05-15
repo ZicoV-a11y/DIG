@@ -1398,32 +1398,38 @@ class _TrackRow extends StatelessWidget {
     }
     final isLoading = isCurrent && controller.isLoadingTrack;
     final isSelected = !isCurrent && controller.selectedTrackUid == track.uid;
-    // Reviewed state surfaces at the row level (left-edge stripe +
-    // ultra-subtle tint) so it registers peripherally, without
-    // requiring a focused scan of the REV cell. Aggregated views
-    // own the reviewed flag for bucket primaries; bucket variants
-    // fall through to the underlying track.
-    final aggViewForState = controller.aggregatedViewForPrimary(track);
-    final reviewed = aggViewForState?.reviewed ?? track.reviewed;
+    // Transient "just reviewed" highlight: when this track's current
+    // play session crosses the threshold, the controller sets
+    // `justReviewedUid` to its uid. Stays set until the next track
+    // starts. AnimatedContainer below fades the colour in (=
+    // user-visible flash) and out (when the marker clears). The
+    // persistent "ever been reviewed" record stays in the REV cell's
+    // filled-disc glyph — this row treatment is purely momentary.
+    final isJustReviewed = controller.justReviewedUid != null &&
+        controller.justReviewedUid == track.uid;
     final titleColor = isCurrent
         ? AppColors.accent
         : (track.isAvailable ? AppColors.textPrimary : AppColors.textTertiary);
     final titleWeight = isCurrent ? FontWeight.w600 : FontWeight.w500;
     final trailIndex = isCurrent ? null : controller.trailIndexOf(track.uid);
     Color rowColor;
-    if (isCurrent) {
+    if (isCurrent && isJustReviewed) {
+      // Currently-playing AND just crossed threshold this session:
+      // an extra-warm wash on top of the playing highlight so the
+      // user sees "this is the one that just got logged."
+      rowColor = Color.alphaBlend(
+        AppColors.reviewed.withValues(alpha: 0.10),
+        AppColors.selectedRow,
+      );
+    } else if (isCurrent) {
       rowColor = AppColors.selectedRow;
+    } else if (isJustReviewed) {
+      // Just crossed threshold but no longer the current track —
+      // shouldn't happen often (the marker clears on next play()),
+      // but defensive: keep the highlight until the marker clears.
+      rowColor = AppColors.reviewed.withValues(alpha: 0.08);
     } else if (isSelected) {
       rowColor = AppColors.accent.withValues(alpha: 0.07);
-    } else if (reviewed) {
-      // Ultra-subtle accent wash — peripheral cue that this row has
-      // crossed the play threshold. Suppressed under selection /
-      // current-track highlights above so those keep dominance.
-      // Stacks underneath any trail tint if both are present
-      // (combined alpha stays well within readable range).
-      final base = AppColors.reviewed.withValues(alpha: 0.04);
-      final trail = AppColors.trailTint(trailIndex);
-      rowColor = trail == null ? base : Color.alphaBlend(trail, base);
     } else {
       rowColor = AppColors.trailTint(trailIndex) ?? Colors.transparent;
     }
@@ -1432,8 +1438,17 @@ class _TrackRow extends StatelessWidget {
       behavior: HitTestBehavior.opaque,
       onSecondaryTapDown: (details) =>
           _showContextMenu(context, details.globalPosition),
-      child: Material(
-      color: rowColor,
+      // AnimatedContainer animates rowColor changes. The user-visible
+      // "flash" when a track crosses the threshold is this color
+      // transition fading in over ~500 ms; the highlight then stays
+      // until the next play() clears `justReviewedUid`, after which
+      // it fades back out over the same duration.
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 500),
+        curve: Curves.easeOut,
+        color: rowColor,
+        child: Material(
+      color: Colors.transparent,
       child: InkWell(
         onTap: () => controller.play(track.uid),
         hoverColor: AppColors.hoverRow,
@@ -1448,22 +1463,6 @@ class _TrackRow extends StatelessWidget {
                 child: SizedBox(
                   width: 2,
                   child: ColoredBox(color: AppColors.accent),
-                ),
-              )
-            // Reviewed-row stripe — sibling of the current-track
-            // stripe above, gated mutually so we never stack two
-            // 2 px bars at the same edge. Uses the reviewed accent
-            // (greenish), distinct from the playing accent
-            // (purple), so the user can tell at a glance whether
-            // a row is currently-playing or merely reviewed.
-            else if (reviewed)
-              const Positioned(
-                left: 0,
-                top: 0,
-                bottom: 0,
-                child: SizedBox(
-                  width: 2,
-                  child: ColoredBox(color: AppColors.reviewed),
                 ),
               ),
             Padding(
@@ -1542,6 +1541,7 @@ class _TrackRow extends StatelessWidget {
             ),
           ],
         ),
+      ),
       ),
       ),
     );

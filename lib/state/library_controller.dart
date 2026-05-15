@@ -127,6 +127,14 @@ class LibraryController extends ChangeNotifier {
   // in `_revealInFinderWithFallback`.
   String? _currentTrackPath;
   String? _selectedTrackUid;
+  // Transient "this track's play session just crossed the threshold"
+  // marker. Set when [_sessionListened] reaches the threshold during
+  // playback; cleared the moment a new track starts. Drives the
+  // momentary row highlight in the track table — appears as a fade-in
+  // flash (animated by the row's AnimatedContainer) and stays until
+  // the next track plays. NOT a persistent "reviewed" indicator —
+  // that's `track.reviewed` and surfaces in the REV cell.
+  String? _justReviewedUid;
   PlaybackMode _playbackMode = PlaybackMode.sequential;
   final Random _rng = Random();
   bool _isPlaying = false;
@@ -1188,6 +1196,13 @@ class LibraryController extends ChangeNotifier {
 
   String? get currentTrackUid => _currentTrackUid;
   String? get currentTrackPath => _currentTrackPath;
+  /// UID of the most recently threshold-crossed track. Stays set
+  /// while that track is current; clears on the next [play] call.
+  /// The table row keyed to this uid renders with an accent
+  /// highlight (an AnimatedContainer at the row level fades the
+  /// highlight in — that's the "flash"). Distinct from
+  /// `track.reviewed`, which is the long-term persistent flag.
+  String? get justReviewedUid => _justReviewedUid;
   String? get selectedTrackUid => _selectedTrackUid;
   PlaybackMode get playbackMode => _playbackMode;
   bool get isPlaying => _isPlaying;
@@ -3174,6 +3189,11 @@ class LibraryController extends ChangeNotifier {
       _lastTickPosition = Duration.zero;
       _sessionListened = Duration.zero;
       _sessionPlayCounted = false;
+      // Clear the transient "just reviewed" marker so the previous
+      // track's highlight disappears the moment a new track starts
+      // playing. Set again later in [_onPosition] when this new
+      // track's session crosses the threshold.
+      _justReviewedUid = null;
       _isLoadingTrack = true;
       _markLibraryDirty();
       notifyListeners();
@@ -3333,6 +3353,13 @@ class LibraryController extends ChangeNotifier {
             // per-save-period "tracks played" counter. Flushed
             // to the events table at the next autosave tick.
             _playsSinceSnapshot += 1;
+            // Mark this track for transient row-highlight in the
+            // table. The row's AnimatedContainer fades the colour
+            // in (= the user-visible "flash"); the marker stays
+            // until the next `play()` call clears it, so the
+            // highlight reads as "you played this track through
+            // — until you start the next one."
+            _justReviewedUid = track.uid;
           }
           _pushRecentReviewed(track.uid);
           _markLibraryDirty();

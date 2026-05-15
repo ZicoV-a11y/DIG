@@ -613,6 +613,7 @@ Widget _buildRowInner(
   Track t,
   LibraryController c, {
   required bool isCurrent,
+  required bool isJustReviewed,
   required bool isLoading,
   required bool showArtwork,
   required Color titleColor,
@@ -647,21 +648,44 @@ Widget _buildRowInner(
       // Filled disc when the threshold has been crossed; hollow
       // ring when not. The disc reads as a *state* glyph rather
       // than a "task completed" check, so it scans faster in a
-      // dense table and pairs naturally with the row-level
-      // accent stripe + ultra-subtle tint applied to reviewed
-      // rows by the row builder below.
+      // dense table.
+      //
+      // When `isJustReviewed` is true — the moment this track's
+      // play session crossed the threshold, still active until
+      // the next track plays — the disc participates in the row
+      // flash: brighter colour + ~15% scale-up. Animations match
+      // the row's 500 ms AnimatedContainer cadence so the REV
+      // cell + row pulse together as one moment. After the
+      // marker clears the disc decays back to its long-term
+      // appearance (still filled if the track is permanently
+      // reviewed; hollow otherwise).
+      final glyph = reviewed ? '●' : '○';
+      final baseColor = reviewed
+          ? AppColors.reviewed
+          : AppColors.textTertiary;
+      // Brighter accent for the active moment. Blends accent
+      // toward white so the disc visibly "lifts" against its
+      // normal hue, working whether the row was previously
+      // reviewed or not.
+      final activeColor =
+          Color.alphaBlend(Colors.white.withValues(alpha: 0.35), baseColor);
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(
-          child: Text(
-            reviewed ? '●' : '○',
-            style: TextStyle(
-              fontSize: 16,
-              height: 1.0,
-              fontWeight: FontWeight.w600,
-              color: reviewed
-                  ? AppColors.reviewed
-                  : AppColors.textTertiary,
+          child: AnimatedScale(
+            scale: isJustReviewed ? 1.15 : 1.0,
+            duration: const Duration(milliseconds: 500),
+            curve: Curves.easeOut,
+            child: AnimatedDefaultTextStyle(
+              duration: const Duration(milliseconds: 500),
+              curve: Curves.easeOut,
+              style: TextStyle(
+                fontSize: 16,
+                height: 1.0,
+                fontWeight: FontWeight.w600,
+                color: isJustReviewed ? activeColor : baseColor,
+              ),
+              child: Text(glyph),
             ),
           ),
         ),
@@ -1500,6 +1524,7 @@ class _TrackRow extends StatelessWidget {
                         track,
                         controller,
                         isCurrent: isCurrent,
+                        isJustReviewed: isJustReviewed,
                         isLoading: isLoading,
                         showArtwork: showArtwork,
                         titleColor: titleColor,

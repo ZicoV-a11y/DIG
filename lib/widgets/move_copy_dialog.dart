@@ -320,9 +320,17 @@ class _Header extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Hierarchy: payload (filename) dominates the dialog visually.
+    // The action label ("MOVE OR COPY") is demoted to a small
+    // uppercase tag above it — reads as the *operation*, not the
+    // *subject*. The filename soft-wraps up to 3 lines because
+    // variant names ("(Audio Prophecy & Charlie Rouhana Re-fit)"
+    // / "(feat. Ashley Slater)") carry operational meaning that
+    // silent truncation would hide.
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 14, 12, 12),
+      padding: const EdgeInsets.fromLTRB(20, 16, 12, 14),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Expanded(
             child: Column(
@@ -330,31 +338,33 @@ class _Header extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 const Text(
-                  'Move or copy',
+                  'MOVE OR COPY',
                   style: TextStyle(
-                    color: AppColors.textPrimary,
-                    fontSize: 15,
+                    color: AppColors.textTertiary,
+                    fontSize: 10,
                     fontWeight: FontWeight.w600,
-                    letterSpacing: 0.4,
+                    letterSpacing: 1.4,
                   ),
                 ),
-                const SizedBox(height: 2),
+                const SizedBox(height: 6),
                 Text(
                   track.filename,
                   style: const TextStyle(
-                    color: AppColors.textSecondary,
-                    fontSize: 12,
+                    color: AppColors.textPrimary,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                    height: 1.2,
                   ),
-                  maxLines: 1,
+                  maxLines: 3,
                   overflow: TextOverflow.ellipsis,
                 ),
                 if (currentSource != null) ...[
-                  const SizedBox(height: 2),
+                  const SizedBox(height: 6),
                   Text(
                     'Currently in: ${currentSource!.displayName}',
                     style: const TextStyle(
                       color: AppColors.textTertiary,
-                      fontSize: 10,
+                      fontSize: 11,
                     ),
                   ),
                 ],

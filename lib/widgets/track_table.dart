@@ -644,17 +644,24 @@ Widget _buildRowInner(
         ),
       );
     case 'rev':
+      // Filled disc when the threshold has been crossed; hollow
+      // ring when not. The disc reads as a *state* glyph rather
+      // than a "task completed" check, so it scans faster in a
+      // dense table and pairs naturally with the row-level
+      // accent stripe + ultra-subtle tint applied to reviewed
+      // rows by the row builder below.
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4),
         child: Center(
           child: Text(
-            reviewed ? '✔' : '○',
+            reviewed ? '●' : '○',
             style: TextStyle(
-              fontSize: 17,
+              fontSize: 16,
               height: 1.0,
+              fontWeight: FontWeight.w600,
               color: reviewed
                   ? AppColors.reviewed
-                  : AppColors.textSecondary,
+                  : AppColors.textTertiary,
             ),
           ),
         ),
@@ -1391,6 +1398,13 @@ class _TrackRow extends StatelessWidget {
     }
     final isLoading = isCurrent && controller.isLoadingTrack;
     final isSelected = !isCurrent && controller.selectedTrackUid == track.uid;
+    // Reviewed state surfaces at the row level (left-edge stripe +
+    // ultra-subtle tint) so it registers peripherally, without
+    // requiring a focused scan of the REV cell. Aggregated views
+    // own the reviewed flag for bucket primaries; bucket variants
+    // fall through to the underlying track.
+    final aggViewForState = controller.aggregatedViewForPrimary(track);
+    final reviewed = aggViewForState?.reviewed ?? track.reviewed;
     final titleColor = isCurrent
         ? AppColors.accent
         : (track.isAvailable ? AppColors.textPrimary : AppColors.textTertiary);
@@ -1401,6 +1415,15 @@ class _TrackRow extends StatelessWidget {
       rowColor = AppColors.selectedRow;
     } else if (isSelected) {
       rowColor = AppColors.accent.withValues(alpha: 0.07);
+    } else if (reviewed) {
+      // Ultra-subtle accent wash — peripheral cue that this row has
+      // crossed the play threshold. Suppressed under selection /
+      // current-track highlights above so those keep dominance.
+      // Stacks underneath any trail tint if both are present
+      // (combined alpha stays well within readable range).
+      final base = AppColors.reviewed.withValues(alpha: 0.04);
+      final trail = AppColors.trailTint(trailIndex);
+      rowColor = trail == null ? base : Color.alphaBlend(trail, base);
     } else {
       rowColor = AppColors.trailTint(trailIndex) ?? Colors.transparent;
     }
@@ -1425,6 +1448,22 @@ class _TrackRow extends StatelessWidget {
                 child: SizedBox(
                   width: 2,
                   child: ColoredBox(color: AppColors.accent),
+                ),
+              )
+            // Reviewed-row stripe — sibling of the current-track
+            // stripe above, gated mutually so we never stack two
+            // 2 px bars at the same edge. Uses the reviewed accent
+            // (greenish), distinct from the playing accent
+            // (purple), so the user can tell at a glance whether
+            // a row is currently-playing or merely reviewed.
+            else if (reviewed)
+              const Positioned(
+                left: 0,
+                top: 0,
+                bottom: 0,
+                child: SizedBox(
+                  width: 2,
+                  child: ColoredBox(color: AppColors.reviewed),
                 ),
               ),
             Padding(
@@ -1917,14 +1956,28 @@ String _formatBpm(double? bpm) {
   return bpm.round().toString();
 }
 
-/// Compact relative-time label for the Last Played column.
+/// Compact date+time label for the Last Played column.
+/// Format: "M/D/YY · H:MM AM/PM" (e.g. "5/14/25 · 8:42 PM").
 /// Pure function over `(at, now)` — no allocations beyond the
 /// returned String, no DateTime arithmetic per-frame beyond a few
 /// integer subtractions. Cheap enough at 60fps × ~50 visible rows.
+///
+/// The bullet separator (` · `) matches the meta-line rhythm used
+/// elsewhere (deck Now Playing, Review-missing detail line) so the
+/// column reads consistent with surrounding UI vocabulary.
+///
+/// 12-hour clock with AM/PM (no seconds, no 24-hour ambiguity).
+/// Hour has no leading zero; minute is always 2 digits. Midnight
+/// renders as `12:00 AM`, noon as `12:00 PM`.
 String _formatLastPlayed(DateTime? at) {
-  // Short numeric M/D/YY, no leading zeros, 2-digit year. Never
-  // played → em dash. Examples: 5/14/25, 5/9/25, 1/3/25, 12/31/24.
   if (at == null) return '—';
   final yy = (at.year % 100).toString().padLeft(2, '0');
-  return '${at.month}/${at.day}/$yy';
+  final date = '${at.month}/${at.day}/$yy';
+  final hour24 = at.hour;
+  final hour12 = hour24 == 0
+      ? 12
+      : (hour24 > 12 ? hour24 - 12 : hour24);
+  final minute = at.minute.toString().padLeft(2, '0');
+  final ampm = hour24 < 12 ? 'AM' : 'PM';
+  return '$date · $hour12:$minute $ampm';
 }

@@ -169,7 +169,11 @@ class LibraryController extends ChangeNotifier {
   // Triple/quad combos still ellipsize; users can drag wider.
   double _colFormatWidth = 96;
   double _colPlaysWidth = 60;
-  double _colLastPlayedWidth = 68;
+  // 140 fits "M/D/YY · H:MM AM" comfortably. Was 68 before the
+  // 2026-05-15 enrichment that added time-of-day; the old width
+  // would truncate the new format. Users who customised the
+  // column before this change keep their persisted value.
+  double _colLastPlayedWidth = 140;
   // Text columns: persisted absolute widths.
   double _colTitleWidth = 350;
   double _colArtistWidth = 240;

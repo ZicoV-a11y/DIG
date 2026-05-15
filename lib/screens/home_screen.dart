@@ -19,7 +19,8 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen>
+    with WidgetsBindingObserver {
   late final TextEditingController _searchTextController;
   late final FocusNode _searchFocusNode;
   late final FocusNode _bodyFocusNode;
@@ -36,6 +37,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _searchFocusNode = FocusNode(debugLabel: 'search');
     _bodyFocusNode = FocusNode(debugLabel: 'body');
     HardwareKeyboard.instance.addHandler(_handleKeyEvent);
+    // Lifecycle observer — see [didChangeAppLifecycleState] below
+    // for the defensive focus re-grab on app resume.
+    WidgetsBinding.instance.addObserver(this);
     // Keep the search-field text in sync when the query is set
     // from outside the toolbar (e.g. a Now Playing pivot click).
     widget.controller.addListener(_syncSearchTextWithQuery);
@@ -44,12 +48,42 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     widget.controller.removeListener(_syncSearchTextWithQuery);
+    WidgetsBinding.instance.removeObserver(this);
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     _searchTextController.dispose();
     _searchFocusNode.dispose();
     _bodyFocusNode.dispose();
     _tableScroll.dispose();
     super.dispose();
+  }
+
+  /// Defensive focus re-grab when the app returns to foreground.
+  ///
+  /// Observed bug (no reliable repro yet, but seen multiple times
+  /// in real use): after Cmd+Tab away and back, OR occasionally
+  /// after a hot reload, hover events keep firing but click and/or
+  /// arrow-key events go silent until full app restart. Hover
+  /// survival tells us the render tree + pointer tracking are
+  /// alive; what dies is *interaction ownership*. Re-claiming the
+  /// body focus node on resume is the lowest-cost mitigation for
+  /// the Cmd+Tab variant.
+  ///
+  /// Guards:
+  ///   - Only fires on [AppLifecycleState.resumed] (not paused /
+  ///     inactive / hidden / detached).
+  ///   - Only re-claims focus when no other node currently owns it,
+  ///     so we never yank focus out from under an open dialog,
+  ///     text field, or modal sheet.
+  ///   - `requestFocus` is a no-op when the node already has focus,
+  ///     so this is idempotent under repeated resume events.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state != AppLifecycleState.resumed) return;
+    if (!mounted) return;
+    final currentFocus = FocusManager.instance.primaryFocus;
+    if (currentFocus != null && currentFocus.hasPrimaryFocus) return;
+    _bodyFocusNode.requestFocus();
   }
 
   /// Mirror `controller.searchQuery` back into the toolbar's

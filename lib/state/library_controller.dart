@@ -3362,7 +3362,27 @@ class LibraryController extends ChangeNotifier {
             _justReviewedUid = track.uid;
           }
           _pushRecentReviewed(track.uid);
-          _markLibraryDirty();
+          // Bump `_dataVersion` only — NOT `_libraryVersion` and
+          // NOT the visible cache. The track object was mutated
+          // in place (playCount, reviewed via cumulativeListened);
+          // widget rebuilds via notifyListeners() read those
+          // updated fields directly. Crucially, the table's
+          // visible-cache stays valid → no re-sort fires while a
+          // song is playing → neighbour rows DO NOT shift around
+          // the currently-playing row when the threshold crosses.
+          //
+          // Was previously `_markLibraryDirty()` here, which
+          // invalidated the visible cache. With sticky-current
+          // pinning the playing row, the re-sort would remove it
+          // from its natural new position and re-insert at the
+          // locked index — shifting every row in between by 1.
+          // User noticed and complained: "I JUST DONT WANT THINGS
+          // TO MOVE WHILE THE SONG IS PLAYING."
+          //
+          // Other caches that legitimately depend on data freshness
+          // (multiVariantBucketCount, source counts) still refresh
+          // because they key off `_dataVersion`.
+          _dataVersion++;
           notifyListeners();
           // Persist through the bucket helper so the play-count
           // increment and cumulative listening propagate to every

@@ -136,7 +136,33 @@ class _HomeScreenState extends State<HomeScreen>
     _searchFocusNode.requestFocus();
   }
 
+  /// Esc panic-key behaviour.
+  ///
+  /// Hierarchy (first matching action wins):
+  ///   1. **Open modal route** (dialog, menu, popup) → dismiss it.
+  ///      This was previously broken: our global HardwareKeyboard
+  ///      handler intercepts Esc before Flutter's default
+  ///      ModalRoute Esc-to-pop chain runs, so a dialog stayed
+  ///      open even after Esc until the user clicked the barrier.
+  ///      Worse, if the input-event bug ever traps mouse clicks,
+  ///      Esc was the user's only keyboard recovery — but it
+  ///      didn't close anything. Now it does.
+  ///   2. **Active search query** → clear it.
+  ///   3. **Search input focused** → unfocus.
+  ///   4. **Always** → re-claim body focus.
+  ///
+  /// Returns `true` from the caller in every case so Esc never
+  /// double-dispatches (the route's own Esc handler still fires
+  /// when we call Navigator.pop here, but the call we make is
+  /// the one that pops; the framework's parallel Esc dispatch
+  /// becomes a no-op against an already-popping route).
   void _escape() {
+    final ctx = context;
+    final navigator = Navigator.maybeOf(ctx, rootNavigator: true);
+    if (navigator != null && navigator.canPop()) {
+      navigator.pop();
+      return;
+    }
     if (_searchTextController.text.isNotEmpty) {
       _searchTextController.clear();
       widget.controller.setSearchQuery('');

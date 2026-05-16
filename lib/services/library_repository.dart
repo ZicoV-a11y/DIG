@@ -309,7 +309,19 @@ class LibraryRepository {
       }
 
       final batch = txn.batch();
+      // Yield-every-N counter. Even with async I/O above, a tight
+      // loop over 10k+ entries on the main isolate hogs the event
+      // loop and the UI can't paint. An explicit yield every 200
+      // iterations costs ~50 yields for a 10k-file initial scan —
+      // imperceptible cost, and the UI keeps rendering frames.
+      var loopCounter = 0;
       for (final f in files) {
+        if (loopCounter++ % 200 == 0 && loopCounter > 1) {
+          // Microtask yield. Doesn't free the SQLite transaction
+          // (we still hold the connection), but lets the Flutter
+          // engine drain queued frames / pointer events.
+          await Future<void>.delayed(Duration.zero);
+        }
         final ids = computeTrackUid(
           basename: f.filename,
           filesize: f.filesize,
@@ -377,6 +389,26 @@ class LibraryRepository {
           //     record content_updated_external (events queued
           //     to fire after the batch commits, inside the
           //     same transaction)
+          //
+          // CRITICAL: this MUST use the async variant of
+          // computeContentHash, NOT computeContentHashSync. The
+          // sync variant blocks the main isolate while dart:io
+          // performs the read — and on Dropbox / iCloud /
+          // CloudStorage-backed paths the read can block for
+          // tens of seconds while macOS materialises a
+          // dataless placeholder via apfs_materialize_dataless_file_ext.
+          // The user reported a 423-second main-thread hang while
+          // adding a Dropbox folder to watch — root cause was a
+          // call to computeContentHashSync here. The async variant
+          // uses Dart's IO thread pool; main isolate stays
+          // responsive while individual file reads block in the
+          // background.
+          //
+          // Per-file timeout (30s) matches the backfill worker's
+          // pattern so a single truly-stuck file can't stall the
+          // whole batch. A timed-out file falls back to its
+          // previously-stored hash (defensive: never erase a
+          // known-good hash on transient read failure).
           final statUnchanged = oldFilesize == f.filesize &&
               oldModifiedAt == f.modifiedAtMs;
           String? newContentHash;
@@ -384,12 +416,10 @@ class LibraryRepository {
           if (statUnchanged && oldContentHash != null) {
             newContentHash = oldContentHash;
           } else {
-            // computeContentHashSync is fine here: we're already
-            // inside an async-aware transaction loop, and the
-            // sync I/O cost only fires for files whose stat
-            // actually changed since the last scan (typically
-            // a handful per scan, not the whole library).
-            final computed = computeContentHashSync(f.path);
+            final computed = await computeContentHash(f.path).timeout(
+              const Duration(seconds: 30),
+              onTimeout: () => null,
+            );
             newContentHash = computed ?? oldContentHash;
             if (oldContentHash != null &&
                 newContentHash != null &&

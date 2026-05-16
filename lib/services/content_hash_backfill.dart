@@ -28,16 +28,42 @@ import 'library_repository.dart';
 /// haven't already failed within this session), the worker exits
 /// quietly. The next scan-end restart picks up any new NULL rows.
 class ContentHashBackfillWorker {
-  ContentHashBackfillWorker(this._repo, {this.onProgress});
+  ContentHashBackfillWorker(
+    this._repo, {
+    this.onProgress,
+    this.onHashStart,
+    this.onHashEnd,
+  });
 
   final LibraryRepository _repo;
 
   /// Optional progress hook fired after each batch. Receives
-  /// `(rowsHashedThisBatch, totalRowsHashedThisSession)`. The
-  /// controller uses it to surface status (Slice 4) without
-  /// polling. Always called on the same isolate that called
-  /// `start()`.
-  final void Function(int batchSuccesses, int sessionSuccesses)? onProgress;
+  /// `(rowsHashedThisBatch, totalRowsHashedThisSession,
+  /// candidatesRemaining)`. `candidatesRemaining` is the live count
+  /// of rows still waiting (sampled at the start of each batch);
+  /// the controller uses it together with `sessionSuccesses` to
+  /// render determinate progress like "Hashing audio 12 / 873"
+  /// instead of an indeterminate spinner. Always called on the
+  /// same isolate that called `start()`.
+  final void Function(
+      int batchSuccesses,
+      int sessionSuccesses,
+      int candidatesRemaining)? onProgress;
+
+  /// Fires when a single-file hash starts. The controller uses this
+  /// to know which path is in flight so it can swap the status-bar
+  /// label to a cloud-waiting hint once elapsed exceeds the
+  /// patience threshold (a Dropbox dataless placeholder commonly
+  /// blocks the read for 10–30 seconds while macOS materialises
+  /// the file; "Waiting on cloud · filename" reads as deliberate,
+  /// "Hashing audio" sitting frozen reads as broken).
+  final void Function(String path)? onHashStart;
+
+  /// Paired with [onHashStart]. Fires after the await completes
+  /// regardless of outcome (success, timeout, error). The controller
+  /// uses this to clear its "currently hashing" state so the
+  /// status bar drops the cloud-waiting hint promptly.
+  final void Function(String path)? onHashEnd;
 
   /// Number of NULL-content_hash candidates pulled per batch.
   static const int _batchSize = 10;
@@ -56,6 +82,7 @@ class ContentHashBackfillWorker {
 
   bool _running = false;
   bool _cancelled = false;
+  bool _paused = false;
   Timer? _scheduler;
   int _sessionSuccesses = 0;
 
@@ -67,6 +94,13 @@ class ContentHashBackfillWorker {
   final Set<String> _failedThisSession = {};
 
   bool get isRunning => _running;
+
+  /// `true` while the worker is suspended for higher-priority
+  /// work (currently: active playback). Distinct from `!_running`
+  /// (= no work to do or explicit `cancel()`). A paused worker
+  /// still has scheduling state — `resume()` picks up where it
+  /// left off without losing the in-session failed-path memo.
+  bool get isPaused => _paused;
 
   /// Kick off (or resume) a backfill pass. Returns immediately;
   /// work happens via scheduled timers. Idempotent — calling
@@ -87,7 +121,38 @@ class ContentHashBackfillWorker {
     _scheduler?.cancel();
     _scheduler = null;
     _running = false;
+    _paused = false;
     _failedThisSession.clear();
+  }
+
+  /// Suspend the worker temporarily — the next-scheduled batch
+  /// will tick, see `_paused`, and reschedule itself for later
+  /// without doing any hashing work. Used to yield disk + IO
+  /// thread pool to active playback.
+  ///
+  /// Distinct from `cancel()` in two ways:
+  ///   - `_running` stays true → status bar can show
+  ///     `Hashing audio · paused for playback`.
+  ///   - The failed-path set survives → resume doesn't replay
+  ///     the same dead Dropbox placeholders.
+  void pause() {
+    if (!_running) return;
+    _paused = true;
+  }
+
+  /// Drop the pause flag so the next scheduled tick (or `resume`
+  /// itself, when not already scheduled) does real work.
+  /// Idempotent.
+  void resume() {
+    if (!_paused) return;
+    _paused = false;
+    // If the previously-scheduled tick already fired during the
+    // pause and rescheduled itself with a slow interval, kick a
+    // fresh immediate tick so work resumes without waiting on
+    // the cool-down.
+    if (_running && !_cancelled && _scheduler == null) {
+      _scheduleNextBatch(immediate: true);
+    }
   }
 
   void _scheduleNextBatch({bool immediate = false}) {
@@ -98,8 +163,29 @@ class ContentHashBackfillWorker {
     );
   }
 
+  /// Cool-down between paused-batch reschedules. While playback is
+  /// active the worker should be invisible — checking the pause
+  /// flag every 500 ms (the normal batch interval) would waste CPU
+  /// for hours during a DJ set. Two seconds is short enough that
+  /// resumption feels prompt when playback stops, long enough that
+  /// the idle worker uses ~zero resources.
+  static const Duration _pausedRecheckInterval = Duration(seconds: 2);
+
   Future<void> _processBatch() async {
     if (_cancelled) return;
+    if (_paused) {
+      // Skip this batch — playback is active. Reschedule on the
+      // slow cool-down so we recheck the flag periodically without
+      // burning the event loop. `resume()` will kick an immediate
+      // tick when playback stops, so this is just the fallback.
+      _scheduler = Timer(_pausedRecheckInterval, _processBatch);
+      return;
+    }
+    // Sample the live candidate count for determinate progress.
+    // Cheap query (indexed COUNT) — runs once per batch (every
+    // 500 ms) so the status bar's denominator stays current as
+    // a scan inserts new NULL-hash rows mid-session.
+    final remaining = await _repo.contentHashCandidatesCount();
     // Ask for more than the batch size so we have headroom to
     // skip already-failed paths without an extra round-trip.
     final candidates = await _repo.contentHashCandidates(
@@ -117,6 +203,12 @@ class ContentHashBackfillWorker {
       //    re-trigger us next scan-end with a fresh failed-set.
       _running = false;
       _scheduler = null;
+      // One final progress tick with `remaining = 0` so the
+      // status bar drops the backfill state cleanly instead of
+      // freezing on the last-shown count.
+      if (onProgress != null) {
+        onProgress!(0, _sessionSuccesses, 0);
+      }
       debugPrint(
         '[content_hash backfill] session complete: '
         '$_sessionSuccesses rows hashed, '
@@ -139,6 +231,7 @@ class ContentHashBackfillWorker {
       //      placeholder pending download, dead mount) can't
       //      stall the whole backfill.
       String? hash;
+      onHashStart?.call(path);
       try {
         hash = await computeContentHash(path).timeout(
           _hashTimeout,
@@ -150,6 +243,8 @@ class ContentHashBackfillWorker {
       } catch (e) {
         debugPrint('[content_hash backfill] error hashing $path: $e');
         hash = null;
+      } finally {
+        onHashEnd?.call(path);
       }
       if (_cancelled) return;
       if (hash != null) {
@@ -161,7 +256,13 @@ class ContentHashBackfillWorker {
       }
     }
     if (onProgress != null) {
-      onProgress!(batchSuccesses, _sessionSuccesses);
+      // Subtract this batch's successes from the start-of-batch
+      // snapshot so the denominator's monotonic-decreasing.
+      // Floor at 0: a concurrent scan could insert new NULL-hash
+      // rows mid-batch and push the live count higher — the next
+      // batch's resample picks that up; here we just clamp.
+      final live = (remaining - batchSuccesses).clamp(0, 1 << 30);
+      onProgress!(batchSuccesses, _sessionSuccesses, live);
     }
     _scheduleNextBatch();
   }

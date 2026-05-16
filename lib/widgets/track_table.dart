@@ -1458,6 +1458,17 @@ class _TrackRow extends StatelessWidget {
       rowColor = AppColors.trailTint(trailIndex) ?? Colors.transparent;
     }
 
+    // Not-yet-enriched signal: a row whose metadata hasn't been
+    // read yet (newly discovered, or bytes-changed-since-last-read)
+    // reads as dimmed so the user can see at a glance which rows
+    // are "still being processed." The audio engine can still play
+    // them — duration / title / artist just come from filename
+    // heuristics until enrichment catches up. Fades to full
+    // opacity when `metadataReadAt` lands, on the same 500 ms
+    // curve as the threshold-flash row tint so it feels like
+    // part of the same animation language.
+    final readyOpacity = track.isReady ? 1.0 : 0.45;
+
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onSecondaryTapDown: (details) =>
@@ -1471,10 +1482,14 @@ class _TrackRow extends StatelessWidget {
         duration: const Duration(milliseconds: 500),
         curve: Curves.easeOut,
         color: rowColor,
-        child: Material(
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 500),
+          curve: Curves.easeOut,
+          opacity: readyOpacity,
+          child: Material(
       color: Colors.transparent,
       child: InkWell(
-        onTap: () => controller.play(track.uid),
+        onTap: () => controller.play(track.uid, path: track.path),
         hoverColor: AppColors.hoverRow,
         focusColor: AppColors.focusOverlay,
         child: Stack(
@@ -1566,6 +1581,7 @@ class _TrackRow extends StatelessWidget {
             ),
           ],
         ),
+      ),
       ),
       ),
       ),

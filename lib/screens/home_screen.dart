@@ -5,7 +5,9 @@ import 'package:flutter/services.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../widgets/folder_sidebar.dart';
+import '../widgets/library_activity_strip.dart';
 import '../widgets/library_status_bar.dart';
+import '../widgets/reconciliation_banner.dart';
 import '../widgets/library_toolbar.dart';
 import '../widgets/playback_bar.dart';
 import '../widgets/track_table.dart';
@@ -367,6 +369,8 @@ class _HomeScreenState extends State<HomeScreen>
                                             child: TrackTable(controller: c),
                                           ),
                                         ),
+                                        ReconciliationBanner(controller: c),
+                                        LibraryActivityStrip(controller: c),
                                         LibraryStatusBar(controller: c),
                                       ],
                                     ),

@@ -16,7 +16,7 @@ class AppDatabase {
   // v7 adds `sources.parent_source_id` + `sources.path_prefix` so a
   // folder picked inside an already-watched source becomes a virtual
   // "sub-view" instead of a duplicate scanning source.
-  static const _schemaVersion = 13;
+  static const _schemaVersion = 14;
 
   late final Database _db;
 
@@ -149,6 +149,7 @@ class AppDatabase {
         bpm REAL,
         has_artwork INTEGER NOT NULL DEFAULT 0,
         metadata_read_at INTEGER NOT NULL DEFAULT 0,
+        enrichment_state TEXT NOT NULL DEFAULT 'discovered',
         FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
       )
     ''');
@@ -159,6 +160,9 @@ class AppDatabase {
     batch.execute('CREATE INDEX idx_idx_source ON indexed_files(source_id)');
     batch.execute('CREATE INDEX idx_idx_avail ON indexed_files(is_available)');
     batch.execute('CREATE INDEX idx_idx_meta_read ON indexed_files(metadata_read_at)');
+    batch.execute(
+      'CREATE INDEX idx_idx_enrichment_state ON indexed_files(enrichment_state)',
+    );
 
     // tracks has NO foreign key — source removal must never delete
     // intelligence rows (guardrail 5: "source removal never destroys
@@ -257,6 +261,63 @@ class AppDatabase {
     if (oldVersion < 13) {
       await _migrateV12toV13(db);
     }
+    if (oldVersion < 14) {
+      await _migrateV13toV14(db);
+    }
+  }
+
+  /// Add `indexed_files.enrichment_state` — the formal lifecycle
+  /// column for the metadata pipeline. Replaces the implicit "is
+  /// `metadata_read_at` zero?" check with explicit states so the
+  /// UI can distinguish "never tried" from "tried and failed" and
+  /// the ontology can grow (deferred, blocked-on-cloud) without
+  /// schema churn.
+  ///
+  /// Backfill rule:
+  ///   - `metadata_read_at > 0`  → `ready`  (tags landed previously)
+  ///   - `metadata_read_at = 0`  → `discovered` (default)
+  ///
+  /// We do NOT carry forward any "enriching" state across the
+  /// migration — at boot the in-memory enrichment queue is empty,
+  /// so any pre-migration in-flight work would have been
+  /// effectively cancelled by the previous shutdown. Treating
+  /// those rows as `discovered` lets the regular enrichment pass
+  /// pick them up cleanly.
+  ///
+  /// Idempotent — safe to retry after a partial migration.
+  static Future<void> _migrateV13toV14(Database db) async {
+    debugPrint(
+      '[db] starting v13 → v14 migration (indexed_files.enrichment_state)',
+    );
+    final stopwatch = Stopwatch()..start();
+
+    final columns = await db.rawQuery('PRAGMA table_info(indexed_files)');
+    final hasColumn =
+        columns.any((c) => c['name'] == 'enrichment_state');
+    if (!hasColumn) {
+      await db.execute(
+        "ALTER TABLE indexed_files "
+        "ADD COLUMN enrichment_state TEXT NOT NULL DEFAULT 'discovered'",
+      );
+    }
+    // Index is cheap, idempotent, and turns the boot-time "find
+    // every row not yet ready" sweep from a full table scan into
+    // an index range read.
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_idx_enrichment_state '
+      'ON indexed_files(enrichment_state)',
+    );
+    final backfilled = await db.rawUpdate(
+      "UPDATE indexed_files "
+      "SET enrichment_state = 'ready' "
+      "WHERE metadata_read_at > 0 "
+      "  AND enrichment_state = 'discovered'",
+    );
+
+    debugPrint(
+      '[db] v13 → v14 done in ${stopwatch.elapsedMilliseconds}ms '
+      '($backfilled rows backfilled to ready).',
+    );
   }
 
   /// Add `indexed_files.first_seen_at` — the temporal anchor for

@@ -44,6 +44,34 @@ import 'track_uid.dart';
 /// `markCrossSourceMoves` automatically.
 const supersessionTemporalOverlapGrace = Duration(minutes: 10);
 
+/// Aggregate outcome of a single `markUnseenAvailability` pass —
+/// the "what just happened" data the reconciliation-summary toast
+/// renders after a scan.
+///
+/// `removed` is every row in this source that transitioned
+/// available → missing during this call. `preservedElsewhere` is
+/// the subset whose `content_hash` still appears on at least one
+/// available row in a different watched source (so the file
+/// effectively survived through another folder; the user's intel
+/// reconnects automatically if they re-add this source). Both
+/// counts are computed inside the same transaction that flipped
+/// the state, so they reflect the post-flip truth atomically.
+class ReconciliationDelta {
+  final int removed;
+  final int preservedElsewhere;
+  const ReconciliationDelta({
+    required this.removed,
+    required this.preservedElsewhere,
+  });
+
+  static const empty =
+      ReconciliationDelta(removed: 0, preservedElsewhere: 0);
+
+  /// Convenience: `true` when the delta is worth surfacing to the
+  /// user (a no-op scan with nothing removed shouldn't fire a toast).
+  bool get isMaterial => removed > 0;
+}
+
 class MoveCopyResult {
   final bool success;
   final String? newPath;
@@ -95,6 +123,17 @@ class LibraryRepository {
   LibraryRepository(this._appDb);
 
   Database get _db => _appDb.db;
+
+  // Paths whose content_hash was deliberately nulled by a stat-change
+  // upsert so the backfill worker would recompute the hash off the
+  // main isolate. Holds the OLD hash + source so `setContentHashForPath`
+  // can record a `contentUpdatedExternal` audit event when the
+  // recomputed hash differs from what we previously knew. Lives only
+  // in-memory: if the app quits before backfill reaches a path the
+  // event for that path is lost — accepted tradeoff to keep cloud-
+  // storage bulk scans from blocking the UI for minutes at a time.
+  final Map<String, ({String oldHash, String sourceId})>
+      _pendingHashCompare = {};
 
   // ---------------------------------------------------------------------------
   // Sources
@@ -272,17 +311,6 @@ class LibraryRepository {
     final now = DateTime.now().millisecondsSinceEpoch;
     int inserted = 0;
 
-    // Paths whose content_hash changed during this batch — events
-    // are recorded outside the batch so they land in the same
-    // transaction without conflicting with sqflite's `Batch` API
-    // (which doesn't surface intermediate query results we'd need
-    // to keep the audit + state-mutation logic atomic).
-    final mutations = <({
-      String path,
-      String oldHash,
-      String newHash,
-    })>[];
-
     await _db.transaction((txn) async {
       // Pre-load existing rows for these paths in chunks (SQLite has
       // a default ~999 parameter limit per statement). Columns
@@ -379,57 +407,45 @@ class LibraryRepository {
             );
           }
 
-          // content_hash recompute on stat change. Same rules as
-          // the per-file upsertIndexedFile path:
-          //   - stat unchanged + hash present → reuse old
-          //   - stat changed → recompute; null result preserves
-          //     the previously-good hash (transient read failure
-          //     must not erase real evidence)
-          //   - hash mutation → reset metadata_read_at = 0 +
-          //     record content_updated_external (events queued
-          //     to fire after the batch commits, inside the
-          //     same transaction)
+          // content_hash policy on bulk-scan UPDATE:
+          //   - stat unchanged + hash present → reuse old hash.
+          //   - stat changed → null the hash and let the
+          //     `ContentHashBackfillWorker` recompute it off the
+          //     main isolate (throttled, async, timeout-bounded).
           //
-          // CRITICAL: this MUST use the async variant of
-          // computeContentHash, NOT computeContentHashSync. The
-          // sync variant blocks the main isolate while dart:io
-          // performs the read — and on Dropbox / iCloud /
-          // CloudStorage-backed paths the read can block for
-          // tens of seconds while macOS materialises a
-          // dataless placeholder via apfs_materialize_dataless_file_ext.
-          // The user reported a 423-second main-thread hang while
-          // adding a Dropbox folder to watch — root cause was a
-          // call to computeContentHashSync here. The async variant
-          // uses Dart's IO thread pool; main isolate stays
-          // responsive while individual file reads block in the
-          // background.
+          // We used to compute the hash inline here (async variant
+          // + 30s timeout) but on cloud-storage paths (Dropbox /
+          // iCloud / CloudStorage) macOS blocks each read on
+          // dataless-placeholder materialization for 10–30s per
+          // file. The transaction stayed open the whole time
+          // holding the DB write lock; the UI couldn't query
+          // tracks and the app appeared frozen. A 1000-file Dropbox
+          // burst could lock the DB for tens of minutes.
           //
-          // Per-file timeout (30s) matches the backfill worker's
-          // pattern so a single truly-stuck file can't stall the
-          // whole batch. A timed-out file falls back to its
-          // previously-stored hash (defensive: never erase a
-          // known-good hash on transient read failure).
+          // The backfill worker is purpose-built for this: 10
+          // files per batch, 500 ms between batches, async
+          // + 30s timeout, runs only at idle. The transaction
+          // becomes pure CPU + writes; UI stays responsive even
+          // mid-scan.
+          //
+          // Audit-event tradeoff: `contentUpdatedExternal` used
+          // to fire inline when oldHash != newHash. We preserve
+          // it by stashing `(path → oldHash + sourceId)` in
+          // `_pendingHashCompare`; `setContentHashForPath`
+          // checks the map when the backfill writes the
+          // recomputed hash, records the event then, and clears
+          // the entry. Event timing shifts from "during scan"
+          // to "during backfill" — same audit, just deferred.
           final statUnchanged = oldFilesize == f.filesize &&
               oldModifiedAt == f.modifiedAtMs;
-          String? newContentHash;
-          bool contentMutated = false;
+          final String? newContentHash;
           if (statUnchanged && oldContentHash != null) {
             newContentHash = oldContentHash;
           } else {
-            final computed = await computeContentHash(f.path).timeout(
-              const Duration(seconds: 30),
-              onTimeout: () => null,
-            );
-            newContentHash = computed ?? oldContentHash;
-            if (oldContentHash != null &&
-                newContentHash != null &&
-                oldContentHash != newContentHash) {
-              contentMutated = true;
-              mutations.add((
-                path: f.path,
-                oldHash: oldContentHash,
-                newHash: newContentHash,
-              ));
+            newContentHash = null;
+            if (oldContentHash != null && !statUnchanged) {
+              _pendingHashCompare[f.path] =
+                  (oldHash: oldContentHash, sourceId: sourceId);
             }
           }
 
@@ -446,13 +462,20 @@ class LibraryRepository {
             'availability_state': 'available',
             'last_seen_at': now,
           };
-          if (contentMutated) {
-            // External tag edit / DAW re-render / etc. — title /
-            // artist / album / etc. extracted from the OLD bytes
-            // are stale, so wipe metadata_read_at to make the
-            // reactive enrichment pipeline re-read on the next
-            // viewport / play / post-scan sweep.
+          if (!statUnchanged && oldContentHash != null) {
+            // Stat moved → bytes likely diverged (re-encode, retag,
+            // in-place rewrite). Cached title/artist/album extracted
+            // from the OLD bytes are stale. Wipe `metadata_read_at`
+            // so the enrichment pipeline re-reads on next viewport /
+            // play / post-scan sweep. Done eagerly (don't wait for
+            // the deferred hash compare) because the user may sort
+            // or click into this row before backfill catches up.
+            //
+            // Mirror in the formal state column: a previously-`ready`
+            // row drops back to `discovered` so the UI re-dims it
+            // and the enrichment pipeline knows it has fresh work.
             updateMap['metadata_read_at'] = 0;
+            updateMap['enrichment_state'] = 'discovered';
           }
           batch.update(
             'indexed_files',
@@ -463,28 +486,9 @@ class LibraryRepository {
         }
       }
       await batch.commit(noResult: true);
-
-      // Record audit events for every detected content_hash
-      // mutation. Done after the batch commits but inside the
-      // same transaction so a transaction rollback would also
-      // drop the events — never narrate a change that didn't
-      // actually land.
-      for (final m in mutations) {
-        await recordEvent(
-          type: EventType.contentUpdatedExternal,
-          path: m.path,
-          sourceId: sourceId,
-          payload: {
-            'old_content_hash_prefix': m.oldHash.length >= 12
-                ? m.oldHash.substring(0, 12)
-                : m.oldHash,
-            'new_content_hash_prefix': m.newHash.length >= 12
-                ? m.newHash.substring(0, 12)
-                : m.newHash,
-          },
-          txn: txn,
-        );
-      }
+      // contentUpdatedExternal events for stat-changed rows fire
+      // later via `setContentHashForPath` once the backfill worker
+      // computes the new hash. See `_pendingHashCompare` notes.
     });
 
     return inserted;
@@ -694,6 +698,10 @@ class LibraryRepository {
       // initial enrichment would otherwise lock the old values in.
       if (contentMutated) {
         updateMap['metadata_read_at'] = 0;
+        // Drop the formal state back to `discovered` so the UI
+        // re-dims this row and the enrichment pipeline knows it
+        // has fresh work to do. Mirrors the bulk-path behaviour.
+        updateMap['enrichment_state'] = 'discovered';
       }
       await txn.update(
         'indexed_files',
@@ -747,10 +755,12 @@ class LibraryRepository {
   /// size — each chunk's NOT IN clause clobbered the available flag
   /// for paths in OTHER chunks, so only the last chunk's paths
   /// survived as available.
-  Future<void> markUnseenAvailability(
+  Future<ReconciliationDelta> markUnseenAvailability(
     String sourceId,
     Set<String> seenPaths,
   ) async {
+    int removed = 0;
+    int preservedElsewhere = 0;
     await _db.transaction((txn) async {
       // Snapshot the rows that are about to transition from
       // 'available' to 'missing'. We pull them BEFORE the update
@@ -758,15 +768,21 @@ class LibraryRepository {
       // Filtering against [seenPaths] is done in Dart rather than
       // SQL — a NOT IN clause with a 12k-element bind list is
       // both ugly and at the edge of SQLite's parameter limit.
+      //
+      // `content_hash` is pulled alongside `path` so we can compute
+      // the "preserved elsewhere" count for the reconciliation
+      // summary (rows whose bytes are still reachable through a
+      // different watched source). Cheap — no extra query, just
+      // an extra column on a query we already ran.
       final wasAvailable = await txn.rawQuery(
-        "SELECT path FROM indexed_files "
+        "SELECT path, content_hash FROM indexed_files "
         "WHERE source_id = ? AND availability_state = 'available'",
         [sourceId],
       );
-      final transitioningToMissing = wasAvailable
-          .map((r) => r['path'] as String)
-          .where((p) => !seenPaths.contains(p))
-          .toList();
+      final transitioning = wasAvailable
+          .where((r) => !seenPaths.contains(r['path'] as String))
+          .toList(growable: false);
+      removed = transitioning.length;
       // Pass 1: reset everything in this source to missing. Both
       // `is_available` (legacy boolean) and `availability_state`
       // (richer state machine) move together: the state machine
@@ -784,13 +800,53 @@ class LibraryRepository {
       // Record removal events. Done inside the transaction so the
       // event row and the state change land atomically — no
       // "ghost event for a state change that rolled back" case.
-      for (final path in transitioningToMissing) {
+      for (final row in transitioning) {
         await recordEvent(
           type: EventType.removedExternal,
-          path: path,
+          path: row['path'] as String,
           sourceId: sourceId,
           txn: txn,
         );
+      }
+      // Preserved-elsewhere check. For each transitioning row that
+      // has a content_hash, look for at least one currently-
+      // available row IN ANOTHER SOURCE with the same hash. We
+      // gather distinct hashes first so a folder of duplicates
+      // doesn't trigger N redundant lookups.
+      final hashesToCheck = <String>{};
+      for (final row in transitioning) {
+        final ch = row['content_hash'] as String?;
+        if (ch != null && ch.isNotEmpty) hashesToCheck.add(ch);
+      }
+      if (hashesToCheck.isNotEmpty) {
+        // Chunked IN-clause to stay inside SQLite's bind limit.
+        const chunkSize = 400;
+        final hashList = hashesToCheck.toList(growable: false);
+        final survivingHashes = <String>{};
+        for (var i = 0; i < hashList.length; i += chunkSize) {
+          final end = (i + chunkSize).clamp(0, hashList.length);
+          final slice = hashList.sublist(i, end);
+          final placeholders = List.filled(slice.length, '?').join(',');
+          final hits = await txn.rawQuery(
+            "SELECT DISTINCT content_hash FROM indexed_files "
+            "WHERE source_id != ? "
+            "  AND availability_state = 'available' "
+            "  AND content_hash IN ($placeholders)",
+            [sourceId, ...slice],
+          );
+          for (final h in hits) {
+            survivingHashes.add(h['content_hash'] as String);
+          }
+        }
+        // Count transitioning rows whose hash survives in
+        // another source. A folder of duplicates within Q where
+        // each duplicate has a twin in Z counts each Q row.
+        for (final row in transitioning) {
+          final ch = row['content_hash'] as String?;
+          if (ch != null && survivingHashes.contains(ch)) {
+            preservedElsewhere++;
+          }
+        }
       }
       if (seenPaths.isEmpty) return;
 
@@ -809,6 +865,10 @@ class LibraryRepository {
         );
       }
     });
+    return ReconciliationDelta(
+      removed: removed,
+      preservedElsewhere: preservedElsewhere,
+    );
   }
 
   /// Permanently remove `indexed_files` rows for the given paths.
@@ -1073,6 +1133,24 @@ class LibraryRepository {
     return paths.toList();
   }
 
+  /// Total rows still waiting for the backfill worker. Powers the
+  /// determinate progress display in the status bar — "Hashing
+  /// audio 12 / 873" is more reassuring than an indeterminate
+  /// spinner during a long Dropbox materialization wave.
+  /// Counted, not sampled — cheap because of the `availability_state`
+  /// + content_hash IS NULL filters working off existing indexes.
+  Future<int> contentHashCandidatesCount() async {
+    final rows = await _db.rawQuery(
+      '''
+      SELECT COUNT(*) AS n FROM indexed_files
+      WHERE content_hash IS NULL
+        AND availability_state = 'available'
+        AND filesize > 0
+      ''',
+    );
+    return (rows.first['n'] as int?) ?? 0;
+  }
+
   /// Write a freshly-computed content_hash for a single path.
   /// Called by the backfill worker once per row; intentionally
   /// targeted so it doesn't fight the scan upsert's broader
@@ -1080,13 +1158,39 @@ class LibraryRepository {
   ///
   /// No-op if the row has been removed between the candidate
   /// query and this write (returns 0).
+  ///
+  /// Deferred-audit hook: if `_pendingHashCompare[path]` was
+  /// populated by a stat-change upsert (the batch path nulls
+  /// `content_hash` so the backfill worker can rehash off the
+  /// main isolate), record `contentUpdatedExternal` here when the
+  /// new hash differs from the stashed old one. This shifts the
+  /// audit event from "during scan" (where it would have blocked
+  /// the transaction on cloud-storage paths) to "during backfill"
+  /// — same audit, just deferred. The entry is removed either way
+  /// so a stable bytes-on-disk file doesn't keep getting compared.
   Future<int> setContentHashForPath(String path, String hash) async {
-    return await _db.update(
+    final pending = _pendingHashCompare.remove(path);
+    final updated = await _db.update(
       'indexed_files',
       {'content_hash': hash},
       where: 'path = ?',
       whereArgs: [path],
     );
+    if (updated > 0 && pending != null && pending.oldHash != hash) {
+      await recordEvent(
+        type: EventType.contentUpdatedExternal,
+        path: path,
+        sourceId: pending.sourceId,
+        payload: {
+          'old_content_hash_prefix': pending.oldHash.length >= 12
+              ? pending.oldHash.substring(0, 12)
+              : pending.oldHash,
+          'new_content_hash_prefix':
+              hash.length >= 12 ? hash.substring(0, 12) : hash,
+        },
+      );
+    }
+    return updated;
   }
 
   /// Idempotent — safe to call after every scan.
@@ -2619,8 +2723,17 @@ class LibraryRepository {
       // fallback still covers parse-failed rows; this just stops
       // the counter from looking stuck on libraries with lots of
       // unparseable formats (AIFF variants, exotic ID3, etc.).
+      //
+      // Formal `enrichment_state` mirrors the success/failure
+      // outcome:
+      //   read succeeded → `ready` (row is now fully populated)
+      //   read failed    → `failed` (warning treatment in UI;
+      //                     controller's in-memory skip set
+      //                     prevents retry within session)
       final values = <String, Object?>{
         'metadata_read_at': now,
+        'enrichment_state':
+            m.readSucceeded ? 'ready' : 'failed',
       };
       if (m.readSucceeded) {
         values['has_artwork'] = m.hasArtwork ? 1 : 0;
@@ -2642,6 +2755,43 @@ class LibraryRepository {
       );
     }
     await batch.commit(noResult: true);
+  }
+
+  /// Flip a set of paths to `enriching`. Called by the controller
+  /// when paths enter the enrichment queue so the UI can render
+  /// the "actively being processed" treatment (pulse animation
+  /// once that lands). Chunked to respect SQLite's parameter
+  /// limit; idempotent; no-op for paths that no longer exist.
+  Future<void> markPathsEnriching(Iterable<String> paths) async {
+    final list = paths.toList();
+    if (list.isEmpty) return;
+    const chunk = 400;
+    for (var i = 0; i < list.length; i += chunk) {
+      final end = (i + chunk).clamp(0, list.length);
+      final slice = list.sublist(i, end);
+      final placeholders = List.filled(slice.length, '?').join(',');
+      await _db.rawUpdate(
+        "UPDATE indexed_files "
+        "SET enrichment_state = 'enriching' "
+        "WHERE path IN ($placeholders) "
+        "  AND enrichment_state IN ('discovered', 'failed')",
+        slice,
+      );
+    }
+  }
+
+  /// Crash-recovery sweep: any row left in `enriching` from a
+  /// previous run (the in-memory queue is gone, so we'd never
+  /// pick those rows up again) reverts to `discovered` so the
+  /// regular enrichment pipeline finds them next viewport sweep
+  /// or `enrichSource` call. Cheap — indexed by enrichment_state.
+  /// Idempotent; safe to call on every boot.
+  Future<int> sweepStuckEnriching() async {
+    return await _db.rawUpdate(
+      "UPDATE indexed_files "
+      "SET enrichment_state = 'discovered' "
+      "WHERE enrichment_state = 'enriching'",
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -2721,6 +2871,8 @@ Track _trackFromJoinedRow(Map<String, Object?> r) {
     hasArtwork: ((r['has_artwork'] as int?) ?? 0) != 0,
     metadataReadAt:
         readAt == 0 ? null : DateTime.fromMillisecondsSinceEpoch(readAt),
+    enrichmentState:
+        EnrichmentState.fromWire(r['enrichment_state'] as String?),
     favorite: (iFav ?? 0) != 0,
     playCount: (r['i_play_count'] as int?) ?? 0,
     cumulativeListened:

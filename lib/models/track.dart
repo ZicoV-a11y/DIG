@@ -1,6 +1,70 @@
 import '../services/filename_parser.dart';
 import '../utils/key_normalizer.dart';
 
+/// Persistent operational state for the metadata-enrichment
+/// pipeline. Stored in `indexed_files.enrichment_state` (v14).
+///
+/// Lifecycle:
+///   `discovered` → `enriching` → `ready`  (happy path)
+///   `discovered` → `enriching` → `failed` (read error, missing tags)
+///   `ready`      → `discovered`           (stat change wipes the
+///                                          cached enrichment; the
+///                                          upsert path re-flags the
+///                                          row for a fresh pass)
+///
+/// Transient render-time states (`waitingCloud`, "interactive",
+/// "deferred") are layered on top by the UI; they do NOT live in
+/// this enum. Keeping the persistent vocabulary tight makes the
+/// row-state ontology easier to reason about.
+///
+/// Crash recovery: rows stuck in `enriching` after an unexpected
+/// exit are swept back to `discovered` on the next app boot so
+/// the regular enrichment pipeline picks them up cleanly.
+enum EnrichmentState {
+  /// Row exists in the index but its ID3 / Vorbis tags have not
+  /// been read. Title / artist / duration come from filename
+  /// heuristics. Default state for new rows + for stat-changed
+  /// rows whose previously-cached metadata is now stale.
+  discovered,
+
+  /// The metadata-enrichment pipeline has picked this path up
+  /// and is currently reading its tags (in-isolate compute).
+  enriching,
+
+  /// Tags + duration + artwork read successfully. The row is
+  /// fully populated and renders at normal opacity.
+  ready,
+
+  /// The enrichment pipeline tried this path and the read failed
+  /// (file gone, permission denied, corrupt tag block). Surfaces
+  /// as a warning treatment in the UI; the controller's in-memory
+  /// `_failedEnrichmentPaths` set prevents retry within a session.
+  failed;
+
+  /// String form used for the DB column. Single source of truth so
+  /// renames here propagate to schema + migrations cleanly.
+  String get wireName => name;
+
+  /// Parse the DB-column string back into the enum. Unknown values
+  /// fall back to `discovered` so a forward-compat row (written by
+  /// a newer build, opened in an older one) doesn't blow up — it
+  /// just falls back to the "we haven't seen this yet" state.
+  static EnrichmentState fromWire(String? s) {
+    switch (s) {
+      case 'discovered':
+        return EnrichmentState.discovered;
+      case 'enriching':
+        return EnrichmentState.enriching;
+      case 'ready':
+        return EnrichmentState.ready;
+      case 'failed':
+        return EnrichmentState.failed;
+      default:
+        return EnrichmentState.discovered;
+    }
+  }
+}
+
 /// A unified view over `indexed_files` (location + metadata) and
 /// `tracks` (intelligence). The split is a database concern; consumers
 /// (controller, widgets) treat a Track as one object.
@@ -87,6 +151,17 @@ class Track {
   bool hasArtwork;
   DateTime? metadataReadAt;
 
+  /// Formal lifecycle state of this file's metadata enrichment.
+  /// Backs the operational ontology so the UI can render explicit
+  /// state (dim for discovered, pulse for enriching, warning for
+  /// failed) instead of inferring from `metadataReadAt`. Persisted
+  /// in `indexed_files.enrichment_state` (schema v14).
+  ///
+  /// Transient states (`waitingCloud`, "interactive") are NOT
+  /// stored here — those live on the controller and are layered
+  /// over this base state at render time.
+  EnrichmentState enrichmentState;
+
   // Intelligence fields (default values when no `tracks` row exists):
   bool favorite;
   int playCount;
@@ -116,6 +191,7 @@ class Track {
     this.duration = Duration.zero,
     this.hasArtwork = false,
     this.metadataReadAt,
+    this.enrichmentState = EnrichmentState.discovered,
     this.favorite = false,
     this.playCount = 0,
     this.cumulativeListened = Duration.zero,
@@ -128,6 +204,18 @@ class Track {
   bool get hasIntelligence => intelUid != null;
 
   bool get reviewed => cumulativeListened.inSeconds >= 3;
+
+  /// `true` when the metadata enrichment pipeline has successfully
+  /// read this file's tags + duration. Reads from the formal
+  /// [enrichmentState] enum (schema v14) rather than inferring from
+  /// [metadataReadAt] — the enum carries explicit "failed" and
+  /// "enriching" states the timestamp alone can't express.
+  ///
+  /// The row can still be played in any non-ready state — the
+  /// audio engine doesn't need metadata — but the displayed
+  /// title / artist / duration come from filename heuristics, and
+  /// the UI should signal "we're still working on this one."
+  bool get isReady => enrichmentState == EnrichmentState.ready;
 
   // ─── Display-layer metadata fallback ────────────────────────────
   //

@@ -117,8 +117,36 @@ class FolderSidebar extends StatelessWidget {
                     ],
                   ),
                 ),
+              // Library-wide rescan trigger. Mirrors the keyboard
+              // shortcut (Cmd+R / Ctrl+R / F5) for users who don't
+              // remember it. Especially useful after deleting
+              // folders in Finder — the watcher quiescence catches
+              // most cases but Dropbox / iCloud sync flakes
+              // sometimes drop FSEvents on parent-level deletions,
+              // and a manual sweep reconciles cleanly. Disabled
+              // mid-scan to avoid stacking re-runs.
               Padding(
-                padding: const EdgeInsets.all(10),
+                padding: const EdgeInsets.fromLTRB(10, 0, 10, 4),
+                child: OutlinedButton.icon(
+                  onPressed: controller.isScanning
+                      ? null
+                      : controller.rescanAllSources,
+                  icon: const Icon(Icons.refresh_rounded, size: 14),
+                  label: const Text('Refresh library'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: AppColors.textSecondary,
+                    side: const BorderSide(color: AppColors.border),
+                    minimumSize: const Size.fromHeight(30),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    textStyle: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
                 child: OutlinedButton.icon(
                   onPressed: controller.isScanning
                       ? null
@@ -165,6 +193,7 @@ class FolderSidebar extends StatelessWidget {
           selected: controller.selectedSourceId == s.id,
           icon: Icons.folder_outlined,
           scanMode: s.scanMode,
+          folderMissing: controller.isSourceFolderMissing(s.id),
           onTap: () => controller.selectSource(s.id),
           onRescan: () => controller.rescanSource(s.id),
           onEnrich: () => controller.enrichSource(s.id),
@@ -182,6 +211,7 @@ class FolderSidebar extends StatelessWidget {
             selected: controller.selectedSourceId == child.id,
             icon: Icons.subdirectory_arrow_right_rounded,
             isSubView: true,
+            folderMissing: controller.isSourceFolderMissing(child.id),
             parentForRescan: s,
             onRescanParent: () => controller.rescanSource(s.id),
             onEnrich: () => controller.enrichSource(child.id),
@@ -469,6 +499,14 @@ class _SourceTile extends StatefulWidget {
   // "All Tracks" tile only: enrich the entire library scope.
   final VoidCallback? onEnrichLibrary;
 
+  /// `true` when this source's watched folder doesn't exist on
+  /// disk right now (folder deleted in Finder, external drive
+  /// ejected, Dropbox folder unlinked). Renders a "Folder missing"
+  /// subtitle + dim treatment so the user can distinguish "tracks
+  /// in this source are missing" from "the entire watched root is
+  /// gone." Source-ontology layer, not per-track availability.
+  final bool folderMissing;
+
   const _SourceTile({
     required this.label,
     required this.count,
@@ -483,6 +521,7 @@ class _SourceTile extends StatefulWidget {
     this.onRescanParent,
     this.onEnrich,
     this.onEnrichLibrary,
+    this.folderMissing = false,
   });
 
   @override
@@ -690,24 +729,51 @@ class _SourceTileState extends State<_SourceTile> {
                     ),
                     child: Row(
                       children: [
+                        // Folder-missing source: swap the icon for a
+                        // crossed-out folder + warning tint, and dim
+                        // the label to textTertiary. Strong visual
+                        // distinction from "healthy source with some
+                        // missing tracks" — that's per-track
+                        // availability, this is source-level.
                         Icon(
-                          widget.icon,
+                          widget.folderMissing
+                              ? Icons.folder_off_outlined
+                              : widget.icon,
                           size: widget.isSubView ? 12 : 14,
-                          color: widget.selected
-                              ? AppColors.accent
-                              : AppColors.textSecondary,
+                          color: widget.folderMissing
+                              ? AppColors.favorite
+                              : widget.selected
+                                  ? AppColors.accent
+                                  : AppColors.textSecondary,
                         ),
                         const SizedBox(width: 10),
                         Expanded(
-                          child: Text(
-                            widget.label,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: AppColors.textPrimary,
-                              fontSize: 13,
-                              fontWeight: widget.selected
-                                  ? FontWeight.w600
-                                  : FontWeight.w400,
+                          child: Tooltip(
+                            message: widget.folderMissing
+                                ? 'Folder missing on disk — tracks '
+                                    'remain in the library and reconnect '
+                                    'automatically when the folder '
+                                    'returns. Right-click to remove '
+                                    'this watch entirely.'
+                                : '',
+                            waitDuration: widget.folderMissing
+                                ? const Duration(milliseconds: 400)
+                                : const Duration(days: 1),
+                            child: Text(
+                              widget.label,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: widget.folderMissing
+                                    ? AppColors.textTertiary
+                                    : AppColors.textPrimary,
+                                fontSize: 13,
+                                fontWeight: widget.selected
+                                    ? FontWeight.w600
+                                    : FontWeight.w400,
+                                fontStyle: widget.folderMissing
+                                    ? FontStyle.italic
+                                    : FontStyle.normal,
+                              ),
                             ),
                           ),
                         ),

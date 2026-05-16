@@ -110,14 +110,53 @@ _OperationState? _resolveOperation(LibraryController c) {
     );
   }
   // content_hash backfill — background, lowest priority. Surfaces
-  // only when no other foreground operation is active. The total
-  // is unknown (just a count of NULL-hash candidates that drains
-  // over time); show the running session count as "done" with no
-  // total so the progress bar stays indeterminate.
+  // only when no other foreground operation is active. The worker
+  // samples `contentHashCandidatesCount()` every batch and reports
+  // it via onProgress, so we can show determinate "12 / 873"
+  // progress + a filled bar — calmer than an indeterminate spinner
+  // sitting there for 30 seconds while Dropbox materialises a
+  // dataless placeholder.
   if (c.isBackfillingContentHashes) {
+    final remaining = c.backfillRemaining;
+    final done = c.backfillHashedThisSession;
+    // Label-state priority order:
+    //   1. paused for playback (foreground audio outranks bg work)
+    //   2. waiting on cloud (a single hash has been in flight past
+    //      the patience threshold — almost certainly a Dropbox /
+    //      iCloud dataless placeholder being hydrated by macOS)
+    //   3. plain "Hashing audio"
+    // Each label reads as deliberate, not stalled.
+    final String label;
+    final String? subject;
+    if (c.isBackfillPaused) {
+      label = 'Hashing audio · paused for playback';
+      subject = null;
+    } else if (c.isWaitingOnCloud) {
+      // Elapsed seconds let the user distinguish ongoing hydration
+      // from a permanent stall — "Waiting on Dropbox · 14s" reads
+      // as "this is happening now", a static label would just look
+      // frozen.
+      final secs = c.currentHashElapsed?.inSeconds ?? 0;
+      label = 'Waiting on ${c.currentHashCloudLabel} · ${secs}s';
+      subject = c.currentHashFilename;
+    } else {
+      label = 'Hashing audio';
+      subject = null;
+    }
+    if (remaining != null && remaining > 0) {
+      final total = done + remaining;
+      return _OperationState(
+        label: label,
+        subject: subject,
+        done: done,
+        total: total,
+        progress: total == 0 ? null : (done / total).clamp(0.0, 1.0),
+      );
+    }
     return _OperationState(
-      label: 'Hashing audio',
-      done: c.backfillHashedThisSession,
+      label: label,
+      subject: subject,
+      done: done,
     );
   }
   return null;

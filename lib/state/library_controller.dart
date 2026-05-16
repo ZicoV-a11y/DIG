@@ -11,6 +11,7 @@ import 'package:just_audio/just_audio.dart' show ProcessingState;
 import 'package:uuid/uuid.dart';
 
 import '../models/intelligence_record.dart';
+import '../models/reconciliation_summary.dart';
 import '../models/source.dart';
 import '../models/activity_event.dart';
 import '../models/track.dart';
@@ -264,6 +265,8 @@ class LibraryController extends ChangeNotifier {
   // crossed the cumulative-listen threshold). Recomputed on
   // `_libraryVersion` change.
   int? _enrichedCountCache;
+  int? _enrichingCountCache;
+  int? _failedEnrichmentCountCache;
   int? _missingCountCache;
   int? _movedCountCache;
   // Paths of rows whose `availability_state == 'missing'` AND whose
@@ -295,14 +298,53 @@ class LibraryController extends ChangeNotifier {
   // pile the queue forever and exaggerate "Enriching" totals.
   final Set<String> _failedEnrichmentPaths = {};
 
+  // Source-level existence ontology. Distinct from per-track
+  // availability — the source is the *watched root* and can be
+  // healthy / missing independently of any individual file. A
+  // source whose `folder_path` no longer exists on disk (folder
+  // deleted in Finder, external drive ejected, Dropbox folder
+  // unlinked) should NOT appear healthy in the sidebar; users
+  // need to see "Z CRATE · Folder missing" so the missing-source
+  // tracks they're seeing in the table read as recoverable
+  // (remount the drive, restore the folder) rather than corrupt
+  // (something is wrong with the app).
+  //
+  // Stored as a Set rather than mutating each Source object so
+  // the existence check stays cheap to re-run and the persistent
+  // Source record continues to reflect "this is what the user
+  // configured" — not a transient runtime condition. Sub-views
+  // inherit their parent's state and never appear in this set
+  // themselves.
+  final Set<String> _missingFolderSourceIds = {};
+
   // Per-source filesystem watchers. Each watcher fires on any
   // create / modify / delete inside the source folder (recursive
-  // when the source's scan mode is recursive). Events are coalesced
-  // through `_watcherDebounce` — a burst of events from a file save
-  // or a folder move only triggers one rescan.
+  // when the source's scan mode is recursive).
+  //
+  // Events are coalesced via **quiescence detection**: the debounce
+  // timer is reset on every event so the rescan only fires after
+  // [_watcherQuietWindow] of silence. Crucial for cloud-storage
+  // paths (Dropbox / iCloud / CloudStorage) where a single user
+  // action can produce a stream of FSEvents lasting tens of seconds.
+  // An "every N seconds" debounce would fire mid-storm and force
+  // repeated rescans; quiescence-based fires exactly once per storm.
+  //
+  // [_watcherMaxQuietWait] is the hard ceiling — even an active
+  // sync that never quiets gets a rescan eventually so the library
+  // doesn't go stale.
   final Map<String, StreamSubscription<FileSystemEvent>> _watchers = {};
   final Map<String, Timer> _watcherDebounce = {};
-  static const _watcherDebounceWindow = Duration(milliseconds: 500);
+  final Map<String, DateTime> _watcherFirstEventAt = {};
+  static const _watcherQuietWindow = Duration(seconds: 3);
+  static const _watcherMaxQuietWait = Duration(seconds: 30);
+
+  // Throttle for the post-scan lifecycle save. A scan completion
+  // is a meaningful checkpoint, but during a cloud-sync storm we
+  // can complete a scan every 3-5 seconds and don't need to
+  // rewrite the multi-MB library file each time. One save per
+  // window is plenty — the autosave tick covers gaps.
+  DateTime? _lastPostScanSnapshotAt;
+  static const _postScanSnapshotInterval = Duration(minutes: 2);
 
   // App-lifecycle observer. macOS sends `resumed` when the user
   // brings the app to foreground (e.g., Cmd+Tab back from Finder).
@@ -382,6 +424,8 @@ class LibraryController extends ChangeNotifier {
     _backfillWorker = ContentHashBackfillWorker(
       repo,
       onProgress: _onBackfillProgress,
+      onHashStart: _onBackfillHashStart,
+      onHashEnd: _onBackfillHashEnd,
     );
     _positionSub = engine.positionStream.listen(_onPosition);
     _playingSub = engine.playingStream.listen(_onPlaying);
@@ -399,10 +443,193 @@ class LibraryController extends ChangeNotifier {
   /// backfill session. Read by the status bar to show progress.
   int get backfillHashedThisSession => _backfillHashedThisSession;
   int _backfillHashedThisSession = 0;
+
+  /// Live count of rows still pending — drives the determinate
+  /// "N / total" display in the status bar. Sampled by the worker
+  /// at the start of every batch so it stays current even as a
+  /// concurrent scan inserts new NULL-hash rows. `null` until the
+  /// first progress tick lands.
+  int? get backfillRemaining => _backfillRemaining;
+  int? _backfillRemaining;
+
   bool get isBackfillingContentHashes => _backfillWorker.isRunning;
 
-  void _onBackfillProgress(int batch, int session) {
+  // ── Reconciliation summary ─────────────────────────────────────
+  // Transient state representing "what just happened in the
+  // library." Set when a scan marks a non-trivial number of rows
+  // missing (e.g., a crate folder was deleted in Finder). The
+  // banner widget reads this getter and renders a calm,
+  // auto-dismissing operational narration:
+  //
+  //   Q removed
+  //   38 preserved through other folders
+  //   142 tracks removed from view
+  //
+  // Preserved-count is shown BEFORE removed-count by deliberate
+  // UX choice — users emotionally anchor to loss first, so leading
+  // with what survived reframes the operation as curated
+  // progression rather than data destruction.
+  //
+  // Auto-clears after [_reconciliationDismissAfter]; the user can
+  // also dismiss earlier via [dismissReconciliationSummary]. Only
+  // one summary at a time — a second scan landing while a banner
+  // is still on-screen replaces it.
+  ReconciliationSummary? _reconciliationSummary;
+  Timer? _reconciliationTimer;
+
+  /// How long the reconciliation banner stays on-screen before
+  /// auto-dismissing. Long enough to read the counts, short enough
+  /// not to outstay its welcome during active workflow.
+  static const Duration _reconciliationDismissAfter =
+      Duration(seconds: 12);
+
+  /// The current "what just happened" summary, or `null` when
+  /// nothing is pending. Widgets listening to the controller
+  /// surface this in a transient banner.
+  ReconciliationSummary? get reconciliationSummary =>
+      _reconciliationSummary;
+
+  /// Manual dismiss (X button on the banner). Cancels the
+  /// auto-dismiss timer too.
+  void dismissReconciliationSummary() {
+    if (_reconciliationSummary == null) return;
+    _reconciliationSummary = null;
+    _reconciliationTimer?.cancel();
+    _reconciliationTimer = null;
+    notifyListeners();
+  }
+
+  void _surfaceReconciliationSummary(
+    Source source,
+    ReconciliationDelta delta,
+  ) {
+    _reconciliationSummary = ReconciliationSummary(
+      sourceName: source.displayName,
+      removed: delta.removed,
+      preservedElsewhere: delta.preservedElsewhere,
+      surfacedAt: DateTime.now(),
+    );
+    _reconciliationTimer?.cancel();
+    _reconciliationTimer = Timer(_reconciliationDismissAfter, () {
+      // Defensive — `dismissReconciliationSummary` clears the
+      // timer too; we re-check the field in case a manual dismiss
+      // races with the auto-fire.
+      if (_reconciliationSummary?.surfacedAt ==
+          _reconciliationSummary?.surfacedAt) {
+        _reconciliationSummary = null;
+        _reconciliationTimer = null;
+        notifyListeners();
+      }
+    });
+    notifyListeners();
+  }
+
+  /// `true` while the backfill worker is suspended for active
+  /// playback. The status bar uses this to swap the label from
+  /// `Hashing audio` → `Hashing audio · paused for playback` so
+  /// the user can see the system is deliberately yielding, not
+  /// stalled. The denominator + done count stay frozen at their
+  /// last-tick values so the bar reads consistently across the
+  /// pause window.
+  bool get isBackfillPaused => _backfillWorker.isPaused;
+
+  // Single-file hash tracking. Drives the "Waiting on cloud" hint
+  // — a Dropbox / iCloud dataless placeholder commonly blocks the
+  // file read for 10–30 seconds while macOS materialises it. With
+  // a one-line label swap (and live elapsed counter) the wait
+  // reads as deliberate hydration rather than a frozen worker.
+  String? _currentHashPath;
+  DateTime? _currentHashStartedAt;
+  Timer? _currentHashTicker;
+
+  /// Elapsed time since the in-flight hash started, or `null` if
+  /// nothing is currently being hashed. The status bar uses this
+  /// to (a) decide whether to swap to the cloud-waiting label
+  /// (once the threshold elapses) and (b) render the live elapsed
+  /// seconds counter ("Waiting on Dropbox · 14s · file.mp3").
+  Duration? get currentHashElapsed {
+    final at = _currentHashStartedAt;
+    if (at == null) return null;
+    return DateTime.now().difference(at);
+  }
+
+  /// Display label for the currently-hashing path (basename only).
+  /// `null` when nothing is in flight. Plain `track.filename` would
+  /// suffice for paths we already know about; for paths discovered
+  /// mid-session the tracks map may not be populated yet, so we
+  /// derive the basename from the raw path directly.
+  String? get currentHashFilename {
+    final p = _currentHashPath;
+    if (p == null) return null;
+    final i = p.lastIndexOf(Platform.pathSeparator);
+    return i < 0 ? p : p.substring(i + 1);
+  }
+
+  /// Patience threshold. A hash that's been running this long is
+  /// almost certainly waiting on cloud-storage materialisation
+  /// (typical local SSD reads of 512 KB complete in <50 ms).
+  /// Below this the existing `Hashing audio` label is fine; above
+  /// it the user benefits from explicit "we're hydrating from
+  /// cloud" framing.
+  static const Duration _cloudWaitThreshold = Duration(seconds: 5);
+
+  /// `true` when a single-file hash has been in flight longer than
+  /// the patience threshold. The status bar uses this to swap to
+  /// the cloud-waiting label.
+  bool get isWaitingOnCloud {
+    final e = currentHashElapsed;
+    return e != null && e >= _cloudWaitThreshold;
+  }
+
+  /// Best-effort cloud-provider label derived from the in-flight
+  /// path. macOS exposes its cloud-storage mounts under
+  /// `~/Library/CloudStorage/Dropbox-…`, iCloud under
+  /// `~/Library/Mobile Documents/…`. Anything we don't recognise
+  /// falls back to a generic "cloud" label so the UI stays
+  /// truthful (we don't actually know if this 14-second hang is
+  /// Dropbox or just a slow NAS).
+  String get currentHashCloudLabel {
+    final p = _currentHashPath ?? '';
+    if (p.contains('/Library/CloudStorage/Dropbox')) return 'Dropbox';
+    if (p.contains('/Library/CloudStorage/GoogleDrive')) return 'Google Drive';
+    if (p.contains('/Library/CloudStorage/OneDrive')) return 'OneDrive';
+    if (p.contains('/Library/Mobile Documents')) return 'iCloud';
+    return 'cloud';
+  }
+
+  void _onBackfillProgress(int batch, int session, int remaining) {
     _backfillHashedThisSession = session;
+    _backfillRemaining = remaining;
+    notifyListeners();
+  }
+
+  void _onBackfillHashStart(String path) {
+    _currentHashPath = path;
+    _currentHashStartedAt = DateTime.now();
+    // 1 Hz tick so the elapsed-seconds counter advances visibly
+    // and the threshold flip from "Hashing audio" → "Waiting on
+    // cloud" fires on the second it's reached. Cheap (one
+    // notifyListeners per second, only while a hash is in
+    // flight). Cancelled in `_onBackfillHashEnd`.
+    _currentHashTicker?.cancel();
+    _currentHashTicker = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) {
+        // Skip the notify when nothing's actually in flight any
+        // more (defensive — Timer.cancel races with the hash's
+        // finally block).
+        if (_currentHashStartedAt == null) return;
+        notifyListeners();
+      },
+    );
+    notifyListeners();
+  }
+
+  void _onBackfillHashEnd(String path) {
+    _currentHashPath = null;
+    _currentHashStartedAt = null;
+    _currentHashTicker?.cancel();
+    _currentHashTicker = null;
     notifyListeners();
   }
 
@@ -599,11 +826,30 @@ class LibraryController extends ChangeNotifier {
     } catch (e) {
       debugPrint('[hydrate] heal pass failed: $e');
     }
+    // Crash-recovery: any row left in `enriching` from a previous
+    // run reverts to `discovered` so the regular enrichment pass
+    // picks it back up. Must run BEFORE loadTracks so the
+    // freshly-loaded Track objects see the corrected states.
+    try {
+      final swept = await repo.sweepStuckEnriching();
+      if (swept > 0) {
+        debugPrint(
+          '[hydrate] swept $swept rows from stuck enriching → discovered',
+        );
+      }
+    } catch (e) {
+      debugPrint('[hydrate] enrichment-state sweep failed: $e');
+    }
     final tracks = await repo.loadTracks();
     _sources
       ..clear()
       ..addAll(sources);
     _replaceTracks(tracks);
+    // Initial source-existence sweep. Any source whose
+    // `folder_path` isn't on disk lands in `_missingFolderSourceIds`
+    // so the sidebar renders the "Folder missing" treatment from
+    // first paint instead of waiting for a scan to discover it.
+    _refreshMissingFolderSet();
     _markLibraryDirty();
     notifyListeners();
 
@@ -899,10 +1145,22 @@ class LibraryController extends ChangeNotifier {
       if (t.metadataReadAt != null) continue;
       _inEnrichmentQueue.add(p);
       fresh.add(p);
+      // Flip the in-memory state immediately so the row renders
+      // its "actively being processed" treatment without waiting
+      // for the DB write below to round-trip.
+      t.enrichmentState = EnrichmentState.enriching;
     }
     if (fresh.isEmpty) return;
     _enrichmentQueue.addAll(fresh);
     _metadataTotalThisRun += fresh.length;
+    // Persist `enriching` so a render-anywhere read of these
+    // rows (e.g., re-hydration after a window reopen) sees the
+    // same state. Fire-and-forget — failure to persist is OK,
+    // worst case the row stays at `discovered` and a subsequent
+    // enqueue does the same work again. Boot-time
+    // `sweepStuckEnriching` is the safety net for any rows that
+    // ever land here without a paired clearance.
+    unawaited(repo.markPathsEnriching(fresh));
     debugPrint(
       '[meta] queued +${fresh.length} '
       '(queue=${_enrichmentQueue.length}, processing=$_metadataProcessing)',
@@ -1041,11 +1299,13 @@ class LibraryController extends ChangeNotifier {
         t.duration = m.duration!;
       }
       t.hasArtwork = m.hasArtwork;
+      t.enrichmentState = EnrichmentState.ready;
     } else {
       // Tag parser failed (audio_metadata_reader can't decode this
       // particular format / file revision). Track the path so we
       // don't keep re-enqueueing it from every viewport snapshot.
       _failedEnrichmentPaths.add(t.path);
+      t.enrichmentState = EnrichmentState.failed;
     }
     // Stamp regardless of success: "we have processed this row".
     // The filename-parsing display fallback still covers it; the
@@ -1220,6 +1480,38 @@ class LibraryController extends ChangeNotifier {
     return _enrichedCountCache ?? 0;
   }
 
+  /// Library-wide count of rows currently in the
+  /// `EnrichmentState.enriching` state — i.e., paths handed to the
+  /// metadata-extraction pipeline whose tags haven't landed yet.
+  /// Drives the activity strip's "ENRICHING N" chunk. Always shows
+  /// (including zero) so the user sees a calm-but-truthful baseline.
+  int get enrichingCount {
+    _ensureLibraryStats();
+    return _enrichingCountCache ?? 0;
+  }
+
+  /// Library-wide count of rows in `EnrichmentState.failed`. These
+  /// are paths the metadata pipeline tried and couldn't decode
+  /// (corrupt tag block, unsupported codec variant, permission
+  /// flap). Surfaced explicitly so the user can spot "attention
+  /// required" libraries without digging.
+  int get failedEnrichmentCount {
+    _ensureLibraryStats();
+    return _failedEnrichmentCountCache ?? 0;
+  }
+
+  /// Implicit "not yet processed" count: total rows minus the ones
+  /// in any other state. Computed from the cached totals so the
+  /// activity strip stays consistent with the rest of the tally
+  /// (rounding errors here would manifest as the four chunks not
+  /// adding up to the file count, which would be a trust killer).
+  int get discoveredCount {
+    final total = totalTrackCount;
+    final accounted = enrichedCount + enrichingCount + failedEnrichmentCount;
+    final remainder = total - accounted;
+    return remainder < 0 ? 0 : remainder;
+  }
+
   /// Library-wide missing tally — truly-gone files only. Auto-
   /// detected moves are excluded (they live in `movedCount`).
   int get missingCount {
@@ -1367,6 +1659,12 @@ class LibraryController extends ChangeNotifier {
     // / sort changes shouldn't force a 12k-track recompute.
     if (_libraryStatsVersion == _dataVersion) return;
     var enriched = 0;
+    // Per-state counts for the activity strip. `discovered` is
+    // implicit: total - enriched - enriching - failed. We compute
+    // the active states (where work is happening or visibly missing)
+    // and let the strip derive `discovered` from the total.
+    var enriching = 0;
+    var failedEnrichment = 0;
     var supersededCount = 0;
     // Build the byte-equivalence side index in pass 1: every
     // content_hash that has at least one currently-`available`
@@ -1384,6 +1682,20 @@ class LibraryController extends ChangeNotifier {
     final missingTracks = <Track>[];
     for (final t in _tracks) {
       if (t.metadataReadAt != null) enriched++;
+      // Authoritative state read from the formal `enrichment_state`
+      // column (schema v14). `discovered` is implicit (the
+      // remainder) so we don't tally it here.
+      switch (t.enrichmentState) {
+        case EnrichmentState.enriching:
+          enriching++;
+          break;
+        case EnrichmentState.failed:
+          failedEnrichment++;
+          break;
+        case EnrichmentState.discovered:
+        case EnrichmentState.ready:
+          break;
+      }
       if (t.availability == 'missing') {
         missingTracks.add(t);
       } else if (t.availability == 'superseded') {
@@ -1426,6 +1738,8 @@ class LibraryController extends ChangeNotifier {
       if (v) reviewedBucketed++;
     }
     _enrichedCountCache = enriched;
+    _enrichingCountCache = enriching;
+    _failedEnrichmentCountCache = failedEnrichment;
     _missingCountCache = trulyMissing;
     _movedCountCache = supersededCount + coexistingPaths.length;
     _coexistingMissingPathsCache = coexistingPaths;
@@ -1466,6 +1780,62 @@ class LibraryController extends ChangeNotifier {
   /// Lifetime event count — for "X of Y" tally text in the panel
   /// header.
   Future<int> activityEventCount() => repo.eventCount();
+
+  /// Snapshot of top-level source IDs whose `folder_path` does
+  /// not currently exist on disk. The sidebar uses this to render
+  /// missing-folder tiles dimmed with a "Folder missing" subtitle,
+  /// so the user can tell the difference between "this source has
+  /// some tracks gone" (per-track availability) and "the entire
+  /// watched root is gone" (this set).
+  ///
+  /// Returns a view of the internal set; callers shouldn't mutate.
+  /// Sub-views never appear here — they piggyback on their parent's
+  /// state and have no folder of their own.
+  Set<String> get missingFolderSourceIds =>
+      Set.unmodifiable(_missingFolderSourceIds);
+
+  /// Convenience for sidebar tiles: returns `true` when [sourceId]
+  /// is a top-level source whose watched folder isn't on disk
+  /// right now. Cheap (Set lookup); safe to call per-frame.
+  bool isSourceFolderMissing(String sourceId) =>
+      _missingFolderSourceIds.contains(sourceId);
+
+  /// Recompute the missing-folder set across every source —
+  /// top-level AND sub-views. A sub-view is a saved filter
+  /// pointing at a path prefix inside its parent (e.g., Q is a
+  /// sub-view of Afro:Tech:Deep filtering tracks under
+  /// `…/Afro:Tech:Deep/Q/`). When the user deletes that
+  /// sub-folder in Finder, the sub-view's `folderPath` no
+  /// longer exists either, even though the parent does — the
+  /// sidebar still needs to mark it missing so the user sees
+  /// the dead lens for what it is.
+  ///
+  /// Cheap — one `existsSync` per source, which resolves to a
+  /// single stat. Called at hydrate, at scan start, after
+  /// source add/remove, and on watcher-failure paths.
+  ///
+  /// Returns `true` if the set changed (so callers can decide
+  /// whether to `notifyListeners`).
+  bool _refreshMissingFolderSet() {
+    final before = Set<String>.from(_missingFolderSourceIds);
+    _missingFolderSourceIds.clear();
+    for (final s in _sources) {
+      try {
+        if (!Directory(s.folderPath).existsSync()) {
+          _missingFolderSourceIds.add(s.id);
+        }
+      } catch (_) {
+        // existsSync can throw on some failure modes (permission
+        // denied at a parent, broken symlink). Treat any throw as
+        // "we can't see this folder" → missing. The user can
+        // recover by reconnecting whatever underlying storage
+        // dropped out.
+        _missingFolderSourceIds.add(s.id);
+      }
+    }
+    return before.length != _missingFolderSourceIds.length ||
+        !before.containsAll(_missingFolderSourceIds);
+  }
 
   Set<String> get coexistingMissingPaths {
     _ensureLibraryStats();
@@ -1750,8 +2120,25 @@ class LibraryController extends ChangeNotifier {
 
   Track? get currentTrack {
     final uid = _currentTrackUid;
-    if (uid == null) return null;
-    return _tracksByUid[uid];
+    if (uid != null) {
+      final byUid = _tracksByUid[uid];
+      if (byUid != null) return byUid;
+    }
+    // Playback-priority fallback: the audio engine plays a file
+    // PATH; `_currentTrackPath` is the most stable identity we
+    // have across scan reloads. If a watcher-triggered rescan
+    // shifted the row's uid (e.g., Dropbox sync bumped mtime → new
+    // uid; `computeTrackUid` hashes mtime), the uid lookup misses
+    // but the path lookup still resolves. Without this fallback
+    // the deck reads "No track selected" mid-playback and every
+    // playback-driving action (seek / favorite / play-count /
+    // review) silently no-ops because they gate on `currentTrack`.
+    final path = _currentTrackPath;
+    if (path != null) {
+      final byPath = _tracksByPath[path];
+      if (byPath != null) return byPath;
+    }
+    return null;
   }
 
   Track? _trackByUid(String uid) => _tracksByUid[uid];
@@ -1760,6 +2147,22 @@ class LibraryController extends ChangeNotifier {
 
   /// Replace the in-memory track list and rebuild the lookup maps.
   /// Call sites: hydrate, scan reload, import.
+  ///
+  /// **Playback continuity contract:** if a track is currently
+  /// playing, its row's UID may have shifted (Dropbox sync bumped
+  /// mtime → `computeTrackUid` re-hashed → new uid for the same
+  /// path). `_currentTrackUid` would then point at a uid that no
+  /// longer exists in the new map → `currentTrack` returns null
+  /// → deck reads "No track selected" mid-playback and every
+  /// playback-action (seek, favorite, play-count, review) silently
+  /// no-ops because they gate on `currentTrack`.
+  ///
+  /// Path is the most stable identity we have across reloads.
+  /// After the rebuild, if the playing path still resolves to a
+  /// row, snap `_currentTrackUid` to that row's current uid so
+  /// the deck stays linked. Belt + suspenders with `currentTrack`'s
+  /// path fallback — both guards handle the same hazard from
+  /// different angles.
   void _replaceTracks(List<Track> tracks) {
     _tracks
       ..clear()
@@ -1769,6 +2172,17 @@ class LibraryController extends ChangeNotifier {
     for (final t in tracks) {
       _tracksByUid[t.uid] = t;
       _tracksByPath[t.path] = t;
+    }
+    // Self-heal the playing-track link. Only fires when there's
+    // an actually-playing track AND its path survived the rebuild
+    // (the file disappearing entirely is handled by the
+    // `removeSource` / availability paths, not here).
+    final playingPath = _currentTrackPath;
+    if (playingPath != null) {
+      final reHydrated = _tracksByPath[playingPath];
+      if (reHydrated != null && reHydrated.uid != _currentTrackUid) {
+        _currentTrackUid = reHydrated.uid;
+      }
     }
   }
 
@@ -1834,14 +2248,20 @@ class LibraryController extends ChangeNotifier {
   List<Track> _computeGroupedVisible() {
     // Step 1: group the whole library. Order each bucket so the
     // lowest-quality format (the displayed primary) is at index 0.
-    // Unavailable variants (file deleted / removed since last scan,
-    // marked `is_available = 0`) are dropped from the bucket so the
-    // FORMAT cell count, the primary picker, and the right-click
-    // submenu all stop referencing them as soon as a rescan marks
-    // them gone. If every variant in a bucket is unavailable, the
-    // bucket disappears from the visible table entirely — its
-    // intelligence still lives on the `tracks` row (guardrail 5)
-    // and reconnects automatically if the user adds the file back.
+    //
+    // Variant-presence rule (user policy: "removed from disk =
+    // removed from view"):
+    //   - At least one variant available → show only the available
+    //     variants in the bucket. Unavailable siblings stay in the
+    //     DB and rejoin the bucket when their source comes back,
+    //     but they don't pollute the FORMAT cell / primary picker
+    //     while they're gone.
+    //   - Every variant unavailable → drop the bucket from the
+    //     visible table. The `tracks` intel row (favorite,
+    //     play_count, cumulative listening, review state) lives
+    //     on regardless, so re-adding the file to any watched
+    //     source reconnects automatically — the user's history
+    //     isn't lost, just the now-stale row.
     final rawBuckets = groupBySongIdentity(_tracks);
     final buckets = <List<Track>>[];
     for (final raw in rawBuckets) {
@@ -2244,11 +2664,20 @@ class LibraryController extends ChangeNotifier {
 
   Future<void> _scanIntoSource(Source source) async {
     _isScanning = true;
-    // Yield SQLite + disk to the foreground scan. The backfill
-    // worker is best-effort by design; we'll restart it after the
-    // scan finishes, picking up wherever it left off (the
-    // candidates query is stateless).
-    _backfillWorker.cancel();
+    // Refresh source-existence ontology at scan boundary. Cheap
+    // (one stat per top-level source) and catches the common
+    // "folder was deleted between sessions" or "drive ejected"
+    // cases before the per-track availability sweep below runs.
+    _refreshMissingFolderSet();
+    // Don't cancel the backfill worker. Previous design did, on
+    // the theory that the scan and backfill would fight for disk.
+    // In practice the scan is a tight CPU+DB loop (the inline-hash
+    // bottleneck moved to backfill) and the backfill is throttled
+    // to 10 files / 500 ms — they coexist fine. Cancelling here
+    // created a pathological loop on cloud-sync storms: each
+    // watcher rescan cancelled the backfill mid-hash, then
+    // restarted it; the same Dropbox-resident file was re-picked
+    // and re-hashed (15+ seconds per attempt) on every cycle.
     // Reset the hashing instrumentation so the per-scan summary
     // log at the end of this call reflects only THIS scan's work.
     ContentHashStats.reset();
@@ -2320,10 +2749,13 @@ class LibraryController extends ChangeNotifier {
         debugPrint('$st');
       }
 
-      await repo.markUnseenAvailability(
+      final reconciliation = await repo.markUnseenAvailability(
         source.id,
         {for (final e in entries) e.path},
       );
+      if (reconciliation.isMaterial) {
+        _surfaceReconciliationSummary(source, reconciliation);
+      }
 
       // Auto-detect moved files: any row left in `missing` state
       // whose fingerprint matches an `available` row in the same
@@ -2464,7 +2896,20 @@ class LibraryController extends ChangeNotifier {
       // rows, new content_hash, often new artwork/metadata. Save
       // even if the autosave tick wouldn't fire for another few
       // minutes so the user can roll back to "post-scan state".
-      unawaited(_snapshotNow());
+      //
+      // Throttled to one save per [_postScanSnapshotInterval]
+      // because cloud-sync storms can produce a scan every few
+      // seconds; rewriting the multi-MB library file on every
+      // scan during a storm pegs disk and starves the UI. The
+      // autosave tick covers the windows in between, and the
+      // user-initiated Save action is always immediate.
+      final now = DateTime.now();
+      final last = _lastPostScanSnapshotAt;
+      if (last == null ||
+          now.difference(last) >= _postScanSnapshotInterval) {
+        _lastPostScanSnapshotAt = now;
+        unawaited(_snapshotNow());
+      }
     }
   }
 
@@ -2512,11 +2957,33 @@ class LibraryController extends ChangeNotifier {
     // change. The lifecycle-resumed rescan covers that case.
     debugPrint('[watcher] $sourceId ${_eventTypeName(event)} '
         '${event.path}${event.isDirectory ? " (dir)" : ""}');
-    // Coalesce bursts. A single file save can fire create + modify
-    // events in quick succession; a folder move can fire dozens.
+    // Quiescence-based coalescing: reset the timer on every event
+    // so the rescan only fires after [_watcherQuietWindow] of
+    // silence. Cloud-sync storms (Dropbox materializing 1000 files)
+    // can fire events for tens of seconds; a fixed debounce would
+    // produce repeated mid-storm rescans, each one nulling content
+    // hashes that the backfill worker would then re-compute (15s
+    // per file on Dropbox). One rescan at the END of the storm is
+    // dramatically cheaper.
+    //
+    // Hard ceiling: if events keep coming for [_watcherMaxQuietWait]
+    // straight without ever quieting, fire a rescan anyway so the
+    // library doesn't go stale during a long-running sync.
+    final now = DateTime.now();
+    _watcherFirstEventAt.putIfAbsent(sourceId, () => now);
+    final firstAt = _watcherFirstEventAt[sourceId]!;
+    final waitedTooLong = now.difference(firstAt) >= _watcherMaxQuietWait;
     _watcherDebounce[sourceId]?.cancel();
-    _watcherDebounce[sourceId] = Timer(_watcherDebounceWindow, () {
+    if (waitedTooLong) {
+      // Storm has been continuous past the ceiling — rescan now.
       _watcherDebounce.remove(sourceId);
+      _watcherFirstEventAt.remove(sourceId);
+      rescanSource(sourceId);
+      return;
+    }
+    _watcherDebounce[sourceId] = Timer(_watcherQuietWindow, () {
+      _watcherDebounce.remove(sourceId);
+      _watcherFirstEventAt.remove(sourceId);
       rescanSource(sourceId);
     });
   }
@@ -2594,6 +3061,7 @@ class LibraryController extends ChangeNotifier {
     await _stopWatcher(sourceId);
     await repo.deleteSource(sourceId);
     _sources.removeWhere((s) => s.id == sourceId);
+    _missingFolderSourceIds.remove(sourceId);
     _removeTracksWhere((t) => t.sourceId == sourceId);
     final remainingUids = <String>{for (final t in _tracks) t.uid};
     _recentReviewedUids.removeWhere((uid) => !remainingUids.contains(uid));
@@ -3153,7 +3621,7 @@ class LibraryController extends ChangeNotifier {
     return null;
   }
 
-  Future<void> play(String uid, {bool reveal = false}) async {
+  Future<void> play(String uid, {bool reveal = false, String? path}) async {
     // Per-step millisecond timing of the play path. Each `tick` call
     // logs the cumulative + delta against the last tick. Goal: the
     // segment from `entry` → `engine.setTrack returned` should be
@@ -3167,14 +3635,39 @@ class LibraryController extends ChangeNotifier {
       lastMs = now;
     }
 
-    tick('entry uid=$uid');
-    final track = _trackByUid(uid);
+    tick('entry uid=$uid path=${path ?? "<none>"}');
+    // Path-preferred lookup. `uid` is `sha256(basename | filesize |
+    // durationMs | mtimeMs)` truncated to 16 hex chars — same
+    // physical file in two watched folders (Z CRATE + Afro:Tech:Deep)
+    // collides, and `_tracksByUid` only holds the last-seen Track
+    // for that key. Path is the indexed_files PK; always unique.
+    // When the table's click handler passes its row's path, we
+    // resolve unambiguously even under collision.
+    //
+    // Falls back to uid lookup for callers that only know the uid
+    // (next/previous/keyboard navigation, restore from snapshot).
+    Track? track;
+    if (path != null) {
+      track = _trackByPath(path);
+    }
+    track ??= _trackByUid(uid);
     tick('lookup → ${track == null ? "null" : "ok"}');
     if (track == null) {
-      debugPrint('[play] unknown uid: $uid');
+      debugPrint('[play] unknown uid: $uid (path=$path)');
       return;
     }
-    final isNewTrack = _currentTrackUid != uid;
+    // Re-resolve uid from the actually-found track. When the lookup
+    // succeeded via path, `uid` may have been a collision twin's
+    // value; from here on we use the canonical uid of the row we
+    // intend to play so subsequent state ops (`_currentTrackUid`,
+    // etc.) stay consistent.
+    uid = track.uid;
+    // `isNewTrack` keys on PATH, not uid, so two collision twins
+    // (same uid, different paths) correctly read as distinct
+    // tracks. Without this, switching from Z CRATE → Afro:Tech:Deep
+    // on the same byte-identical AIFF would silently no-op because
+    // the uid hasn't changed.
+    final isNewTrack = _currentTrackPath != track.path;
     if (isNewTrack) {
       await _flushCurrentTrack();
       tick('_flushCurrentTrack');
@@ -3276,34 +3769,40 @@ class LibraryController extends ChangeNotifier {
 
     if (_playbackMode == PlaybackMode.shuffleUnreviewed) {
       final pool = list
-          .where((t) => !t.reviewed && t.uid != _currentTrackUid)
+          .where((t) => !t.reviewed && t.path != _currentTrackPath)
           .toList();
       if (pool.isEmpty) return;
-      await play(pool[_rng.nextInt(pool.length)].uid, reveal: true);
+      final pick = pool[_rng.nextInt(pool.length)];
+      await play(pick.uid, reveal: true, path: pick.path);
       return;
     }
 
     if (_playbackMode == PlaybackMode.shuffle && list.length > 1) {
-      String pickUid;
+      Track pick;
       do {
-        pickUid = list[_rng.nextInt(list.length)].uid;
-      } while (pickUid == _currentTrackUid);
-      await play(pickUid, reveal: true);
+        pick = list[_rng.nextInt(list.length)];
+      } while (pick.path == _currentTrackPath);
+      await play(pick.uid, reveal: true, path: pick.path);
       return;
     }
 
-    final idx = list.indexWhere((t) => t.uid == _currentTrackUid);
+    // Locate "current" by path, not uid — uid can collide across
+    // sources (same physical file at two paths). Path is the row's
+    // primary key in indexed_files and is unambiguous.
+    final idx = list.indexWhere((t) => t.path == _currentTrackPath);
     if (idx >= 0 && idx < list.length - 1) {
-      await play(list[idx + 1].uid, reveal: true);
+      final pick = list[idx + 1];
+      await play(pick.uid, reveal: true, path: pick.path);
     }
   }
 
   Future<void> previous() async {
     final list = visibleTracks;
     if (list.isEmpty || _currentTrackUid == null) return;
-    final idx = list.indexWhere((t) => t.uid == _currentTrackUid);
+    final idx = list.indexWhere((t) => t.path == _currentTrackPath);
     if (idx > 0) {
-      await play(list[idx - 1].uid, reveal: true);
+      final pick = list[idx - 1];
+      await play(pick.uid, reveal: true, path: pick.path);
     }
   }
 
@@ -3418,10 +3917,19 @@ class LibraryController extends ChangeNotifier {
         const Duration(seconds: 10),
         (_) => _flushCurrentTrack(),
       );
+      // Playback-priority law: while audio is playing, the
+      // backfill worker yields the disk + IO thread pool so
+      // scroll, skip, and queue interactions stay smooth. The
+      // worker keeps its session state (progress count, failed-
+      // path memo) — it just stops scheduling new hashes until
+      // we resume() below.
+      _backfillWorker.pause();
     } else {
       _flushTimer?.cancel();
       _flushTimer = null;
       _flushCurrentTrack();
+      // Playback stopped → background work catches up. Idempotent.
+      _backfillWorker.resume();
     }
     _pushNowPlaying();
     notifyListeners();

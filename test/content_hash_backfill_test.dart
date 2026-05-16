@@ -184,16 +184,20 @@ void main() {
       final f = await writeFile('p.mp3', 800 * 1024, seed: 3);
       await seedLegacyRow(f.path);
 
-      final progress = <int>[];
+      final progress = <({int session, int remaining})>[];
       final worker = ContentHashBackfillWorker(
         repo,
-        onProgress: (_, session) => progress.add(session),
+        onProgress: (_, session, remaining) =>
+            progress.add((session: session, remaining: remaining)),
       );
       worker.start();
       await waitForIdle(worker);
 
       expect(progress, isNotEmpty);
-      expect(progress.last, 1, reason: 'one file hashed this session');
+      expect(progress.last.session, 1,
+          reason: 'one file hashed this session');
+      expect(progress.last.remaining, 0,
+          reason: 'no NULL-hash candidates remain after the worker drains');
     });
 
     test('stops cleanly when no candidates remain', () async {
@@ -264,6 +268,68 @@ void main() {
       expect(await contentHashAt('/nowhere/missing.mp3'), isNull);
       // But the worker has cleanly exited, not hung in a retry loop.
       expect(worker.isRunning, isFalse);
+    });
+
+    test('pause() halts hashing without losing session state; '
+         'resume() picks back up', () async {
+      // Playback-priority law: while audio plays, the backfill
+      // worker yields disk + IO thread pool. Test the mechanism
+      // in isolation: pause before any work runs, confirm nothing
+      // gets hashed; resume, confirm work completes.
+      final files = <File>[];
+      for (var i = 0; i < 8; i++) {
+        final f = await writeFile('p-$i.mp3', 100 * 1024, seed: 200 + i);
+        await seedLegacyRow(f.path);
+        files.add(f);
+      }
+
+      final worker = ContentHashBackfillWorker(repo);
+      worker.start();
+      // Pause immediately — before the first 0ms-delayed tick
+      // gets a chance to run a real batch.
+      worker.pause();
+      expect(worker.isPaused, isTrue);
+      expect(worker.isRunning, isTrue,
+          reason: 'paused worker is still "running" — just not '
+              'scheduling new hashes');
+
+      // Wait long enough that ~4 normal batches would have fired.
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      // The very first tick may have been in-flight when pause
+      // landed (race condition that doesn't actually matter for
+      // the user-visible property). Anything from 0 to <=10
+      // rows is acceptable; the key invariant is that pause
+      // STOPPED THE WORK from completing, not that it caught
+      // every single in-flight syscall.
+      var hashedDuringPause = 0;
+      for (final f in files) {
+        if (await contentHashAt(f.path) != null) hashedDuringPause++;
+      }
+      expect(hashedDuringPause, lessThan(files.length),
+          reason: 'pause must prevent the full batch from completing');
+
+      // Resume + drain.
+      worker.resume();
+      expect(worker.isPaused, isFalse);
+      await waitForIdle(worker);
+      for (final f in files) {
+        expect(await contentHashAt(f.path), isNotNull,
+            reason: 'resume must complete every previously-pending file');
+      }
+    });
+
+    test('cancel() while paused fully tears down state', () async {
+      final f = await writeFile('cp.mp3', 100 * 1024, seed: 999);
+      await seedLegacyRow(f.path);
+
+      final worker = ContentHashBackfillWorker(repo);
+      worker.start();
+      worker.pause();
+      worker.cancel();
+
+      expect(worker.isRunning, isFalse);
+      expect(worker.isPaused, isFalse,
+          reason: 'cancel must clear the paused flag too');
     });
   });
 }

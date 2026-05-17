@@ -59,6 +59,31 @@ class _HomeScreenState extends State<HomeScreen>
     super.dispose();
   }
 
+  /// Hot-reload graceful reset. Flutter calls `reassemble()` on
+  /// every State after a hot reload. We forward to the controller
+  /// so it can pause/cancel background work that doesn't survive
+  /// hot reload cleanly:
+  ///
+  ///   - In-flight `compute()` isolates (AudioScanner, metadata
+  ///     extractor, content hash) die with `Computation ended
+  ///     without result` on reload; their callers catch and log,
+  ///     but the cascade of "scan failed → next watcher event
+  ///     triggers rescan → reload happens again mid-compute" can
+  ///     make the UI feel frozen until the storm settles.
+  ///   - Pending watcher debounce timers point at closures whose
+  ///     class definitions may have changed under them.
+  ///   - The backfill worker's scheduler has timers that survive
+  ///     reload but reference potentially-stale class bodies.
+  ///
+  /// Cancelling them gives the post-reload state a clean room to
+  /// rebuild from. The next scan / watcher event re-arms everything
+  /// normally.
+  @override
+  void reassemble() {
+    super.reassemble();
+    widget.controller.handleHotReload();
+  }
+
   /// Defensive focus re-grab when the app returns to foreground.
   ///
   /// Observed bug (no reliable repro yet, but seen multiple times

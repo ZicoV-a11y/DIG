@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../models/track.dart';
-import '../services/filename_parser.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import 'skip_button.dart';
@@ -38,12 +37,40 @@ class PlaybackBar extends StatelessWidget {
           //    horizontal expansion.
           final W = deckConstraints.maxWidth;
 
-          // Right-zone now holds artwork only — volume moved back to
-          // the utility rail. Right zone width from edge:
-          //   artwork 110 + right pad 16 = 126 from right edge
-          const transportButtonRowWidth = 552.0;
+          // Right-zone holds the artwork. `_DeckArtwork` returns a
+          // SizedBox 130 wide (130 is the SizedBox; the visual art
+          // inside is 110, with the extra 20 px making room for
+          // the favorite overlay button). The Row allocates 130
+          // because that's the SizedBox width — math must use 130,
+          // not 110.
+          //
+          // Transport row width measured precisely:
+          //   skip (42×6) + circle (48×2) + play (80) = 428 buttons
+          //   gaps: 10×4 + 14×2 + 6×2                = 80 gaps
+          //   total                                   = 508
+          const transportButtonRowWidth = 508.0;
+
+          // The deck (PlaybackBar) does NOT span the full app
+          // width. The home-screen layout puts the deck inside an
+          // inner Expanded and parks the UtilityRail (100 px) as
+          // a sibling to the RIGHT of that Expanded, separated by
+          // a 4 px gap, with 4 px outer padding on every side:
+          //
+          //   [pad4][Expanded: PlaybackBar (W)][gap4][rail100][pad4]
+          //
+          // So the deck's right edge is 108 px from the app's
+          // right edge, and the deck's W/2 is ~52 px LEFT of the
+          // app's true horizontal centre. The alignment math
+          // below targets W/2 + 52 (app's true centre) instead of
+          // W/2 so the play button sits at the geometric centre
+          // of the whole window, accounting for the rail.
+          //
+          // If the rail width, gap, or outer padding ever change,
+          // update `appCenterOffset` to match.
+          const appCenterOffset = 52.0;
+          final transportCenterDeckX = W / 2 + appCenterOffset;
           final transportLeftScreen =
-              W / 2 - transportButtonRowWidth / 2;
+              transportCenterDeckX - transportButtonRowWidth / 2;
 
           // Now Playing's render width can extend from the slot's
           // left edge (x=16) up to the transport's left edge minus
@@ -54,20 +81,30 @@ class PlaybackBar extends StatelessWidget {
               (transportLeftScreen - 16 - breathingBeforeTransport)
                   .clamp(280.0, 600.0);
 
-          // Alignment for the button row inside the Expanded zone.
-          // Layout: pad16 + NP280 + gap16 + Expanded + gap16 + artwork110 + pad16
-          // Expanded spans [312, W-142]. Width = W - 454. Its centre
-          // is at W/2 + 85 (85 px right of app centre because of the
-          // left-side Now Playing block). We want the button row
-          // centred at W/2.
-          //   alignment.x ∈ [-1, 1] where -1 = parent-left, 1 = parent-right
-          //   shift_distance_from_centre = alignment.x × (parent_width - child_width) / 2
-          //   -85 = alignment.x × (W - 454 - 552) / 2
-          //   alignment.x = -170 / (W - 1006)
+          // Alignment math for the button row inside the Expanded
+          // zone.
+          //   Layout (inside the deck):
+          //     pad16 + NP280 + gap16 + Expanded + gap16 + art130 + pad16
+          //   Fixed total: 16+280+16+16+130+16 = 474
+          //   Expanded width = W − 474
+          //   Expanded starts at x = 312
+          //   Expanded centre = 312 + (W−474)/2 = W/2 + 75
+          //
+          //   Target transport-row centre (in deck coords):
+          //     W/2 + 52   ← app's true horizontal centre
+          //
+          //   Shift required (relative to Expanded centre):
+          //     (W/2 + 52) − (W/2 + 75) = −23 px
+          //
+          //   In Align(alignment.x), x ∈ [−1, 1] maps to a shift of
+          //     x × (parent_width − child_width) / 2:
+          //     −23 = x × (W − 474 − 508) / 2 = x × (W − 982) / 2
+          //     x   = −46 / (W − 982)
+          //
           // Clamp so we never pin past the edges if the window
           // shrinks below the 1180 minimum.
           final buttonAlignmentX =
-              (-170.0 / (W - 1006)).clamp(-1.0, 1.0);
+              (-46.0 / (W - 982)).clamp(-1.0, 1.0);
 
           return ListenableBuilder(
             listenable: controller,
@@ -93,8 +130,6 @@ class PlaybackBar extends StatelessWidget {
                         track: track,
                         onTap:
                             hasTrack ? controller.revealCurrent : null,
-                        onPivotTap: (name) =>
-                            controller.setSearchQuery(name),
                       ),
                     ),
                   ),
@@ -300,12 +335,10 @@ class _PositionRow extends StatelessWidget {
 class _NowPlayingBlock extends StatelessWidget {
   final Track? track;
   final VoidCallback? onTap;
-  final void Function(String) onPivotTap;
 
   const _NowPlayingBlock({
     required this.track,
     required this.onTap,
-    required this.onPivotTap,
   });
 
   @override
@@ -332,169 +365,85 @@ class _NowPlayingBlock extends StatelessWidget {
     // attempts at LayoutBuilder-driven font scaling here made the
     // text grow with the block; user feedback was that the block
     // should *use* the space, not balloon the text.
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisAlignment: MainAxisAlignment.center,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Tooltip(
-          message: 'Jump to current track',
-          waitDuration: const Duration(milliseconds: 600),
-          child: Material(
-            color: Colors.transparent,
-            child: InkWell(
-              onTap: onTap,
-              hoverColor: AppColors.hoverRow,
-              focusColor: AppColors.focusOverlay,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 10,
-                ),
-                child: SizedBox(
-                  width: double.infinity,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        split.primary,
-                        overflow: TextOverflow.ellipsis,
-                        maxLines: 1,
-                        style: const TextStyle(
-                          color: AppColors.textPrimary,
-                          fontSize: 22,
-                          fontWeight: FontWeight.w600,
-                          height: 1.15,
-                        ),
-                      ),
-                      if (split.subtitle != null) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          split.subtitle!,
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 1,
-                          style: const TextStyle(
-                            color: AppColors.textSecondary,
-                            fontSize: 16,
-                            height: 1.15,
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 4),
-                      Text(
-                        t.displayArtist.isEmpty
-                            ? '—'
-                            : t.displayArtist,
-                        overflow: TextOverflow.ellipsis,
-                        maxLines: 1,
-                        style: const TextStyle(
-                          color: AppColors.textSecondary,
-                          fontSize: 14,
-                          height: 1.15,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        _formatTrackMeta(t),
-                        overflow: TextOverflow.ellipsis,
-                        maxLines: 1,
-                        style: const TextStyle(
-                          color: AppColors.textTertiary,
-                          fontSize: 14,
-                          height: 1.15,
-                          fontFeatures: [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                    ],
+    return Tooltip(
+      message: 'Jump to current track',
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          hoverColor: AppColors.hoverRow,
+          focusColor: AppColors.focusOverlay,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+              horizontal: 12,
+              vertical: 10,
+            ),
+            child: SizedBox(
+              width: double.infinity,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    split.primary,
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                    style: const TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w600,
+                      height: 1.15,
+                    ),
                   ),
-                ),
+                  if (split.subtitle != null) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      split.subtitle!,
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                      style: const TextStyle(
+                        color: AppColors.textSecondary,
+                        fontSize: 16,
+                        height: 1.15,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 4),
+                  Text(
+                    t.displayArtist.isEmpty ? '—' : t.displayArtist,
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                    style: const TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 14,
+                      height: 1.15,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _formatTrackMeta(t),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                    style: const TextStyle(
+                      color: AppColors.textTertiary,
+                      fontSize: 14,
+                      height: 1.15,
+                      fontFeatures: [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: _PeoplePivots(track: t, onTap: onPivotTap),
-        ),
-      ],
+      ),
     );
   }
 }
 
 /// 130 × 130 album artwork tile shown at the far right of the playback
 /// header. Renders a placeholder square when no track is current.
-/// Horizontal row of clickable pivots derived from people mentioned
-/// on the currently-playing track (artist, co-artists, remixer,
-/// featured). Tapping a pivot routes through `onTap(name)` —
-/// upstream handler sets the library search query, so the table
-/// filters down to that name's tracks instantly. Dropping the
-/// query restores the prior view; nothing is rebuilt or re-indexed.
-///
-/// Rendered as a sibling of the "jump to current track" InkWell, not
-/// nested inside it, so chip taps and now-playing taps stay distinct
-/// hit zones.
-class _PeoplePivots extends StatelessWidget {
-  final Track track;
-  final void Function(String) onTap;
-
-  const _PeoplePivots({required this.track, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    final pivots = extractPeoplePivots(
-      artist: track.displayArtist,
-      title: track.displayTitle,
-    );
-    if (pivots.isEmpty) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(top: 6),
-      child: Wrap(
-        spacing: 6,
-        runSpacing: 4,
-        children: [
-          for (final name in pivots) _PivotChip(label: name, onTap: () => onTap(name)),
-        ],
-      ),
-    );
-  }
-}
-
-class _PivotChip extends StatelessWidget {
-  final String label;
-  final VoidCallback onTap;
-
-  const _PivotChip({required this.label, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: AppColors.surfaceAlt,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.zero,
-        side: const BorderSide(color: AppColors.border),
-      ),
-      child: InkWell(
-        onTap: onTap,
-        hoverColor: AppColors.hoverRow,
-        focusColor: AppColors.focusOverlay,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-          child: Text(
-            label,
-            style: const TextStyle(
-              color: AppColors.textPrimary,
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              height: 1.2,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 class _DeckArtwork extends StatelessWidget {
   final Track? track;
   final LibraryController controller;

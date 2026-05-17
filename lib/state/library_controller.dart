@@ -15,6 +15,7 @@ import '../models/reconciliation_summary.dart';
 import '../models/source.dart';
 import '../models/activity_event.dart';
 import '../models/track.dart';
+import '../widgets/delete_track_dialog.dart' show DeleteDecision;
 import '../services/audio_scanner.dart';
 import '../services/content_hash.dart';
 import '../services/content_hash_backfill.dart';
@@ -25,6 +26,7 @@ import '../services/library_save_manager.dart';
 import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
 import '../services/playback_engine.dart';
+import '../services/trash.dart';
 import '../utils/aggregated_track_view.dart';
 import '../utils/key_normalizer.dart';
 import '../utils/song_identity.dart';
@@ -254,8 +256,20 @@ class LibraryController extends ChangeNotifier {
   // string-prefixed every path). Now we recompute the whole map
   // once per `_libraryVersion` change and answer subsequent calls
   // in O(1).
-  Map<String, int>? _sourceCountCache;
-  int _sourceCountCacheVersion = -1;
+  // Per-source operational stats. One cached snapshot covers
+  // sidebar tile counts (`total`) AND status-bar contextual
+  // progress (`ready`, `enriching`, `waitingOnCloud`). All
+  // populated by a single walk of `_tracks` in
+  // `_computeAllSourceCounts`, so adding the new fields didn't
+  // introduce a second iteration pass — same O(N × subViews)
+  // cost, more useful output.
+  //
+  // Sub-views increment the same stats record as their parent's
+  // walk via the existing path-prefix branch, so progress inside
+  // a sub-view (e.g., Q under Afro:Tech:Deep) reflects only the
+  // tracks under that prefix — matching the user's mental scope.
+  Map<String, _SourceStats>? _sourceStatsCache;
+  int _sourceStatsCacheVersion = -1;
 
   // Cached library-wide tallies for the always-on status bar:
   // enriched (any metadata extracted), missing (rows surviving the
@@ -290,6 +304,60 @@ class LibraryController extends ChangeNotifier {
   // the user can see exactly what file is being processed instead
   // of just an opaque counter.
   String? _currentEnrichmentLabel;
+  String? _currentEnrichmentPath;
+
+  /// Wall-clock time of the last [_applyMetadata] completion.
+  /// Drives the "waiting on cloud" surfacing for the metadata
+  /// pipeline — if [_metadataProcessing] is true but no path has
+  /// completed in N seconds, isolates are almost certainly blocked
+  /// on Dropbox / iCloud placeholder materialization. Updates
+  /// every notify, so the elapsed-since-last-completion read in
+  /// `enrichmentSinceLastCompletion` is accurate to ~1 s.
+  DateTime? _lastEnrichmentCompletionAt;
+
+  /// Stale-threshold for the metadata pipeline. A foreground
+  /// scan finishes batch-of-50 local files in under a second; if
+  /// nothing's landed in 5 s the isolates are stuck in cloud-
+  /// materialisation purgatory and the status bar should narrate
+  /// that explicitly instead of looking frozen at `0 / 170`.
+  static const Duration _enrichmentStallThreshold = Duration(seconds: 5);
+
+  /// `null` when no enrichment has run yet OR the pipeline is
+  /// idle. Otherwise: time elapsed since the last successful
+  /// `_applyMetadata`. The status bar uses this to flip to a
+  /// "waiting on cloud" label once the duration exceeds the
+  /// stall threshold.
+  Duration? get enrichmentSinceLastCompletion {
+    final at = _lastEnrichmentCompletionAt;
+    if (at == null) return null;
+    return DateTime.now().difference(at);
+  }
+
+  /// `true` while the enrichment pipeline is actively processing
+  /// but hasn't completed a single path in [_enrichmentStallThreshold].
+  /// Drives the cloud-wait status-bar label so the user sees the
+  /// reason (Dropbox materialising files) instead of a frozen
+  /// `Enriching 0 / 170`.
+  bool get isEnrichmentStalled {
+    if (!_metadataProcessing) return false;
+    final since = enrichmentSinceLastCompletion;
+    if (since == null) return false;
+    return since >= _enrichmentStallThreshold;
+  }
+
+  /// Best-effort cloud-provider label derived from the in-flight
+  /// enrichment file. Reads the full path (not just the basename)
+  /// because the cloud-host marker lives in the parent directory
+  /// tree (`/Library/CloudStorage/Dropbox-…` etc.). Same detection
+  /// set as the hash backfill's cloud-label.
+  String get currentEnrichmentCloudLabel {
+    final p = _currentEnrichmentPath ?? '';
+    if (p.contains('/Library/CloudStorage/Dropbox')) return 'Dropbox';
+    if (p.contains('/Library/CloudStorage/GoogleDrive')) return 'Google Drive';
+    if (p.contains('/Library/CloudStorage/OneDrive')) return 'OneDrive';
+    if (p.contains('/Library/Mobile Documents')) return 'iCloud';
+    return 'cloud';
+  }
 
   // Files whose tag-parser failed (audio_metadata_reader threw, or
   // returned no parseable header). We remember them at session
@@ -1172,51 +1240,101 @@ class LibraryController extends ChangeNotifier {
     }
   }
 
+  Timer? _enrichmentStallTicker;
+
+  /// `true` when [path] resolves to a cloud-storage mount where
+  /// reads can block for tens of seconds (placeholder
+  /// materialisation). Same detection set as
+  /// [currentEnrichmentCloudLabel] / [currentHashCloudLabel] so
+  /// the operational vocabulary stays consistent across pipelines.
+  ///
+  /// Used by `_processMetadataQueue` to throttle isolate
+  /// concurrency on cloud paths — see the per-wave logic there.
+  static bool _isCloudPath(String path) {
+    return path.contains('/Library/CloudStorage/Dropbox') ||
+        path.contains('/Library/CloudStorage/GoogleDrive') ||
+        path.contains('/Library/CloudStorage/OneDrive') ||
+        path.contains('/Library/Mobile Documents');
+  }
+
   Future<void> _processMetadataQueue() async {
     if (_metadataProcessing) return;
     _metadataProcessing = true;
+    _lastEnrichmentCompletionAt = DateTime.now();
+    // 1 Hz tick so the elapsed-since-last-completion clock
+    // advances visibly in the status bar even when isolates are
+    // blocked on Dropbox materialisation. Cancelled in the
+    // `finally` below when processing ends.
+    _enrichmentStallTicker?.cancel();
+    _enrichmentStallTicker = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) {
+        if (!_metadataProcessing) return;
+        notifyListeners();
+      },
+    );
     notifyListeners();
     debugPrint('[meta] processor starting (queue=${_enrichmentQueue.length})');
     try {
-      // Process small files first. On Dropbox cloud-only libraries
-      // a 50MB AIFF can take 7s to materialise but a 6MB MP3
-      // returns in well under 1s — sorting size-asc means the user
-      // sees thousands of fast files populate immediately while
-      // the slow stragglers come in the background.
+      // Two-key sort: local paths first, then by filesize asc
+      // within each storage class. Cloud paths sink to the back
+      // of the queue so the user sees thousands of fast local
+      // results land before any cloud-hydration delay starts.
+      // Within a storage class, smallest-first keeps the
+      // "thousands of small wins arriving steadily" feel.
       _enrichmentQueue.sort((a, b) {
+        final aCloud = _isCloudPath(a);
+        final bCloud = _isCloudPath(b);
+        if (aCloud != bCloud) return aCloud ? 1 : -1;
         final sa = _tracksByPath[a]?.filesize ?? 0;
         final sb = _tracksByPath[b]?.filesize ?? 0;
         return sa.compareTo(sb);
       });
 
-      // Run several batches in parallel. Each `compute()` call
-      // spawns its own isolate — the OS pipelines the per-file
-      // syscalls across them. Concurrency was 4 (tuned for
-      // throttled Dropbox FileProvider downloads); on local
-      // files it can go higher because the bottleneck shifts
-      // from network → disk + isolate scheduling. 8 fully
-      // saturates a modern Mac's perf cores without exhausting
-      // memory (8 isolates × ~50 files of buffered tag-header
-      // bytes is still tiny). Throughput typically scales near
-      // linear up to core count.
-      const concurrency = 8;
-
       while (_enrichmentQueue.isNotEmpty) {
+        // Hydration-aware scheduling. Determine if the NEXT wave
+        // will be processing cloud paths — if so, throttle hard:
+        //   - concurrency = 2 (was 8). Parallel hydration of 8
+        //     Dropbox AIFFs saturates the network, makes nothing
+        //     visibly complete, and burns CPU on stalled isolates.
+        //     2 concurrent reads let one finish while the next is
+        //     already in flight; user sees one row brighten,
+        //     then another, then another — steady visible
+        //     progress instead of a giant batched burst.
+        //   - batch size = 1. Each isolate processes one file at
+        //     a time and returns. Without this, a single
+        //     blocked AIFF would freeze 50 results behind it.
+        //     Isolate-spawn overhead (~50 ms) is negligible
+        //     against per-file Dropbox waits of 5–30 s.
+        // Local paths keep the original 8 × 50 budget — they
+        // benefit from amortising isolate-spawn cost across
+        // many cheap reads. The queue sort above puts local
+        // first, so cloud throttling only kicks in once the
+        // local backlog drains.
+        final wavePeekPath = _enrichmentQueue.first;
+        final isCloudWave = _isCloudPath(wavePeekPath);
+        final concurrency = isCloudWave ? 2 : 8;
+        final batchSize = isCloudWave ? 1 : _metadataBatchSize;
+
         final waveBatches = <List<String>>[];
         for (var i = 0;
             i < concurrency && _enrichmentQueue.isNotEmpty;
             i++) {
           final batch = _enrichmentQueue
-              .take(_metadataBatchSize)
+              .take(batchSize)
               .toList(growable: false);
           _enrichmentQueue.removeRange(0, batch.length);
-          // These paths are leaving the queue. Drop them from the
-          // dedup set so a future viewport report can re-enqueue
-          // them if metadata extraction failed and didn't stamp
-          // `metadata_read_at`.
-          for (final p in batch) {
-            _inEnrichmentQueue.remove(p);
-          }
+          // INTENTIONALLY do NOT remove batch paths from
+          // `_inEnrichmentQueue` here. They're still IN FLIGHT —
+          // the wave is awaiting `extractBatch` below. A
+          // concurrent `enrichSource` (from a viewport report or
+          // another scan completion) would otherwise see these
+          // paths as "not queued, not yet enriched" and re-enqueue
+          // them, double-counting. The user reported "87 songs,
+          // 170 backlog" — that was exactly this bug. The dedup
+          // set now represents "in the pipeline at all" (queued
+          // OR in-flight), and paths get removed only after their
+          // results land in `_applyMetadata`.
           waveBatches.add(batch);
         }
         final waveSw = Stopwatch()..start();
@@ -1249,15 +1367,32 @@ class LibraryController extends ChangeNotifier {
             }
             // Surface a representative filename from this batch
             // for the status bar — rotates as batches finish.
+            // Full path retained on `_currentEnrichmentPath` so
+            // `currentEnrichmentCloudLabel` can detect Dropbox /
+            // iCloud / etc. (the basename alone wouldn't match).
             if (results.isNotEmpty) {
               final p = results.first.path;
               final i = p.lastIndexOf(sep);
               _currentEnrichmentLabel = i < 0 ? p : p.substring(i + 1);
+              _currentEnrichmentPath = p;
             }
+            // A batch landing means the pipeline is making
+            // progress — reset the stall clock so the cloud-wait
+            // label drops back to plain "Enriching".
+            _lastEnrichmentCompletionAt = DateTime.now();
             for (final m in results) {
               final t = _trackByPath(m.path);
-              if (t == null) continue;
-              _applyMetadata(t, m);
+              if (t != null) {
+                _applyMetadata(t, m);
+              }
+              // Path is no longer in flight — clear from the
+              // dedup set so future enrichSource calls can
+              // re-enqueue it if needed (e.g., new viewport
+              // report after a stat-change reset its
+              // `metadata_read_at`). Failed reads still stamp
+              // `metadataReadAt`, so `_enqueueIfNeeded` skips
+              // them; this just drops the in-flight marker.
+              _inEnrichmentQueue.remove(m.path);
             }
             try {
               await repo.updateMetadataBatch(results);
@@ -1281,6 +1416,10 @@ class LibraryController extends ChangeNotifier {
       _metadataDoneThisRun = 0;
       _metadataTotalThisRun = 0;
       _currentEnrichmentLabel = null;
+      _currentEnrichmentPath = null;
+      _lastEnrichmentCompletionAt = null;
+      _enrichmentStallTicker?.cancel();
+      _enrichmentStallTicker = null;
       _inEnrichmentQueue.clear();
       notifyListeners();
       debugPrint('[meta] processor idle');
@@ -1447,6 +1586,16 @@ class LibraryController extends ChangeNotifier {
     await repo.setSetting('utility_rail_locked', locked ? '1' : '0');
   }
   String? get selectedSourceId => _selectedSourceId;
+
+  /// The currently-selected source object, or `null` when "All
+  /// Tracks" is selected (or the source ID resolved to something
+  /// no longer in `_sources`). Status bar uses this to render
+  /// the contextual `Q · enriching · 32 / 87 ready` label.
+  Source? get selectedSource {
+    final id = _selectedSourceId;
+    if (id == null) return null;
+    return _sourceById(id);
+  }
   String get searchQuery => _searchQuery;
   bool get unreviewedOnly => _unreviewedOnly;
   bool get showArtwork => _showArtwork;
@@ -1555,6 +1704,75 @@ class LibraryController extends ChangeNotifier {
     _replaceTracks(allTracks);
     _markLibraryDirty();
     notifyListeners();
+  }
+
+  /// Intentional in-app deletion: move the listed files to the
+  /// macOS Trash, remove their `indexed_files` rows, optionally
+  /// clear favorite on every variant sharing the song's intel uid.
+  ///
+  /// Distinct from `purgeMissingTracks` in three ways:
+  /// 1. The files are still on disk when this is called — we
+  ///    relocate them to ~/.Trash via NSFileManager (recoverable
+  ///    from Finder). The Review-missing path operates on files
+  ///    already gone from disk.
+  /// 2. We can selectively clear `tracks.favorite` for the song —
+  ///    the dialog's "Remove Favorite" radio surfaces this when
+  ///    the song was favorited and surviving variants remain.
+  /// 3. Intel row stays in `tracks` regardless. The user can
+  ///    re-add the file later and history reconnects.
+  ///
+  /// Returns the count of files successfully moved to Trash. A
+  /// trash failure on one path doesn't abort the rest — each
+  /// failure is logged and the surviving deletions proceed.
+  Future<int> deleteTracksToTrash(DeleteDecision decision) async {
+    if (decision.paths.isEmpty) return 0;
+    final trashed = <String>[];
+    for (final p in decision.paths) {
+      final ok = await TrashService.moveToTrash(p);
+      if (ok) {
+        trashed.add(p);
+      } else {
+        debugPrint('[delete] trash failed, skipping: $p');
+      }
+    }
+    if (trashed.isEmpty) return 0;
+
+    // DB cleanup + audit events. Same path as the missing-row
+    // purge so the events table sees one `purged` per row.
+    await repo.purgeIndexedFiles(trashed);
+
+    // Conditional FAV cascade — only when the dialog flagged
+    // `clearFavorite` AND the song actually had intel to flip.
+    // Pattern mirrors `toggleFavorite`: write the canonical intel
+    // row, then propagate to every in-memory variant pointing at
+    // the same intel uid (including ones not in this delete batch).
+    if (decision.clearFavorite) {
+      try {
+        await repo.updateIntelligence(
+          intelUid: decision.intelUid,
+          favorite: false,
+        );
+        for (final t in _tracks) {
+          if (t.intelUid == decision.intelUid) {
+            t.favorite = false;
+          }
+        }
+      } catch (e) {
+        debugPrint(
+          '[delete] favorite-clear write failed (intel=${decision.intelUid}): $e',
+        );
+      }
+    }
+
+    // Drop trashed paths from in-memory state. Reload from DB
+    // would also work but is heavier for a small batch; explicit
+    // pruning keeps the hot path tight.
+    final trashedSet = trashed.toSet();
+    _removeTracksWhere((t) => trashedSet.contains(t.path));
+
+    _markLibraryDirty();
+    notifyListeners();
+    return trashed.length;
   }
 
   // ── App-initiated Move / Copy orchestration ─────────────────
@@ -2088,34 +2306,82 @@ class LibraryController extends ChangeNotifier {
 
   int sourceTrackCount(String sourceId) {
     // Per-source counts depend only on which tracks belong to which
-    // source, not the user's filter. Key on `_dataVersion` so
-    // sidebar tile counts stay valid across source / search / sort
-    // changes.
-    if (_sourceCountCache == null ||
-        _sourceCountCacheVersion != _dataVersion) {
-      _sourceCountCache = _computeAllSourceCounts();
-      _sourceCountCacheVersion = _dataVersion;
+    // source, not the user's filter. Reads from the same cached
+    // walk that produces ready / enriching / waitingOnCloud — one
+    // pass populates everything.
+    _ensureSourceStats();
+    return _sourceStatsCache?[sourceId]?.total ?? 0;
+  }
+
+  /// Contextual operational progress for a single source. Powers
+  /// the status bar's source-scoped enrichment cluster ("Q ·
+  /// enriching · 32 / 87 ready · 18 waiting on Dropbox"). Returns
+  /// `null` when [sourceId] is unknown.
+  ///
+  /// Sub-views (filtered lenses on a parent's tracks) get their
+  /// own stats from the same path-prefix match used elsewhere in
+  /// the codebase, so progress reads as "what's happening to the
+  /// tracks I'm currently looking at" rather than the parent's
+  /// globals.
+  ({int total, int ready, int enriching, int waitingOnCloud})?
+      progressForSource(String sourceId) {
+    _ensureSourceStats();
+    final stats = _sourceStatsCache?[sourceId];
+    if (stats == null) return null;
+    return (
+      total: stats.total,
+      ready: stats.ready,
+      enriching: stats.enriching,
+      waitingOnCloud: stats.waitingOnCloud,
+    );
+  }
+
+  void _ensureSourceStats() {
+    if (_sourceStatsCache == null ||
+        _sourceStatsCacheVersion != _dataVersion) {
+      _sourceStatsCache = _computeAllSourceCounts();
+      _sourceStatsCacheVersion = _dataVersion;
     }
-    return _sourceCountCache![sourceId] ?? 0;
   }
 
   /// Walk the in-memory tracks once and bucket per source. Sub-views
-  /// (filtered lenses) get their own count from a path-prefix match
+  /// (filtered lenses) get their own stats from a path-prefix match
   /// against the parent's tracks. Called once per library-version
   /// change; subsequent reads are O(1).
-  Map<String, int> _computeAllSourceCounts() {
-    final counts = <String, int>{};
+  ///
+  /// Records four counters per source in the same pass:
+  ///   - `total` — every visible track in scope
+  ///   - `ready` — `EnrichmentState.ready`
+  ///   - `enriching` — `EnrichmentState.enriching`
+  ///   - `waitingOnCloud` — `enriching` AND path is cloud-backed
+  ///     (the status bar appends a "N waiting on Dropbox" note
+  ///     when this is nonzero so the user sees the external cause)
+  Map<String, _SourceStats> _computeAllSourceCounts() {
+    final stats = <String, _SourceStats>{};
     final subViews = [for (final s in _sources) if (s.isSubView) s];
     for (final t in _tracks) {
-      counts[t.sourceId] = (counts[t.sourceId] ?? 0) + 1;
+      final isEnriching = t.enrichmentState == EnrichmentState.enriching;
+      final isReady = t.enrichmentState == EnrichmentState.ready;
+      final isWaitingOnCloud = isEnriching && _isCloudPath(t.path);
+      final ownerStats = stats[t.sourceId] ??= _SourceStats();
+      ownerStats.bump(
+        isReady: isReady,
+        isEnriching: isEnriching,
+        isWaitingOnCloud: isWaitingOnCloud,
+      );
       for (final sv in subViews) {
         if (sv.parentSourceId == t.sourceId &&
             t.path.startsWith(sv.pathPrefix!)) {
-          counts[sv.id] = (counts[sv.id] ?? 0) + 1;
+          final subStats = stats[sv.id] ??= _SourceStats();
+          subStats.bump(
+            isReady: isReady,
+            isEnriching: isEnriching,
+            isWaitingOnCloud: isWaitingOnCloud,
+          );
         }
       }
     }
-    return counts;
+    return stats;
   }
 
   Track? get currentTrack {
@@ -4016,6 +4282,59 @@ class LibraryController extends ChangeNotifier {
     return summary;
   }
 
+  /// Graceful reset of background work for Flutter hot reload.
+  /// Called from `_HomeScreenState.reassemble()` whenever the user
+  /// hits `r` in the running `flutter run` session.
+  ///
+  /// What hot reload breaks if we don't intervene:
+  ///   - `compute()` isolates in flight die with "Computation ended
+  ///     without result". The scanner, metadata extractor, and
+  ///     content-hash backfill all use compute(); a reload landing
+  ///     mid-call surfaces as a `[scan] FAILED` log line and a brief
+  ///     UI hang while the cascading watcher rescans pile up.
+  ///   - Pending watcher-debounce timers reference closures that
+  ///     may have changed under them; their next fire could call
+  ///     into a stale code path.
+  ///   - The backfill worker's scheduler timer survives but its
+  ///     class body might have been edited; on the next fire it
+  ///     could behave inconsistently.
+  ///
+  /// Cancelling these gives the post-reload state a clean room
+  /// to rebuild from. Background work re-arms naturally:
+  ///   - Watchers continue firing (the streams survived); the
+  ///     next event re-arms the quiescence debounce.
+  ///   - The backfill worker auto-restarts at the next scan-end
+  ///     boundary (see `_scanIntoSource`'s `finally` block).
+  ///   - Any track the user clicks to play kicks the on-demand
+  ///     enrichment hook so foreground interactions stay snappy.
+  ///
+  /// Safe to call multiple times in quick succession (idempotent).
+  void handleHotReload() {
+    debugPrint('[reassemble] pausing background work for hot reload');
+    // Backfill: cancel cleanly. Restarts on next scan-end.
+    _backfillWorker.cancel();
+    // Drop pending watcher debounces — better to lose one quiesced
+    // rescan than to fire it through a half-reloaded code path.
+    for (final t in _watcherDebounce.values) {
+      t.cancel();
+    }
+    _watcherDebounce.clear();
+    _watcherFirstEventAt.clear();
+    // Clear the enrichment stall ticker. If `_metadataProcessing`
+    // is still true (an isolate batch in flight pre-reload), let
+    // the processor's own `finally` block tear down on next tick —
+    // we just stop the 1Hz UI notify so the post-reload frame
+    // doesn't show stale "waiting N seconds" counters.
+    _enrichmentStallTicker?.cancel();
+    _enrichmentStallTicker = null;
+    // Dismiss any reconciliation banner mid-fade so the post-reload
+    // UI doesn't surface a half-stale narration.
+    _reconciliationSummary = null;
+    _reconciliationTimer?.cancel();
+    _reconciliationTimer = null;
+    notifyListeners();
+  }
+
   @override
   void dispose() {
     _flushTimer?.cancel();
@@ -4050,6 +4369,29 @@ String _displayNameFor(String path) {
     if (segs[i].isNotEmpty) return segs[i];
   }
   return path;
+}
+
+/// Per-source operational stats — single struct populated in the
+/// `_computeAllSourceCounts` walk and consumed by both the sidebar
+/// (`total`) and the status-bar contextual cluster (`ready`,
+/// `enriching`, `waitingOnCloud`). Mutable for cheap accumulation
+/// during the walk; widgets only read it.
+class _SourceStats {
+  int total = 0;
+  int ready = 0;
+  int enriching = 0;
+  int waitingOnCloud = 0;
+
+  void bump({
+    required bool isReady,
+    required bool isEnriching,
+    required bool isWaitingOnCloud,
+  }) {
+    total++;
+    if (isReady) ready++;
+    if (isEnriching) enriching++;
+    if (isWaitingOnCloud) waitingOnCloud++;
+  }
 }
 
 /// Thin shim around `WidgetsBindingObserver` so the controller can

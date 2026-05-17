@@ -61,8 +61,33 @@ bool sameSongIdentity(Track a, Track b) {
   if (a.fingerprint.isNotEmpty && a.fingerprint == b.fingerprint) {
     return true;
   }
-  if (a.title.isEmpty || a.artist.isEmpty) return false;
-  if (b.title.isEmpty || b.artist.isEmpty) return false;
+  // Asymmetric-tagging fallback. When exactly ONE side lacks tags
+  // — typically a freshly-added file whose metadata enrichment
+  // hasn't completed yet — pair via basename + duration. Common
+  // real-world case: user adds an MP3 to a folder that already
+  // has an enriched AIFF sibling of the same song. The MP3 sits
+  // with empty title/artist for the few seconds (or minutes, on
+  // slow Dropbox) it takes for the enrichment pipeline to reach
+  // it; during that window the strict 4-field match silently
+  // splits the bucket and the user can't see the MP3 next to the
+  // AIFFs in the variant picker / move dialog / etc.
+  //
+  // The asymmetric guard ("exactly one untagged") prevents two
+  // unrelated, both-untagged files with coincidentally similar
+  // names from merging. Two untagged tracks STILL fail to pair —
+  // identity is not asserted until at least one side carries real
+  // tags. Once the pipeline catches up, the match upgrades to the
+  // strict path and stays.
+  final aTagged = a.title.isNotEmpty && a.artist.isNotEmpty;
+  final bTagged = b.title.isNotEmpty && b.artist.isNotEmpty;
+  if (aTagged != bTagged) {
+    final aSecs = a.duration.inSeconds;
+    final bSecs = b.duration.inSeconds;
+    if (aSecs == 0 || bSecs == 0) return false;
+    if (aSecs != bSecs) return false;
+    return _basenameNoExt(a.filename) == _basenameNoExt(b.filename);
+  }
+  if (!aTagged) return false; // both untagged → cannot pair
   if (a.duration.inSeconds != b.duration.inSeconds) return false;
   if (a.title != b.title) return false;
   if (a.artist != b.artist) return false;
@@ -81,24 +106,38 @@ bool sameSongIdentity(Track a, Track b) {
 /// they round-trip through the table without being silently dropped.
 List<List<Track>> groupBySongIdentity(Iterable<Track> tracks) {
   final buckets = <List<Track>>[];
-  // Two parallel indices, mirroring the two-tier match rule in
+  // Three parallel indices, mirroring the match rules in
   // `sameSongIdentity`:
   //   - byKey: primary key (manual override or 4-field) → bucket
   //   - byFingerprint: file-content equivalence hash → bucket
-  // A track joins an existing bucket if its key matches, else if
-  // its fingerprint matches, else creates a new bucket. When a
-  // track joins (or creates) a bucket, both its key and its
-  // fingerprint are registered to that bucket so future tracks
-  // matching by either signal follow it in.
+  //   - byNameSec: basename-noext + duration in seconds → bucket
+  //     (the asymmetric-tagging fallback; only consulted when the
+  //     other two signals miss)
+  // A track joins an existing bucket if any of those indexes points
+  // to one; otherwise it creates a new bucket. When a track joins
+  // (or creates) a bucket, all three of its signals get registered
+  // so future tracks matching by any of them follow it in.
   final byKey = <String, int>{};
   final byFingerprint = <String, int>{};
+  final byNameSec = <String, int>{};
+
+  String? nameSecKey(Track t) {
+    final secs = t.duration.inSeconds;
+    if (secs == 0) return null;
+    return '${_basenameNoExt(t.filename)}|$secs';
+  }
 
   for (final t in tracks) {
     final key = songIdentityKey(t);
+    final ns = nameSecKey(t);
+    final tagged = t.title.isNotEmpty && t.artist.isNotEmpty;
     int? bucketIdx;
     if (key != null) bucketIdx = byKey[key];
     if (bucketIdx == null && t.fingerprint.isNotEmpty) {
       bucketIdx = byFingerprint[t.fingerprint];
+    }
+    if (bucketIdx == null && ns != null) {
+      bucketIdx = byNameSec[ns];
     }
     if (bucketIdx == null) {
       bucketIdx = buckets.length;
@@ -107,6 +146,16 @@ List<List<Track>> groupBySongIdentity(Iterable<Track> tracks) {
     buckets[bucketIdx].add(t);
     if (key != null) byKey[key] = bucketIdx;
     if (t.fingerprint.isNotEmpty) byFingerprint[t.fingerprint] = bucketIdx;
+    // Only TAGGED tracks register their own basename+seconds key.
+    // Untagged tracks can JOIN a name+secs bucket (when a tagged
+    // sibling registered it earlier), but they don't seed one
+    // themselves — otherwise two unrelated untagged files with
+    // coincidentally identical names + durations would silently
+    // merge, violating the "at least one side must be tagged"
+    // rule the matcher enforces. Once enrichment lands a tagged
+    // sibling, it registers the key and future untagged
+    // discoveries pair correctly.
+    if (tagged && ns != null) byNameSec[ns] = bucketIdx;
   }
   return buckets;
 }

@@ -128,20 +128,125 @@ void main() {
       expect(sameSongIdentity(a, b), isFalse);
     });
 
-    test('empty title on either side prevents any match', () {
-      final empty = _t(filename: 'x.mp3', title: '', artist: 'A');
-      final filled = _t(filename: 'x.aiff', title: 'T', artist: 'A');
-      expect(sameSongIdentity(empty, filled), isFalse);
-      // Two empty-title tracks also don't match — without metadata
-      // there's no song identity to assert.
-      final empty2 = _t(filename: 'x.aiff', title: '', artist: 'A');
-      expect(sameSongIdentity(empty, empty2), isFalse);
+    test(
+        'asymmetric-tagging fallback: untagged track pairs with tagged '
+        'sibling sharing basename + duration', () {
+      // Real-world case: user adds an MP3 to a folder that already
+      // has an enriched AIFF of the same song. The MP3 sits with
+      // empty title/artist until the enrichment pipeline reaches
+      // it; the matcher must pair them during that window so the
+      // variant picker / move dialog show all variants.
+      final untaggedMp3 = _t(
+        filename: 'x.mp3',
+        title: '',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
+      final taggedAiff = _t(
+        filename: 'x.aiff',
+        title: 'T',
+        artist: 'A',
+        duration: const Duration(seconds: 300),
+      );
+      expect(sameSongIdentity(untaggedMp3, taggedAiff), isTrue);
+      // Symmetric — order doesn't matter.
+      expect(sameSongIdentity(taggedAiff, untaggedMp3), isTrue);
     });
 
-    test('empty artist on either side prevents any match', () {
-      final empty = _t(filename: 'x.mp3', title: 'T', artist: '');
-      final filled = _t(filename: 'x.aiff', title: 'T', artist: 'A');
-      expect(sameSongIdentity(empty, filled), isFalse);
+    test('asymmetric fallback requires duration match', () {
+      final untagged = _t(
+        filename: 'x.mp3',
+        title: '',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
+      final taggedDifferent = _t(
+        filename: 'x.aiff',
+        title: 'T',
+        artist: 'A',
+        duration: const Duration(seconds: 240),
+      );
+      expect(sameSongIdentity(untagged, taggedDifferent), isFalse,
+          reason: 'untagged side without matching duration must not pair');
+    });
+
+    test('asymmetric fallback requires basename match', () {
+      final untagged = _t(
+        filename: 'x.mp3',
+        title: '',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
+      final taggedDifferentName = _t(
+        filename: 'y.aiff',
+        title: 'T',
+        artist: 'A',
+        duration: const Duration(seconds: 300),
+      );
+      expect(sameSongIdentity(untagged, taggedDifferentName), isFalse,
+          reason: 'untagged side with different basename must not pair');
+    });
+
+    test('asymmetric fallback rejects degenerate duration', () {
+      // duration == 0 means we don't trust the seconds signal yet
+      // (file size / format unknown, mid-scan). The fallback must
+      // not green-light a match on basename alone.
+      final untagged = _t(
+        filename: 'x.mp3',
+        title: '',
+        artist: '',
+        duration: Duration.zero,
+      );
+      final tagged = _t(
+        filename: 'x.aiff',
+        title: 'T',
+        artist: 'A',
+        duration: const Duration(seconds: 300),
+      );
+      expect(sameSongIdentity(untagged, tagged), isFalse);
+    });
+
+    test('two untagged tracks still cannot pair', () {
+      // Without any tagged anchor, identity is not assertible.
+      // The asymmetric fallback fires only when EXACTLY ONE side
+      // is tagged — protects against two unrelated, both-untagged
+      // files with coincidentally similar names merging.
+      final a = _t(
+        filename: 'x.mp3',
+        title: '',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
+      final b = _t(
+        filename: 'x.aiff',
+        title: '',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
+      expect(sameSongIdentity(a, b), isFalse);
+    });
+
+    test('empty artist on tagged side falls through to strict path', () {
+      // When a track has a title but no artist, it's treated as
+      // "untagged" for the purposes of the asymmetric fallback
+      // (the matcher requires BOTH title AND artist). Pairing then
+      // becomes valid only via name+secs against a fully-tagged
+      // counterpart.
+      final partialMeta = _t(
+        filename: 'x.mp3',
+        title: 'T',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
+      final filled = _t(
+        filename: 'x.aiff',
+        title: 'T',
+        artist: 'A',
+        duration: const Duration(seconds: 300),
+      );
+      expect(sameSongIdentity(partialMeta, filled), isTrue,
+          reason: 'partial-meta side is treated as untagged and pairs '
+              'via name + duration with the fully-tagged counterpart');
     });
 
     test('different filesize / uid / path do not block a match', () {
@@ -548,18 +653,64 @@ void main() {
       expect(result.first.map((t) => t.uid), ['second', 'first', 'third']);
     });
 
-    test('tracks with empty title/artist each get their own bucket', () {
-      final tagged = _t(filename: 'x.mp3', title: 'T', artist: 'A');
-      final untagged1 = _t(filename: 'y.mp3', title: '', artist: '');
-      final untagged2 = _t(filename: 'y.aiff', title: '', artist: '');
+    test('two untagged tracks (no tagged anchor) each get their own bucket',
+        () {
+      // Without any tagged sibling registering a name+secs key,
+      // two untagged tracks can't merge — the basename+duration
+      // signal is too weak on its own (different songs with the
+      // same name + duration would silently fuse). The matcher
+      // requires at least one TAGGED side to anchor the bucket.
+      final tagged = _t(
+        filename: 'x.mp3',
+        title: 'T',
+        artist: 'A',
+        duration: const Duration(seconds: 200),
+      );
+      final untagged1 = _t(
+        filename: 'y.mp3',
+        title: '',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
+      final untagged2 = _t(
+        filename: 'y.aiff',
+        title: '',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
       final result = groupBySongIdentity([tagged, untagged1, untagged2]);
-      // Three buckets — the two untagged tracks must NOT collapse,
-      // even though they share basename + duration. Without metadata
-      // there's no song identity to assert.
       expect(result, hasLength(3));
       expect(result[0], [tagged]);
       expect(result[1], [untagged1]);
       expect(result[2], [untagged2]);
+    });
+
+    test(
+        'asymmetric-tagging fallback: untagged sibling joins tagged '
+        'bucket via basename + duration', () {
+      // Real-world case from the user: AIFF was enriched first,
+      // then user re-added an MP3 of the same song. While the
+      // MP3 sits with empty title/artist (waiting for the
+      // metadata pipeline), it must still bucket with the AIFF
+      // so the variant picker / move dialog / table grouping
+      // reflect all variants.
+      final taggedAiff = _t(
+        filename: 'song.aiff',
+        title: 'Song',
+        artist: 'Artist',
+        duration: const Duration(seconds: 300),
+      );
+      final untaggedMp3 = _t(
+        filename: 'song.mp3',
+        title: '',
+        artist: '',
+        duration: const Duration(seconds: 300),
+      );
+      // Order matters less than the asymmetric pairing logic:
+      // tagged first registers the name+secs key, untagged joins.
+      final result = groupBySongIdentity([taggedAiff, untaggedMp3]);
+      expect(result, hasLength(1));
+      expect(result.first.length, 2);
     });
 
     test('mixed scenario — realistic library slice', () {

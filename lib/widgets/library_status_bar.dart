@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../models/source.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import 'review_missing_dialog.dart';
@@ -88,15 +89,95 @@ class _OperationState {
   });
 }
 
+/// Source-scoped enrichment status. Renders the user-stated target:
+///
+///   Q · enriching · 32 / 87 ready   18 waiting on Dropbox
+///
+/// The progress bar reflects the source's ready/total ratio
+/// (steady, library-completion view) rather than the run's
+/// done/total (which can balloon under re-queue / large discovery).
+/// Stall narration still applies: when the global isolate pool
+/// is wedged on cloud reads, we surface the cloud-wait suffix
+/// alongside the source name so the operational vocabulary stays
+/// consistent across pipelines.
+_OperationState _contextualEnrichmentState(
+  LibraryController c,
+  Source selected,
+  ({int total, int ready, int enriching, int waitingOnCloud}) progress,
+) {
+  final ratio = progress.total == 0
+      ? null
+      : (progress.ready / progress.total).clamp(0.0, 1.0);
+  // Subject text: lead with the "N waiting on Dropbox" call-out
+  // when relevant — that's the user-facing reason this source's
+  // progress is moving slowly. When nothing is cloud-blocked,
+  // fall back to the rotating filename so the user still sees
+  // *what* is being processed right now.
+  final String? subject;
+  if (progress.waitingOnCloud > 0) {
+    subject =
+        '${progress.waitingOnCloud} waiting on ${c.currentEnrichmentCloudLabel}';
+  } else {
+    subject = c.currentEnrichmentLabel;
+  }
+  final String label;
+  if (c.isEnrichmentStalled) {
+    final secs = c.enrichmentSinceLastCompletion?.inSeconds ?? 0;
+    label = '${selected.displayName} · enriching · '
+        'waiting on ${c.currentEnrichmentCloudLabel} · ${secs}s';
+  } else {
+    label = '${selected.displayName} · enriching';
+  }
+  return _OperationState(
+    label: label,
+    subject: subject,
+    progress: ratio,
+    done: progress.ready,
+    total: progress.total,
+  );
+}
+
 _OperationState? _resolveOperation(LibraryController c) {
   if (c.isScanning) {
     return const _OperationState(label: 'Scanning library');
   }
   if (c.isMetadataProcessing && c.metadataProgressTotal > 0) {
+    // Contextual scope: when a source is selected AND it has
+    // active enrichment of its own, swap the label to source-
+    // scoped progress. The activity strip stays library-global —
+    // these two surfaces deliberately answer different questions
+    // ("what's true across the library" vs "what's happening in
+    // my current view"). The user's mental scope matches the
+    // sidebar selection, so the status bar should too.
+    final selected = c.selectedSource;
+    if (selected != null) {
+      final progress = c.progressForSource(selected.id);
+      if (progress != null && progress.enriching > 0) {
+        return _contextualEnrichmentState(c, selected, progress);
+      }
+    }
+
+    // Global fallback — no source selected, or selected source
+    // has no enrichment activity (work happening elsewhere).
     final done = c.metadataProgressDone;
     final total = c.metadataProgressTotal;
+    // Stall narration. When isolate workers haven't completed a
+    // path in N seconds, they're almost certainly blocked on
+    // cloud-storage materialisation (Dropbox / iCloud restoring
+    // a placeholder, large AIFF download). Swap the label so
+    // the user sees the EXTERNAL reason ("Waiting on Dropbox ·
+    // 14s") instead of an apparently-frozen `Enriching 0/170`.
+    // Mirrors the hash-backfill cloud-wait pattern so the
+    // operational vocabulary is consistent across pipelines.
+    final String label;
+    if (c.isEnrichmentStalled) {
+      final secs = c.enrichmentSinceLastCompletion?.inSeconds ?? 0;
+      label = 'Enriching · waiting on ${c.currentEnrichmentCloudLabel} · ${secs}s';
+    } else {
+      label = 'Enriching';
+    }
     return _OperationState(
-      label: 'Enriching',
+      label: label,
       subject: c.currentEnrichmentLabel,
       progress: total == 0 ? null : (done / total).clamp(0.0, 1.0),
       done: done,

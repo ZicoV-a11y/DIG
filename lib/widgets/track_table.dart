@@ -7,6 +7,7 @@ import '../models/track.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import '../utils/file_format.dart';
+import 'delete_track_dialog.dart';
 import 'link_track_dialog.dart';
 import 'move_copy_dialog.dart';
 import 'track_artwork.dart';
@@ -996,6 +997,16 @@ class _TrackRow extends StatelessWidget {
       ));
     }
 
+    // Destructive group at the bottom, separated by its own divider
+    // so the eye sees a clear visual break between reorganisational
+    // actions (Move/Copy) and trash. Hidden on unavailable rows —
+    // there's nothing on disk to trash for a file the system
+    // already marked missing.
+    if (track.isAvailable) {
+      items.add(const PopupMenuDivider(height: 1));
+      items.add(_deleteMenuItem());
+    }
+
     final result = await showMenu<String>(
       context: context,
       position: RelativeRect.fromRect(
@@ -1113,6 +1124,55 @@ class _TrackRow extends StatelessWidget {
               '${outcome.succeededDestNames.length}, failed '
               '${outcome.failures.length}: '
               '${outcome.failures.first.reason}',
+            ),
+            backgroundColor: AppColors.favorite,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    } else if (result == 'delete' && context.mounted) {
+      final decision = await showDeleteTrackDialog(
+        context: context,
+        controller: controller,
+        track: track,
+      );
+      if (decision == null) return;
+      if (!context.mounted) return;
+      final trashed = await controller.deleteTracksToTrash(decision);
+      if (!context.mounted) return;
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      if (trashed == decision.paths.length) {
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              trashed == 1
+                  ? 'Moved 1 file to Trash'
+                  : 'Moved $trashed files to Trash',
+            ),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      } else if (trashed == 0) {
+        // Trash failed for every target — surface the failure
+        // explicitly so the user doesn't think the action
+        // silently no-op'd.
+        messenger?.showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Move to Trash failed — check file permissions or restart',
+            ),
+            backgroundColor: AppColors.favorite,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      } else {
+        // Partial success: some files trashed, others failed.
+        // Common cause: one of the variants was already gone from
+        // disk between dialog open and Apply.
+        messenger?.showSnackBar(
+          SnackBar(
+            content: Text(
+              'Moved $trashed of ${decision.paths.length} files to Trash',
             ),
             backgroundColor: AppColors.favorite,
             duration: const Duration(seconds: 5),
@@ -1279,6 +1339,39 @@ class _TrackRow extends StatelessWidget {
               style: const TextStyle(
                 color: AppColors.textPrimary,
                 fontSize: 12,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _deleteMenuItem() {
+    // Destructive action. Warning-tinted icon + label so the eye
+    // recognises it as different in intent from every other entry
+    // in the menu. Ellipsis on the label signals "this will ask
+    // first" — same convention as `Move or copy…` above.
+    return PopupMenuItem<String>(
+      value: 'delete',
+      height: 32,
+      child: Row(
+        children: const [
+          Icon(
+            Icons.delete_outline_rounded,
+            size: 14,
+            color: AppColors.favorite,
+          ),
+          SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'Move to Trash…',
+              style: TextStyle(
+                color: AppColors.favorite,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
               ),
               overflow: TextOverflow.ellipsis,
               maxLines: 1,

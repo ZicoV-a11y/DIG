@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/track.dart';
+import '../services/filename_parser.dart';
 import '../state/library_controller.dart';
 import '../theme/app_theme.dart';
 import 'keyboard_shortcuts_help.dart';
@@ -119,6 +120,16 @@ class LibraryToolbar extends StatelessWidget {
           ListenableBuilder(
             listenable: controller,
             builder: (context, _) {
+              return _TrackPivotStrip(
+                track: controller.currentTrack,
+                onTap: controller.setSearchQuery,
+              );
+            },
+          ),
+          const SizedBox(width: 10),
+          ListenableBuilder(
+            listenable: controller,
+            builder: (context, _) {
               final recent = controller.recentReviewedTracks;
               return Row(
                 children: [
@@ -146,6 +157,83 @@ class LibraryToolbar extends StatelessWidget {
             },
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Horizontally-scrollable strip of people-pivot chips for the
+/// currently-playing track. Lives in the toolbar (next to search)
+/// because the chips ARE a search shortcut: tapping one fires
+/// `controller.setSearchQuery(name)` and the table filters down.
+/// Hidden when no track is playing or the track yields no pivots —
+/// so the toolbar collapses back to its plain layout in idle state.
+class _TrackPivotStrip extends StatelessWidget {
+  final Track? track;
+  final void Function(String) onTap;
+
+  const _TrackPivotStrip({required this.track, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = track;
+    if (t == null) return const SizedBox.shrink();
+    final pivots = extractPeoplePivots(
+      artist: t.displayArtist,
+      title: t.displayTitle,
+    );
+    if (pivots.isEmpty) return const SizedBox.shrink();
+    // Cap at ~360 so the chip strip can't squeeze the search field
+    // below readable width on a 1180-px-wide window; the strip
+    // scrolls horizontally beyond that.
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 360),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (var i = 0; i < pivots.length; i++) ...[
+              if (i > 0) const SizedBox(width: 6),
+              _PivotChip(label: pivots[i], onTap: () => onTap(pivots[i])),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PivotChip extends StatelessWidget {
+  final String label;
+  final VoidCallback onTap;
+
+  const _PivotChip({required this.label, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.surfaceAlt,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.zero,
+        side: const BorderSide(color: AppColors.border),
+      ),
+      child: InkWell(
+        onTap: onTap,
+        hoverColor: AppColors.hoverRow,
+        focusColor: AppColors.focusOverlay,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: AppColors.textPrimary,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              height: 1.2,
+            ),
+          ),
+        ),
       ),
     );
   }

@@ -6,6 +6,10 @@ class MainFlutterWindow: NSWindow {
   // Without this, the MPRemoteCommandCenter target registrations would
   // be released and media keys would silently stop working.
   private var mediaKeys: MediaKeysHandler?
+  // Same strong-reference rule: keep the trash channel handler alive
+  // for the window's lifetime so `moveToTrash` calls don't silently
+  // start returning `FlutterMethodNotImplemented` after GC.
+  private var trash: TrashHandler?
 
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
@@ -14,6 +18,9 @@ class MainFlutterWindow: NSWindow {
     // Wire macOS system media controls (F-keys, headset, lock screen,
     // Touch Bar, Control Center) through a method channel.
     self.mediaKeys = MediaKeysHandler(
+      messenger: flutterViewController.engine.binaryMessenger
+    )
+    self.trash = TrashHandler(
       messenger: flutterViewController.engine.binaryMessenger
     )
 

@@ -16,7 +16,7 @@ class AppDatabase {
   // v7 adds `sources.parent_source_id` + `sources.path_prefix` so a
   // folder picked inside an already-watched source becomes a virtual
   // "sub-view" instead of a duplicate scanning source.
-  static const _schemaVersion = 14;
+  static const _schemaVersion = 18;
 
   late final Database _db;
 
@@ -178,10 +178,13 @@ class AppDatabase {
         favorite INTEGER NOT NULL DEFAULT 0,
         play_count INTEGER NOT NULL DEFAULT 0,
         cumulative_ms INTEGER NOT NULL DEFAULT 0,
-        last_played_at INTEGER
+        last_played_at INTEGER,
+        reviewed_at INTEGER,
+        favorite_toggled_at INTEGER
       )
     ''');
     batch.execute('CREATE INDEX idx_tracks_fingerprint ON tracks(fingerprint)');
+    batch.execute('CREATE INDEX idx_tracks_reviewed_at ON tracks(reviewed_at)');
 
     // Append-only activity log. Every lifecycle decision the
     // system makes (mark missing, auto-supersede, purge, manual
@@ -199,7 +202,8 @@ class AppDatabase {
         event_type TEXT NOT NULL,
         path TEXT,
         source_id TEXT,
-        payload TEXT
+        payload TEXT,
+        origin TEXT NOT NULL DEFAULT 'desktop'
       )
     ''');
     batch.execute(
@@ -207,6 +211,144 @@ class AppDatabase {
     );
     batch.execute('CREATE INDEX idx_events_type ON events(event_type)');
     batch.execute('CREATE INDEX idx_events_path ON events(path)');
+    batch.execute('CREATE INDEX idx_events_origin ON events(origin)');
+
+    // Mobile-sync subsystem (v16). Independent storage from the
+    // shared_core wire models — the wire shape is the contract;
+    // these tables are operational state owned by the desktop.
+    //
+    // Per the user's PR2 guidance: do NOT put SQLite models into
+    // shared_core. shared_core carries DTOs. Persistence stays
+    // here; the iOS companion has its own (separate) storage.
+    batch.execute('''
+      CREATE TABLE mobile_devices (
+        device_id TEXT PRIMARY KEY,
+        friendly_name TEXT NOT NULL,
+        paired_at INTEGER NOT NULL,
+        last_seen_at INTEGER,
+        last_sync_at INTEGER,
+        last_manifest_version INTEGER NOT NULL DEFAULT 0,
+        capacity_mode TEXT NOT NULL,
+        capacity_value INTEGER NOT NULL,
+        transport_format_policy TEXT NOT NULL
+          DEFAULT 'prefer_mp3_else_aac_256',
+        sync_recipe TEXT NOT NULL
+          DEFAULT '{"type":"manual"}',
+        recent_eviction_cooldown_days INTEGER NOT NULL DEFAULT 14,
+        auto_approve_sync INTEGER NOT NULL DEFAULT 0,
+        token_hash TEXT NOT NULL
+      )
+    ''');
+
+    batch.execute('''
+      CREATE TABLE mobile_sync_inventory (
+        device_id TEXT NOT NULL,
+        intel_uid TEXT NOT NULL,
+        variant_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        residency TEXT NOT NULL,
+        sync_origin TEXT NOT NULL,
+        priority_rank INTEGER NOT NULL,
+        pinned_at INTEGER,
+        pending_pin INTEGER NOT NULL DEFAULT 0,
+        added_at INTEGER NOT NULL,
+        PRIMARY KEY (device_id, intel_uid),
+        FOREIGN KEY (device_id) REFERENCES mobile_devices(device_id)
+          ON DELETE CASCADE
+      )
+    ''');
+    batch.execute(
+      'CREATE INDEX idx_msi_device ON mobile_sync_inventory(device_id)',
+    );
+    batch.execute(
+      'CREATE INDEX idx_msi_intel ON mobile_sync_inventory(intel_uid)',
+    );
+    batch.execute(
+      'CREATE INDEX idx_msi_pin_queue '
+      'ON mobile_sync_inventory(device_id, pending_pin, pinned_at)',
+    );
+
+    batch.execute('''
+      CREATE TABLE mobile_eviction_history (
+        device_id TEXT NOT NULL,
+        intel_uid TEXT NOT NULL,
+        evicted_at INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        PRIMARY KEY (device_id, intel_uid, evicted_at),
+        FOREIGN KEY (device_id) REFERENCES mobile_devices(device_id)
+          ON DELETE CASCADE
+      )
+    ''');
+    batch.execute(
+      'CREATE INDEX idx_meh_device_recent '
+      'ON mobile_eviction_history(device_id, evicted_at)',
+    );
+
+    // Idempotency dedup for the telemetry reconciler (v17 / PR2.5).
+    // Every event the phone uploads is keyed by event_id (UUID).
+    // The reconciler INSERTs into this table inside the same
+    // transaction that applies the state mutation — duplicate
+    // uploads hit the PK constraint and are skipped cleanly.
+    batch.execute('''
+      CREATE TABLE processed_mobile_events (
+        event_id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        intel_uid TEXT,
+        occurred_at INTEGER NOT NULL,
+        processed_at INTEGER NOT NULL,
+        FOREIGN KEY (device_id) REFERENCES mobile_devices(device_id)
+          ON DELETE CASCADE
+      )
+    ''');
+    batch.execute(
+      'CREATE INDEX idx_pme_device ON processed_mobile_events(device_id)',
+    );
+    batch.execute(
+      'CREATE INDEX idx_pme_processed_at '
+      'ON processed_mobile_events(processed_at)',
+    );
+
+    // Sync session lifecycle (v18 / PR2.6 operational foundation).
+    // Every handshake gets a row; transport + telemetry + audit
+    // all attach to its session_id. The "Last Sync" summary card
+    // and the floating progress window both bind to this table.
+    batch.execute('''
+      CREATE TABLE sync_sessions (
+        session_id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        initiated_by TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        current_state TEXT NOT NULL,
+        completed_at INTEGER,
+        manifest_version INTEGER,
+        tracks_added INTEGER NOT NULL DEFAULT 0,
+        tracks_removed INTEGER NOT NULL DEFAULT 0,
+        bytes_transferred INTEGER NOT NULL DEFAULT 0,
+        telemetry_applied INTEGER NOT NULL DEFAULT 0,
+        telemetry_deduped INTEGER NOT NULL DEFAULT 0,
+        telemetry_skipped INTEGER NOT NULL DEFAULT 0,
+        telemetry_clock_clamped INTEGER NOT NULL DEFAULT 0,
+        failure_state TEXT,
+        failure_reason TEXT,
+        FOREIGN KEY (device_id) REFERENCES mobile_devices(device_id)
+          ON DELETE CASCADE
+      )
+    ''');
+    batch.execute(
+      'CREATE INDEX idx_ss_device ON sync_sessions(device_id)',
+    );
+    // Partial index on active sessions: helps the sidebar
+    // Devices panel query "is this device currently syncing?"
+    // without scanning historical sessions.
+    batch.execute(
+      'CREATE INDEX idx_ss_active '
+      'ON sync_sessions(device_id, completed_at) '
+      'WHERE completed_at IS NULL',
+    );
+    batch.execute(
+      'CREATE INDEX idx_ss_started_at ON sync_sessions(started_at)',
+    );
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -264,6 +406,309 @@ class AppDatabase {
     if (oldVersion < 14) {
       await _migrateV13toV14(db);
     }
+    if (oldVersion < 15) {
+      await _migrateV14toV15(db);
+    }
+    if (oldVersion < 16) {
+      await _migrateV15toV16(db);
+    }
+    if (oldVersion < 17) {
+      await _migrateV16toV17(db);
+    }
+    if (oldVersion < 18) {
+      await _migrateV17toV18(db);
+    }
+  }
+
+  /// Land `sync_sessions` — the operational record of every sync
+  /// handshake (PR2.6). Carries lifecycle state + counters that
+  /// the sidebar Devices panel + floating progress window + Last
+  /// Sync summary all bind to.
+  ///
+  /// Purely additive; existing rows in mobile_devices /
+  /// mobile_sync_inventory unchanged. Idempotent.
+  static Future<void> _migrateV17toV18(Database db) async {
+    debugPrint(
+      '[db] starting v17 → v18 migration (sync_sessions)',
+    );
+    final stopwatch = Stopwatch()..start();
+
+    final tables = await db.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type = 'table' "
+      "AND name = 'sync_sessions'",
+    );
+    if (tables.isEmpty) {
+      await db.execute('''
+        CREATE TABLE sync_sessions (
+          session_id TEXT PRIMARY KEY,
+          device_id TEXT NOT NULL,
+          initiated_by TEXT NOT NULL,
+          started_at INTEGER NOT NULL,
+          current_state TEXT NOT NULL,
+          completed_at INTEGER,
+          manifest_version INTEGER,
+          tracks_added INTEGER NOT NULL DEFAULT 0,
+          tracks_removed INTEGER NOT NULL DEFAULT 0,
+          bytes_transferred INTEGER NOT NULL DEFAULT 0,
+          telemetry_applied INTEGER NOT NULL DEFAULT 0,
+          telemetry_deduped INTEGER NOT NULL DEFAULT 0,
+          telemetry_skipped INTEGER NOT NULL DEFAULT 0,
+          telemetry_clock_clamped INTEGER NOT NULL DEFAULT 0,
+          failure_state TEXT,
+          failure_reason TEXT,
+          FOREIGN KEY (device_id) REFERENCES mobile_devices(device_id)
+            ON DELETE CASCADE
+        )
+      ''');
+    }
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_ss_device '
+      'ON sync_sessions(device_id)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_ss_active '
+      'ON sync_sessions(device_id, completed_at) '
+      'WHERE completed_at IS NULL',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_ss_started_at '
+      'ON sync_sessions(started_at)',
+    );
+
+    debugPrint(
+      '[db] v17 → v18 done in ${stopwatch.elapsedMilliseconds}ms.',
+    );
+  }
+
+  /// Land `processed_mobile_events` — the idempotency dedup table
+  /// for the telemetry reconciler (PR2.5). Every phone-uploaded
+  /// event is keyed by event_id (UUID); the reconciler INSERTs
+  /// into this table inside the same transaction that applies the
+  /// state mutation. Duplicate uploads (retries, reconnects,
+  /// double-POSTs from partial network failures) hit the PK
+  /// constraint and are skipped cleanly.
+  ///
+  /// This is the load-bearing infrastructure for the
+  /// "replay unapplied events safely" architecture — distributed
+  /// systems love retries, hate giant transactions. Per-event
+  /// atomic + idempotent replay beats batch rollback.
+  ///
+  /// Idempotent migration — safe to retry.
+  static Future<void> _migrateV16toV17(Database db) async {
+    debugPrint(
+      '[db] starting v16 → v17 migration (processed_mobile_events)',
+    );
+    final stopwatch = Stopwatch()..start();
+
+    final tables = await db.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type = 'table' "
+      "AND name = 'processed_mobile_events'",
+    );
+    if (tables.isEmpty) {
+      await db.execute('''
+        CREATE TABLE processed_mobile_events (
+          event_id TEXT PRIMARY KEY,
+          device_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          intel_uid TEXT,
+          occurred_at INTEGER NOT NULL,
+          processed_at INTEGER NOT NULL,
+          FOREIGN KEY (device_id) REFERENCES mobile_devices(device_id)
+            ON DELETE CASCADE
+        )
+      ''');
+    }
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_pme_device '
+      'ON processed_mobile_events(device_id)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_pme_processed_at '
+      'ON processed_mobile_events(processed_at)',
+    );
+
+    debugPrint(
+      '[db] v16 → v17 done in ${stopwatch.elapsedMilliseconds}ms.',
+    );
+  }
+
+  /// Land the mobile-sync subsystem (PR2 / Slice 1).
+  ///
+  /// Three new tables + one column:
+  ///   - `mobile_devices`: per-phone pairing, capacity, recipe,
+  ///     transport policy, auth token hash.
+  ///   - `mobile_sync_inventory`: which intel_uids are on each
+  ///     device, with residency class + FIFO pin queue support.
+  ///   - `mobile_eviction_history`: append-only audit of rotation
+  ///     events; drives the "recent eviction cooldown" rule that
+  ///     keeps just-evicted tracks from immediately resurfacing.
+  ///   - `events.origin` column: distinguishes 'desktop' from
+  ///     'mobile:&lt;device_id&gt;' so the activity strip can narrate
+  ///     phone-sourced plays differently.
+  ///
+  /// All purely additive. Existing rows in `events` get the
+  /// default 'desktop' origin via the ADD COLUMN default.
+  ///
+  /// Idempotent — safe to retry after a partial migration.
+  static Future<void> _migrateV15toV16(Database db) async {
+    debugPrint(
+      '[db] starting v15 → v16 migration (mobile-sync subsystem)',
+    );
+    final stopwatch = Stopwatch()..start();
+
+    // events.origin — additive ALTER + index.
+    final eventCols = await db.rawQuery('PRAGMA table_info(events)');
+    final hasOrigin = eventCols.any((c) => c['name'] == 'origin');
+    if (!hasOrigin) {
+      await db.execute(
+        "ALTER TABLE events ADD COLUMN origin TEXT NOT NULL "
+        "DEFAULT 'desktop'",
+      );
+    }
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_events_origin ON events(origin)',
+    );
+
+    // mobile_devices.
+    final tables = await db.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type = 'table' "
+      "AND name IN ('mobile_devices', 'mobile_sync_inventory', "
+      "'mobile_eviction_history')",
+    );
+    final tableNames = tables.map((t) => t['name']).toSet();
+
+    if (!tableNames.contains('mobile_devices')) {
+      await db.execute('''
+        CREATE TABLE mobile_devices (
+          device_id TEXT PRIMARY KEY,
+          friendly_name TEXT NOT NULL,
+          paired_at INTEGER NOT NULL,
+          last_seen_at INTEGER,
+          last_sync_at INTEGER,
+          last_manifest_version INTEGER NOT NULL DEFAULT 0,
+          capacity_mode TEXT NOT NULL,
+          capacity_value INTEGER NOT NULL,
+          transport_format_policy TEXT NOT NULL
+            DEFAULT 'prefer_mp3_else_aac_256',
+          sync_recipe TEXT NOT NULL
+            DEFAULT '{"type":"manual"}',
+          recent_eviction_cooldown_days INTEGER NOT NULL DEFAULT 14,
+          auto_approve_sync INTEGER NOT NULL DEFAULT 0,
+          token_hash TEXT NOT NULL
+        )
+      ''');
+    }
+
+    if (!tableNames.contains('mobile_sync_inventory')) {
+      await db.execute('''
+        CREATE TABLE mobile_sync_inventory (
+          device_id TEXT NOT NULL,
+          intel_uid TEXT NOT NULL,
+          variant_id TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          residency TEXT NOT NULL,
+          sync_origin TEXT NOT NULL,
+          priority_rank INTEGER NOT NULL,
+          pinned_at INTEGER,
+          pending_pin INTEGER NOT NULL DEFAULT 0,
+          added_at INTEGER NOT NULL,
+          PRIMARY KEY (device_id, intel_uid),
+          FOREIGN KEY (device_id) REFERENCES mobile_devices(device_id)
+            ON DELETE CASCADE
+        )
+      ''');
+    }
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_msi_device '
+      'ON mobile_sync_inventory(device_id)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_msi_intel '
+      'ON mobile_sync_inventory(intel_uid)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_msi_pin_queue '
+      'ON mobile_sync_inventory(device_id, pending_pin, pinned_at)',
+    );
+
+    if (!tableNames.contains('mobile_eviction_history')) {
+      await db.execute('''
+        CREATE TABLE mobile_eviction_history (
+          device_id TEXT NOT NULL,
+          intel_uid TEXT NOT NULL,
+          evicted_at INTEGER NOT NULL,
+          reason TEXT NOT NULL,
+          PRIMARY KEY (device_id, intel_uid, evicted_at),
+          FOREIGN KEY (device_id) REFERENCES mobile_devices(device_id)
+            ON DELETE CASCADE
+        )
+      ''');
+    }
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_meh_device_recent '
+      'ON mobile_eviction_history(device_id, evicted_at)',
+    );
+
+    debugPrint(
+      '[db] v15 → v16 done in ${stopwatch.elapsedMilliseconds}ms.',
+    );
+  }
+
+  /// Promote review state to a durable, threshold-driven column.
+  ///
+  /// Before v15, `Track.reviewed` was derived from
+  /// `cumulative_ms >= 3` — a coincidence of "the user listened for
+  /// at least 3 seconds." That coupled three concerns into one
+  /// number: review state, threshold-crossing, and analytics. v15
+  /// splits review state into its own `reviewed_at` timestamp
+  /// column. The threshold-crossing path in the controller now
+  /// stamps `reviewed_at`, `play_count`, and `last_played_at`
+  /// atomically — one trigger, three side effects.
+  ///
+  /// Also adds `favorite_toggled_at` so the iPhone-sync subsystem
+  /// (next slice) can reconcile favorite mutations via
+  /// last-write-wins when desktop and phone disagree.
+  ///
+  /// Backfill: any track whose previous derived-reviewed would have
+  /// been true (cumulative_ms >= 3000) gets `reviewed_at` populated
+  /// from `last_played_at` if available, else `created_at`. This
+  /// preserves every existing "reviewed" judgement; nothing
+  /// reverts to unreviewed across the migration.
+  ///
+  /// Idempotent — safe to retry after a partial migration.
+  static Future<void> _migrateV14toV15(Database db) async {
+    debugPrint(
+      '[db] starting v14 → v15 migration '
+      '(tracks.reviewed_at + favorite_toggled_at)',
+    );
+    final stopwatch = Stopwatch()..start();
+
+    final columns = await db.rawQuery('PRAGMA table_info(tracks)');
+    final names = columns.map((c) => c['name']).toSet();
+    if (!names.contains('reviewed_at')) {
+      await db.execute(
+        'ALTER TABLE tracks ADD COLUMN reviewed_at INTEGER',
+      );
+    }
+    if (!names.contains('favorite_toggled_at')) {
+      await db.execute(
+        'ALTER TABLE tracks ADD COLUMN favorite_toggled_at INTEGER',
+      );
+    }
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_tracks_reviewed_at '
+      'ON tracks(reviewed_at)',
+    );
+    final backfilled = await db.rawUpdate(
+      'UPDATE tracks '
+      'SET reviewed_at = COALESCE(last_played_at, created_at) '
+      'WHERE cumulative_ms >= 3000 AND reviewed_at IS NULL',
+    );
+
+    debugPrint(
+      '[db] v14 → v15 done in ${stopwatch.elapsedMilliseconds}ms '
+      '($backfilled rows backfilled to reviewed_at).',
+    );
   }
 
   /// Add `indexed_files.enrichment_state` — the formal lifecycle

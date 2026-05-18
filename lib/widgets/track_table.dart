@@ -997,6 +997,22 @@ class _TrackRow extends StatelessWidget {
       ));
     }
 
+    // Mobile-sync residency intent (PR2.6.B). One menu item per
+    // paired device — keeps the surface obvious without a
+    // submenu cascade. "Pin to" wording (not "Send to") reflects
+    // the ontology: this mutates the device's pinned inventory
+    // for the manifest builder to honor on next sync; it does
+    // NOT initiate transport.
+    final pairedDevices = controller.pairedDevicesListenable.value;
+    final canPin = track.intelUid != null &&
+        (track.contentHash?.isNotEmpty ?? false);
+    if (pairedDevices.isNotEmpty && canPin) {
+      items.add(const PopupMenuDivider(height: 1));
+      for (final d in pairedDevices) {
+        items.add(_pinToPhoneMenuItem(device: d));
+      }
+    }
+
     // Destructive group at the bottom, separated by its own divider
     // so the eye sees a clear visual break between reorganisational
     // actions (Move/Copy) and trash. Hidden on unavailable rows —
@@ -1028,6 +1044,35 @@ class _TrackRow extends StatelessWidget {
     );
 
     if (result == null) return;
+    if (result.startsWith('pin-to-device:')) {
+      final deviceId = result.substring('pin-to-device:'.length);
+      final intelUid = track.intelUid;
+      if (intelUid == null) return;
+      final written = await controller.pinTracksToDevice(
+        deviceId: deviceId,
+        intelUids: [intelUid],
+      );
+      if (!context.mounted) return;
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      final deviceLabel = controller.pairedDevicesListenable.value
+          .firstWhere(
+            (d) => d.device.deviceId == deviceId,
+            orElse: () => controller.pairedDevicesListenable.value.first,
+          )
+          .device
+          .friendlyName;
+      messenger?.showSnackBar(
+        SnackBar(
+          content: Text(
+            written == 0
+                ? 'Could not pin — track needs a content hash first.'
+                : 'Pinned to $deviceLabel. Available on next sync.',
+          ),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
     if (result == 'reveal') {
       await controller.showTrackInstanceInFinder(track);
     } else if (result.startsWith('reveal:')) {
@@ -1336,6 +1381,40 @@ class _TrackRow extends StatelessWidget {
           Flexible(
             child: Text(
               label,
+              style: const TextStyle(
+                color: AppColors.textPrimary,
+                fontSize: 12,
+              ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Right-click `Pin to <device>` entry. One per paired device.
+  /// Selecting it routes through [LibraryController.pinTracksToDevice]
+  /// — the manifest builder picks the row up on next sync. No
+  /// transfer initiated; this is pure residency-intent mutation.
+  PopupMenuItem<String> _pinToPhoneMenuItem({
+    required DeviceWithState device,
+  }) {
+    return PopupMenuItem<String>(
+      value: 'pin-to-device:${device.device.deviceId}',
+      height: 32,
+      child: Row(
+        children: [
+          const Icon(
+            Icons.push_pin_outlined,
+            size: 14,
+            color: AppColors.accent,
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              'Pin to ${device.device.friendlyName}',
               style: const TextStyle(
                 color: AppColors.textPrimary,
                 fontSize: 12,

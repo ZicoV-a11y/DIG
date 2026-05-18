@@ -1,0 +1,21 @@
+name: shared_core
+description: |
+  Pure-Dart shared models + sync-protocol contracts between the
+  desktop_app (music_tracker) and the future companion_ios app.
+
+  Owns: TrackIdentity, SyncManifest, TelemetryEvent, capacity/
+  residency/sync-state enums, JSON serializers.
+  Does NOT own: UI, sqflite, platform code. Strictly Dart-only so
+  both Flutter macOS and Flutter iOS can depend on it without
+  pulling in each other's platform baggage.
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^5.0.0

@@ -1,0 +1,42 @@
+name: companion_ios
+description: |
+  MusicTracker iPhone companion. Distributed playback node for the
+  MACNEO desktop library — receives a rotating review crate over
+  Wi-Fi, plays it offline, returns playback telemetry on next
+  sync.
+
+  Per the architecture plan: this app intentionally stays small.
+  It does NOT own enrichment, identity, manifest compilation, or
+  reconciliation logic — those live on the desktop. The phone
+  reports observations; the desktop applies ontology.
+
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.11.5
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Shared protocol contracts — identical models the desktop
+  # uses, so the wire shape stays in lockstep.
+  shared_core:
+    path: ../shared_core
+
+  http: ^1.2.2
+  sqflite_common_ffi: ^2.4.0+3
+  just_audio: ^0.10.5
+  audio_session: ^0.2.0+1
+  path_provider: ^2.1.5
+  crypto: ^3.0.3
+  uuid: ^4.5.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

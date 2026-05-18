@@ -168,6 +168,25 @@ class Track {
   Duration cumulativeListened;
   DateTime? lastPlayedAt;
 
+  /// Wall-clock moment review state was first asserted. Stamped by
+  /// the threshold-crossing path atomically with `playCount` and
+  /// `lastPlayedAt` (one trigger, three side effects). Null = not
+  /// yet reviewed. Once stamped, stays stamped across replays — the
+  /// timestamp records WHEN review happened, not the most recent
+  /// listen.
+  ///
+  /// Schema column: `tracks.reviewed_at` (v15). The `reviewed`
+  /// getter reads from this; older code that derived it from
+  /// `cumulative_ms >= 3` is gone.
+  DateTime? reviewedAt;
+
+  /// Wall-clock moment `favorite` last changed. Powers LWW
+  /// reconciliation for the iPhone-sync subsystem: when desktop
+  /// and phone disagree, the side with the larger timestamp wins.
+  ///
+  /// Schema column: `tracks.favorite_toggled_at` (v15).
+  DateTime? favoriteToggledAt;
+
   Track({
     required this.uid,
     required this.fingerprint,
@@ -196,6 +215,8 @@ class Track {
     this.playCount = 0,
     this.cumulativeListened = Duration.zero,
     this.lastPlayedAt,
+    this.reviewedAt,
+    this.favoriteToggledAt,
   });
 
   /// `true` once the user has meaningfully interacted with this track
@@ -203,7 +224,7 @@ class Track {
   /// app treats default intelligence values as identical to "no row".
   bool get hasIntelligence => intelUid != null;
 
-  bool get reviewed => cumulativeListened.inSeconds >= 3;
+  bool get reviewed => reviewedAt != null;
 
   /// `true` when the metadata enrichment pipeline has successfully
   /// read this file's tags + duration. Reads from the formal

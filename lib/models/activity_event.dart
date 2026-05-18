@@ -114,6 +114,12 @@ class ActivityEvent {
   final String? sourceId;
   final Map<String, Object?> payload;
 
+  /// Which node originated this event. Stable values:
+  /// `'desktop'` (default) and `'mobile:&lt;device_id&gt;'`. Lets the
+  /// activity strip render phone-sourced events distinctly from
+  /// local plays.
+  final String origin;
+
   const ActivityEvent({
     required this.id,
     required this.recordedAt,
@@ -121,6 +127,7 @@ class ActivityEvent {
     required this.path,
     required this.sourceId,
     required this.payload,
+    this.origin = 'desktop',
   });
 
   factory ActivityEvent.fromRow(Map<String, Object?> r) {
@@ -150,6 +157,7 @@ class ActivityEvent {
       path: r['path'] as String?,
       sourceId: r['source_id'] as String?,
       payload: parsed,
+      origin: (r['origin'] as String?) ?? 'desktop',
     );
   }
 }

@@ -15,6 +15,8 @@ class IntelligenceRecord {
   final int playCount;
   final int cumulativeMs;
   final int? lastPlayedAt;
+  final int? reviewedAt;
+  final int? favoriteToggledAt;
 
   const IntelligenceRecord({
     required this.uid,
@@ -27,6 +29,8 @@ class IntelligenceRecord {
     required this.playCount,
     required this.cumulativeMs,
     required this.lastPlayedAt,
+    this.reviewedAt,
+    this.favoriteToggledAt,
   });
 
   Map<String, Object?> toJson() => {
@@ -40,6 +44,8 @@ class IntelligenceRecord {
         'playCount': playCount,
         'cumulativeMs': cumulativeMs,
         'lastPlayedAt': lastPlayedAt,
+        if (reviewedAt != null) 'reviewedAt': reviewedAt,
+        if (favoriteToggledAt != null) 'favoriteToggledAt': favoriteToggledAt,
       };
 
   static IntelligenceRecord fromJson(Map<String, Object?> j) {
@@ -62,6 +68,8 @@ class IntelligenceRecord {
       playCount: _asInt(j['playCount']) ?? 0,
       cumulativeMs: _asInt(j['cumulativeMs']) ?? 0,
       lastPlayedAt: _asInt(j['lastPlayedAt']),
+      reviewedAt: _asInt(j['reviewedAt']),
+      favoriteToggledAt: _asInt(j['favoriteToggledAt']),
     );
   }
 }

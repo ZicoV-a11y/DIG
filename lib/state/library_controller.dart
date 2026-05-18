@@ -8,6 +8,7 @@ import 'package:flutter/widgets.dart' show
     WidgetsBinding,
     WidgetsBindingObserver;
 import 'package:just_audio/just_audio.dart' show ProcessingState;
+import 'package:shared_core/shared_core.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/intelligence_record.dart';
@@ -25,6 +26,10 @@ import '../services/library_repository.dart';
 import '../services/library_save_manager.dart';
 import '../services/media_keys.dart';
 import '../services/metadata_extractor.dart';
+import '../services/mobile_sync/mobile_device.dart';
+import '../services/mobile_sync/mobile_sync_repository.dart';
+import '../services/mobile_sync/sync_orchestrator.dart';
+import '../services/mobile_sync/sync_session_store.dart';
 import '../services/playback_engine.dart';
 import '../services/trash.dart';
 import '../utils/aggregated_track_view.dart';
@@ -70,6 +75,14 @@ class LibraryController extends ChangeNotifier {
   /// to address `Current/CURRENT.library` for mtime checks before
   /// snapshotting. Null in tests when `saveManager` is also null.
   final LibraryRoot? libraryRoot;
+
+  /// Mobile-sync persistence layer (PR2.6.B). Null in tests that
+  /// don't exercise the companion-device surfaces — production
+  /// wires one from `main.dart` alongside the HTTP server. When
+  /// null, [pinTracksToDevice] and [pairedDevicesListenable]
+  /// behave as no-ops (empty list, silent return) so the rest of
+  /// the desktop UI keeps working unaltered.
+  final MobileSyncRepository? mobileSync;
   final Uuid _uuid = const Uuid();
 
   static const _recentBufferCapacity = 8;
@@ -488,7 +501,9 @@ class LibraryController extends ChangeNotifier {
     required this.repo,
     this.saveManager,
     this.libraryRoot,
-  }) {
+    this.mobileSync,
+    SyncSessionStore? sessionStore,
+  }) : _sessionStore = sessionStore {
     _backfillWorker = ContentHashBackfillWorker(
       repo,
       onProgress: _onBackfillProgress,
@@ -500,6 +515,191 @@ class LibraryController extends ChangeNotifier {
     _durationSub = engine.durationStream.listen(_onDuration);
     _processingSub = engine.processingStateStream.listen(_onProcessing);
     _wireMediaBridge();
+  }
+
+  /// Owns the `sync_sessions` lifecycle (PR2.6.A). Optional in
+  /// tests; production injects from `main.dart`. When null the
+  /// `pairedDevicesListenable` resolves devices to
+  /// [ActiveSyncSessionState] = `null` (i.e., never `syncing` /
+  /// `awaitingApproval`) — heartbeat math drives the state.
+  final SyncSessionStore? _sessionStore;
+  SyncSessionStore? get sessionStore => _sessionStore;
+
+  /// The state-machine driver for a single sync handshake
+  /// (PR2.6.C). Lazily constructed the first time a UI / endpoint
+  /// requests it, so tests that don't exercise sync don't pay
+  /// the wiring cost. The floating progress window binds to
+  /// `syncOrchestrator.activeSessionListenable` directly.
+  ///
+  /// Null when [_sessionStore] is null (no session lifecycle at
+  /// all in this controller instance).
+  SyncOrchestrator? _syncOrchestrator;
+  SyncOrchestrator? get syncOrchestrator {
+    final store = _sessionStore;
+    if (store == null) return null;
+    if (_syncOrchestrator == null) {
+      _syncOrchestrator = SyncOrchestrator(sessionStore: store);
+      // Q1 contract — sync is a playback-exclusive maintenance
+      // window. Watch the orchestrator's active session and
+      // pause the engine the moment a non-terminal session
+      // appears; let the engine become playable again when the
+      // session clears (orchestrator.clearActive() fires after
+      // the RotationSummary dismiss timer).
+      _syncOrchestrator!.activeSessionListenable
+          .addListener(_onSyncSessionChanged);
+    }
+    return _syncOrchestrator;
+  }
+
+  /// Q1 — true while a non-terminal sync session is in flight.
+  /// `play()` refuses to start a track while this is true; UI
+  /// surfaces (deck buttons, keyboard shortcuts) consult it to
+  /// disable controls. Pure derivation from the orchestrator's
+  /// snapshot — no separate state to keep in sync.
+  bool get isPlaybackBlockedBySync {
+    final orchestrator = _syncOrchestrator;
+    if (orchestrator == null) return false;
+    return isSyncBlockingPlayback(orchestrator.activeSession);
+  }
+
+  void _onSyncSessionChanged() {
+    if (isPlaybackBlockedBySync && _isPlaying) {
+      // Pause the engine the moment a session begins. The
+      // engine.pause() call ripples through to _onPlaying which
+      // updates _isPlaying; from then on play() refuses until
+      // the session terminates and the snapshot clears.
+      unawaited(engine.pause());
+    }
+    // Notify so any widget keying off this controller redraws —
+    // deck play button can grey out, keyboard shortcuts can
+    // refuse, the SyncProgressWindow can render.
+    notifyListeners();
+  }
+
+  /// Snapshot of paired devices + their derived operational
+  /// state. Refreshed by [refreshPairedDevices], typically on a
+  /// short interval from the sidebar panel. UI binds via
+  /// `ValueListenableBuilder`.
+  final ValueNotifier<List<DeviceWithState>> _pairedDevicesNotifier =
+      ValueNotifier<List<DeviceWithState>>(const []);
+  ValueListenable<List<DeviceWithState>> get pairedDevicesListenable =>
+      _pairedDevicesNotifier;
+
+  /// Re-fetch paired devices + their active sessions and recompute
+  /// operational state. Idempotent. Cheap — runs three small queries.
+  /// No-op when [mobileSync] is null.
+  Future<void> refreshPairedDevices() async {
+    final ms = mobileSync;
+    if (ms == null) return;
+    final devices = await ms.listDevices();
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final entries = <DeviceWithState>[];
+    for (final d in devices) {
+      ActiveSyncSessionState? activeState;
+      if (_sessionStore != null) {
+        final active = await _sessionStore.activeForDevice(d.deviceId);
+        if (active != null) {
+          activeState = _activeSessionStateFor(active.currentState);
+        }
+      }
+      final state = deriveDeviceState(
+        lastSeenAt: d.lastSeenAt?.millisecondsSinceEpoch,
+        now: nowMs,
+        activeSessionState: activeState,
+      );
+      entries.add(DeviceWithState(device: d, state: state));
+    }
+    _pairedDevicesNotifier.value = entries;
+  }
+
+  ActiveSyncSessionState? _activeSessionStateFor(SyncState s) {
+    switch (s) {
+      case SyncState.negotiating:
+      case SyncState.approving:
+        return ActiveSyncSessionState.awaitingApproval;
+      case SyncState.preparingManifest:
+      case SyncState.preparingTransports:
+      case SyncState.transferring:
+      case SyncState.receivingTelemetry:
+      case SyncState.applyingTelemetry:
+      case SyncState.finalizingRotation:
+        return ActiveSyncSessionState.syncing;
+      case SyncState.idle:
+      case SyncState.rotationComplete:
+      case SyncState.approvalDeclined:
+      case SyncState.transferFailed:
+      case SyncState.networkLost:
+        return null;
+    }
+  }
+
+  /// Pin one or more tracks to a paired device. Mutates the
+  /// device's `mobile_sync_inventory` rows with `residency='pinned'`
+  /// — the manifest builder picks them up on the next sync. Does
+  /// NOT initiate a transfer; pinning is residency-intent
+  /// mutation, not orchestration. Per the PR2.6 contract: the
+  /// manifest builder remains the canonical inventory authority.
+  ///
+  /// Idempotent — re-pinning the same intel_uid for the same
+  /// device replaces the row (no duplicate inventory entries).
+  /// Returns the count of rows written.
+  Future<int> pinTracksToDevice({
+    required String deviceId,
+    required List<String> intelUids,
+  }) async {
+    final ms = mobileSync;
+    if (ms == null || intelUids.isEmpty) return 0;
+    final now = DateTime.now();
+    var written = 0;
+    for (final intelUid in intelUids) {
+      final track = _tracks.firstWhere(
+        (t) => t.intelUid == intelUid,
+        orElse: () => Track(
+          uid: '',
+          fingerprint: '',
+          path: '',
+          filename: '',
+          sourceId: '',
+          title: '',
+        ),
+      );
+      if (track.uid.isEmpty) continue;
+      if (track.contentHash == null || track.contentHash!.isEmpty) {
+        // Tracks without content_hash can't be pinned — the
+        // manifest builder would reject them at eligibility-
+        // filter time. Skip silently here so the UI can surface
+        // "N of M pinned" without a confusing partial error.
+        continue;
+      }
+      await ms.upsertInventory(MobileInventoryEntry(
+        deviceId: deviceId,
+        intelUid: intelUid,
+        variantId: track.uid,
+        contentHash: track.contentHash!,
+        residency: ResidencyClass.pinned,
+        syncOrigin: 'manual',
+        priorityRank: 100,
+        pinnedAt: now,
+        addedAt: now,
+      ));
+      written++;
+    }
+    await refreshPairedDevices();
+    notifyListeners();
+    return written;
+  }
+
+  /// Drop a single intel_uid from a device's pinned inventory.
+  /// Idempotent — removing a row that doesn't exist is a no-op.
+  Future<void> unpinTrackFromDevice({
+    required String deviceId,
+    required String intelUid,
+  }) async {
+    final ms = mobileSync;
+    if (ms == null) return;
+    await ms.removeFromInventory(deviceId, intelUid);
+    await refreshPairedDevices();
+    notifyListeners();
   }
 
   /// content_hash backfill — see `services/content_hash_backfill.dart`.
@@ -1748,6 +1948,7 @@ class LibraryController extends ChangeNotifier {
     // the same intel uid (including ones not in this delete batch).
     if (decision.clearFavorite) {
       try {
+        final now = DateTime.now();
         await repo.updateIntelligence(
           intelUid: decision.intelUid,
           favorite: false,
@@ -1755,6 +1956,7 @@ class LibraryController extends ChangeNotifier {
         for (final t in _tracks) {
           if (t.intelUid == decision.intelUid) {
             t.favorite = false;
+            t.favoriteToggledAt = now;
           }
         }
       } catch (e) {
@@ -3496,6 +3698,12 @@ class LibraryController extends ChangeNotifier {
         t.lastPlayedAt = intel.lastPlayedAt != null
             ? DateTime.fromMillisecondsSinceEpoch(intel.lastPlayedAt!)
             : null;
+        t.reviewedAt = intel.reviewedAt != null
+            ? DateTime.fromMillisecondsSinceEpoch(intel.reviewedAt!)
+            : null;
+        t.favoriteToggledAt = intel.favoriteToggledAt != null
+            ? DateTime.fromMillisecondsSinceEpoch(intel.favoriteToggledAt!)
+            : null;
       }
     }
     return canonical;
@@ -3609,9 +3817,14 @@ class LibraryController extends ChangeNotifier {
 
     // Optimistic in-memory flip on every bucket variant so the UI
     // updates instantly. _writeBucketIntelligence below will
-    // overwrite these with canonical state once persisted.
+    // overwrite these with canonical state once persisted. The
+    // favorite_toggled_at stamp powers iPhone-sync LWW
+    // reconciliation — repo.updateIntelligence auto-stamps it
+    // when `favorite` is non-null.
+    final now = DateTime.now();
     for (final v in bucket) {
       v.favorite = next;
+      v.favoriteToggledAt = now;
     }
     _markLibraryDirty();
     notifyListeners();
@@ -3631,23 +3844,35 @@ class LibraryController extends ChangeNotifier {
     // row's reviewed state, not the bucket aggregate. Pre-slice-3
     // per-variant divergence would otherwise cause the click to
     // un-review when the user intended to review.
+    //
+    // PR1 change: reviewed state is now durable via reviewed_at —
+    // toggling on stamps the timestamp, toggling off clears it.
+    // cumulative_ms is NO LONGER manipulated here (the old code
+    // wrote 0 / 3000 to drive the derived getter); we leave the
+    // analytics counter alone.
     final reviewed = t.reviewed;
-    final nextCumulativeMs = reviewed ? 0 : 3000;
+    final nextReviewedAt = reviewed ? null : DateTime.now();
 
     // Optimistic in-memory update across the bucket.
-    final nextDuration = Duration(milliseconds: nextCumulativeMs);
     for (final v in bucket) {
-      v.cumulativeListened = nextDuration;
+      v.reviewedAt = nextReviewedAt;
     }
     if (!reviewed) _pushRecentReviewed(uid);
     _markLibraryDirty();
     notifyListeners();
 
     await _writeBucketIntelligence(t, (canonical) async {
-      await repo.updateIntelligence(
-        intelUid: canonical,
-        cumulativeMs: nextCumulativeMs,
-      );
+      if (reviewed) {
+        await repo.updateIntelligence(
+          intelUid: canonical,
+          clearReviewedAt: true,
+        );
+      } else {
+        await repo.updateIntelligence(
+          intelUid: canonical,
+          reviewedAt: nextReviewedAt!.millisecondsSinceEpoch,
+        );
+      }
     });
     _markLibraryDirty();
     notifyListeners();
@@ -3888,6 +4113,18 @@ class LibraryController extends ChangeNotifier {
   }
 
   Future<void> play(String uid, {bool reveal = false, String? path}) async {
+    // Q1 contract: sync is a playback-exclusive maintenance
+    // window. play() refuses while a non-terminal sync session
+    // is in flight — the engine can't safely traverse tracks
+    // whose inventory is being mutated. The UI button paths
+    // should already disable themselves via
+    // `playbackBlockedListenable`, but we guard here too in
+    // case a keyboard shortcut or remote command bypasses the
+    // UI gate.
+    if (isPlaybackBlockedBySync) {
+      debugPrint('[play] refused: sync session in flight');
+      return;
+    }
     // Per-step millisecond timing of the play path. Each `tick` call
     // logs the cumulative + delta against the last tick. Goal: the
     // segment from `entry` → `engine.setTrack returned` should be
@@ -4101,35 +4338,59 @@ class LibraryController extends ChangeNotifier {
     if (track != null && _isPlaying) {
       final delta = pos - _lastTickPosition;
       if (delta > Duration.zero && delta < const Duration(seconds: 2)) {
-        final wasReviewed = track.reviewed;
+        // Real forward playback time — `delta` is bounded above by
+        // 2s to reject seek-induced jumps (a real audio tick is
+        // <250ms apart). cumulative_ms is the analytics counter;
+        // session-level threshold-crossing is what drives review
+        // state.
         track.cumulativeListened = track.cumulativeListened + delta;
         _sessionListened = _sessionListened + delta;
 
-        final crossedReviewed = !wasReviewed && track.reviewed;
+        // PR1 canonical event: when this session's real-playback
+        // counter crosses `_playThresholdSeconds`, ONE trigger
+        // atomically fires three side effects + the optional
+        // first-time review stamp.
+        //
+        //   play_count       += 1     (this session counted)
+        //   last_played_at    = now   (most-recent listen)
+        //   reviewed_at      ??= now  (first review stamp, sticky)
+        //
+        // Replays of an already-reviewed track keep their original
+        // `reviewed_at` intact (preserves WHEN review happened);
+        // play_count and last_played_at still update each session.
+        //
+        // The pre-v15 derived-review logic (`cumulative_ms >= 3` as
+        // the review boundary) is gone — review IS the threshold
+        // crossing now, with no second condition.
         final shouldCountSession =
             !_sessionPlayCounted &&
             _sessionListened >= Duration(seconds: _playThresholdSeconds);
 
-        if (crossedReviewed || shouldCountSession) {
-          if (shouldCountSession) {
-            _sessionPlayCounted = true;
-            track.playCount += 1;
-            // Operational journal accumulator — increment the
-            // per-save-period "tracks played" counter. Flushed
-            // to the events table at the next autosave tick.
-            _playsSinceSnapshot += 1;
-            // Mark this track for transient row-highlight in the
-            // table. The row's AnimatedContainer fades the colour
-            // in (= the user-visible "flash"); the marker stays
-            // until the next `play()` call clears it, so the
-            // highlight reads as "you played this track through
-            // — until you start the next one."
-            _justReviewedUid = track.uid;
-          }
+        if (shouldCountSession) {
+          _sessionPlayCounted = true;
+          track.playCount += 1;
+          final now = DateTime.now();
+          track.lastPlayedAt = now;
+          // Sticky first-review stamp. If reviewedAt is already
+          // set (replay of a reviewed track), leave it alone —
+          // the timestamp records WHEN review happened, not the
+          // latest listen.
+          track.reviewedAt ??= now;
+          // Operational journal accumulator — increment the
+          // per-save-period "tracks played" counter. Flushed
+          // to the events table at the next autosave tick.
+          _playsSinceSnapshot += 1;
+          // Mark this track for transient row-highlight in the
+          // table. The row's AnimatedContainer fades the colour
+          // in (= the user-visible "flash"); the marker stays
+          // until the next `play()` call clears it, so the
+          // highlight reads as "you played this track through
+          // — until you start the next one."
+          _justReviewedUid = track.uid;
           _pushRecentReviewed(track.uid);
           // Bump `_dataVersion` only — NOT `_libraryVersion` and
           // NOT the visible cache. The track object was mutated
-          // in place (playCount, reviewed via cumulativeListened);
+          // in place (playCount, reviewedAt, lastPlayedAt);
           // widget rebuilds via notifyListeners() read those
           // updated fields directly. Crucially, the table's
           // visible-cache stays valid → no re-sort fires while a
@@ -4149,18 +4410,22 @@ class LibraryController extends ChangeNotifier {
           // because they key off `_dataVersion`.
           _dataVersion++;
           notifyListeners();
-          // Persist through the bucket helper so the play-count
-          // increment and cumulative listening propagate to every
-          // sibling variant in memory + the canonical intel row.
-          // Promotion already happened at play() start, so this
-          // call is just a write + mirror.
+          // Persist through the bucket helper so the threshold
+          // mutation propagates to every sibling variant in
+          // memory + the canonical intel row, in one atomic
+          // update. Promotion already happened at play() start,
+          // so this call is just a write + mirror.
           final cumulativeMs = track.cumulativeListened.inMilliseconds;
           final playCount = track.playCount;
+          final lastPlayedAtMs = now.millisecondsSinceEpoch;
+          final reviewedAtMs = track.reviewedAt!.millisecondsSinceEpoch;
           unawaited(_writeBucketIntelligence(track, (canonical) async {
             await repo.updateIntelligence(
               intelUid: canonical,
               cumulativeMs: cumulativeMs,
               playCount: playCount,
+              lastPlayedAt: lastPlayedAtMs,
+              reviewedAt: reviewedAtMs,
             );
           }));
         }
@@ -4407,4 +4672,14 @@ class _LifecycleObserver extends WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     onChange(state);
   }
+}
+
+/// One sidebar Devices panel row: a [MobileDevice] paired with
+/// its derived [DeviceOperationalState]. Pre-computed by
+/// [LibraryController.refreshPairedDevices] so the UI never
+/// recomputes state on rebuild — purity + cheap rendering.
+class DeviceWithState {
+  final MobileDevice device;
+  final DeviceOperationalState state;
+  const DeviceWithState({required this.device, required this.state});
 }

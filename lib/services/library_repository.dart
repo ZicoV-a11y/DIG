@@ -269,11 +269,35 @@ class LibraryRepository {
       SELECT idx.*, t.favorite AS i_favorite,
              t.play_count AS i_play_count,
              t.cumulative_ms AS i_cumulative_ms,
-             t.last_played_at AS i_last_played_at
+             t.last_played_at AS i_last_played_at,
+             t.reviewed_at AS i_reviewed_at,
+             t.favorite_toggled_at AS i_favorite_toggled_at
       FROM indexed_files idx
       LEFT JOIN tracks t ON t.uid = idx.intel_uid
     ''');
     return rows.map(_trackFromJoinedRow).toList();
+  }
+
+  /// Single-row variant for callers that already know which
+  /// variant they want. Used by the mobile-sync transport
+  /// endpoint to resolve `GET /api/v1/track/<variant_id>` to a
+  /// filesystem path; returns null if the row is gone (file
+  /// deleted between manifest generation and transfer).
+  Future<Track?> findTrackByUid(String uid) async {
+    final rows = await _db.rawQuery('''
+      SELECT idx.*, t.favorite AS i_favorite,
+             t.play_count AS i_play_count,
+             t.cumulative_ms AS i_cumulative_ms,
+             t.last_played_at AS i_last_played_at,
+             t.reviewed_at AS i_reviewed_at,
+             t.favorite_toggled_at AS i_favorite_toggled_at
+      FROM indexed_files idx
+      LEFT JOIN tracks t ON t.uid = idx.intel_uid
+      WHERE idx.uid = ?
+      LIMIT 1
+    ''', [uid]);
+    if (rows.isEmpty) return null;
+    return _trackFromJoinedRow(rows.first);
   }
 
   // ---------------------------------------------------------------------------
@@ -531,7 +555,9 @@ class LibraryRepository {
     bool favorite,
     int playCount,
     int cumulativeMs,
-    int? lastPlayedAt
+    int? lastPlayedAt,
+    int? reviewedAt,
+    int? favoriteToggledAt,
   })?> fetchIntelligence(String intelUid) async {
     final rows = await _db.query(
       'tracks',
@@ -546,6 +572,8 @@ class LibraryRepository {
       playCount: (r['play_count'] as int?) ?? 0,
       cumulativeMs: (r['cumulative_ms'] as int?) ?? 0,
       lastPlayedAt: r['last_played_at'] as int?,
+      reviewedAt: r['reviewed_at'] as int?,
+      favoriteToggledAt: r['favorite_toggled_at'] as int?,
     );
   }
 
@@ -1899,11 +1927,16 @@ class LibraryRepository {
   /// [type] should be one of the `EventType.*` constants. [payload]
   /// gets JSON-encoded; pass `null` for events that don't need
   /// type-specific fields.
+  /// [origin] defaults to `'desktop'` (the only originator until
+  /// the iPhone sync subsystem lights up). Phone-sourced events
+  /// pass `'mobile:&lt;device_id&gt;'` so the activity strip can render
+  /// "Zico played 1 track on iPhone" distinctly from local plays.
   Future<void> recordEvent({
     required String type,
     String? path,
     String? sourceId,
     Map<String, Object?>? payload,
+    String origin = 'desktop',
     DatabaseExecutor? txn,
   }) async {
     final exec = txn ?? _db;
@@ -1914,6 +1947,7 @@ class LibraryRepository {
         'path': path,
         'source_id': sourceId,
         'payload': payload == null ? null : jsonEncode(payload),
+        'origin': origin,
       });
     } catch (e) {
       // Swallow — observability isn't worth blocking real work.
@@ -1941,7 +1975,7 @@ class LibraryRepository {
       args.addAll(eventTypes);
     }
     final rows = await _db.rawQuery(
-      'SELECT id, recorded_at, event_type, path, source_id, payload '
+      'SELECT id, recorded_at, event_type, path, source_id, payload, origin '
       'FROM events $where '
       'ORDER BY recorded_at DESC, id DESC '
       'LIMIT ? OFFSET ?',
@@ -1986,7 +2020,7 @@ class LibraryRepository {
   Future<List<ActivityEvent>> loadHistoryForPath(String path) async {
     // Direct events.
     final direct = await _db.rawQuery(
-      'SELECT id, recorded_at, event_type, path, source_id, payload '
+      'SELECT id, recorded_at, event_type, path, source_id, payload, origin '
       'FROM events '
       'WHERE path = ? '
       'ORDER BY recorded_at DESC, id DESC',
@@ -2004,7 +2038,7 @@ class LibraryRepository {
     final successorPattern = '%"successor_path":"$encodedPath"%';
     final destPattern = '%"dest_path":"$encodedPath"%';
     final referencing = await _db.rawQuery(
-      'SELECT id, recorded_at, event_type, path, source_id, payload '
+      'SELECT id, recorded_at, event_type, path, source_id, payload, origin '
       'FROM events '
       // ESCAPE '|' makes the pipe-escaped LIKE wildcards (|% and
       // |_) match literal % and _ — needed because real filenames
@@ -2098,7 +2132,7 @@ class LibraryRepository {
     ];
     final placeholders = List.filled(lifecycleTypes.length, '?').join(',');
     final rows = await _db.rawQuery(
-      'SELECT id, recorded_at, event_type, path, source_id, payload '
+      'SELECT id, recorded_at, event_type, path, source_id, payload, origin '
       'FROM events '
       'WHERE path = ? AND event_type IN ($placeholders) '
       'ORDER BY recorded_at DESC, id DESC '
@@ -2147,7 +2181,7 @@ class LibraryRepository {
       final rows = await _db.rawQuery(
         '''
         SELECT e.id, e.recorded_at, e.event_type, e.path, e.source_id,
-               e.payload
+               e.payload, e.origin
         FROM events e
         WHERE e.path IN ($pathPlaceholders)
           AND e.event_type IN ($typePlaceholders)
@@ -2472,6 +2506,8 @@ class LibraryRepository {
         var playCount = 0;
         var cumulativeMs = 0;
         int? lastPlayedAt;
+        int? reviewedAt; // earliest non-null wins (review is sticky)
+        int? favoriteToggledAt; // latest non-null wins (LWW)
         for (final r in intelRows) {
           if (((r['favorite'] as int?) ?? 0) != 0) favorite = true;
           playCount += (r['play_count'] as int?) ?? 0;
@@ -2479,6 +2515,15 @@ class LibraryRepository {
           final lp = r['last_played_at'] as int?;
           if (lp != null && (lastPlayedAt == null || lp > lastPlayedAt)) {
             lastPlayedAt = lp;
+          }
+          final ra = r['reviewed_at'] as int?;
+          if (ra != null && (reviewedAt == null || ra < reviewedAt)) {
+            reviewedAt = ra;
+          }
+          final fta = r['favorite_toggled_at'] as int?;
+          if (fta != null &&
+              (favoriteToggledAt == null || fta > favoriteToggledAt)) {
+            favoriteToggledAt = fta;
           }
         }
 
@@ -2490,6 +2535,8 @@ class LibraryRepository {
             'play_count': playCount,
             'cumulative_ms': cumulativeMs,
             'last_played_at': lastPlayedAt,
+            'reviewed_at': reviewedAt,
+            'favorite_toggled_at': favoriteToggledAt,
           },
           where: 'uid = ?',
           whereArgs: [canonicalUid],
@@ -2546,6 +2593,8 @@ class LibraryRepository {
              t.play_count AS play_count,
              t.cumulative_ms AS cumulative_ms,
              t.last_played_at AS last_played_at,
+             t.reviewed_at AS reviewed_at,
+             t.favorite_toggled_at AS favorite_toggled_at,
              idx.filename AS filename,
              idx.filesize AS filesize,
              idx.duration_ms AS duration_ms
@@ -2566,6 +2615,8 @@ class LibraryRepository {
           playCount: (r['play_count'] as int?) ?? 0,
           cumulativeMs: (r['cumulative_ms'] as int?) ?? 0,
           lastPlayedAt: r['last_played_at'] as int?,
+          reviewedAt: r['reviewed_at'] as int?,
+          favoriteToggledAt: r['favorite_toggled_at'] as int?,
         ),
     ];
   }
@@ -2636,6 +2687,8 @@ class LibraryRepository {
             'play_count': r.playCount,
             'cumulative_ms': r.cumulativeMs,
             'last_played_at': r.lastPlayedAt,
+            'reviewed_at': r.reviewedAt,
+            'favorite_toggled_at': r.favoriteToggledAt,
           }, conflictAlgorithm: ConflictAlgorithm.ignore);
           insertedAsGhost++;
         } catch (e) {
@@ -2663,7 +2716,23 @@ class LibraryRepository {
     final localCum = (localRow['cumulative_ms'] as int?) ?? 0;
     final localFav = ((localRow['favorite'] as int?) ?? 0) != 0;
     final localLast = localRow['last_played_at'] as int?;
+    final localReviewed = localRow['reviewed_at'] as int?;
+    final localFavToggled = localRow['favorite_toggled_at'] as int?;
     final localCreated = (localRow['created_at'] as int?) ?? imported.createdAt;
+
+    // reviewed_at merge: MIN wins (earliest review timestamp is the
+    // truth — once a track was reviewed, it stays reviewed; the
+    // earlier moment is the one that asserted state).
+    int? mergedReviewed;
+    if (localReviewed == null) {
+      mergedReviewed = imported.reviewedAt;
+    } else if (imported.reviewedAt == null) {
+      mergedReviewed = localReviewed;
+    } else {
+      mergedReviewed = localReviewed < imported.reviewedAt!
+          ? localReviewed
+          : imported.reviewedAt;
+    }
 
     await txn.update(
       'tracks',
@@ -2673,6 +2742,9 @@ class LibraryRepository {
             localCum > imported.cumulativeMs ? localCum : imported.cumulativeMs,
         'favorite': (localFav || imported.favorite) ? 1 : 0,
         'last_played_at': _maxNullable(localLast, imported.lastPlayedAt),
+        'reviewed_at': mergedReviewed,
+        'favorite_toggled_at':
+            _maxNullable(localFavToggled, imported.favoriteToggledAt),
         'created_at':
             localCreated < imported.createdAt ? localCreated : imported.createdAt,
       },
@@ -2687,18 +2759,50 @@ class LibraryRepository {
     return a > b ? a : b;
   }
 
+  /// Single mutation entry point for the `tracks` intelligence row.
+  ///
+  /// Every parameter is optional; non-null values are written, null
+  /// means "don't touch." Three special parameters need explanation:
+  ///
+  /// - [reviewedAt]: stamp the review timestamp. Pass `now` when the
+  ///   threshold-crossing path fires for the first time on this
+  ///   track; existing rows keep their original timestamp because
+  ///   the caller passes `existing ?? now`. Pass null to leave
+  ///   unchanged.
+  /// - [clearReviewedAt]: explicit `UPDATE … reviewed_at = NULL`.
+  ///   Set by the right-click "Mark unreviewed" path so the track
+  ///   becomes eligible for phone-rotation again. Wins over
+  ///   [reviewedAt] if both are passed (defense-in-depth).
+  /// - [favoriteToggledAt]: usually omitted — when [favorite] is
+  ///   non-null we auto-stamp `favorite_toggled_at` to `now`.
+  ///   Callers (phone-sync reconciler) that want to preserve a
+  ///   remote timestamp can pass it explicitly.
   Future<void> updateIntelligence({
     required String intelUid,
     bool? favorite,
     int? playCount,
     int? cumulativeMs,
     int? lastPlayedAt,
+    int? reviewedAt,
+    bool clearReviewedAt = false,
+    int? favoriteToggledAt,
   }) async {
     final values = <String, Object?>{};
-    if (favorite != null) values['favorite'] = favorite ? 1 : 0;
+    if (favorite != null) {
+      values['favorite'] = favorite ? 1 : 0;
+      values['favorite_toggled_at'] =
+          favoriteToggledAt ?? DateTime.now().millisecondsSinceEpoch;
+    } else if (favoriteToggledAt != null) {
+      values['favorite_toggled_at'] = favoriteToggledAt;
+    }
     if (playCount != null) values['play_count'] = playCount;
     if (cumulativeMs != null) values['cumulative_ms'] = cumulativeMs;
     if (lastPlayedAt != null) values['last_played_at'] = lastPlayedAt;
+    if (clearReviewedAt) {
+      values['reviewed_at'] = null;
+    } else if (reviewedAt != null) {
+      values['reviewed_at'] = reviewedAt;
+    }
     if (values.isEmpty) return;
     await _db.update(
       'tracks',
@@ -2845,6 +2949,8 @@ Map<String, Object?> _sourceToRow(Source s) => {
 Track _trackFromJoinedRow(Map<String, Object?> r) {
   final readAt = (r['metadata_read_at'] as int?) ?? 0;
   final lastPlayedAt = r['i_last_played_at'] as int?;
+  final reviewedAt = r['i_reviewed_at'] as int?;
+  final favoriteToggledAt = r['i_favorite_toggled_at'] as int?;
   final iFav = r['i_favorite'] as int?;
   return Track(
     uid: r['uid'] as String,
@@ -2880,6 +2986,12 @@ Track _trackFromJoinedRow(Map<String, Object?> r) {
     lastPlayedAt: lastPlayedAt == null
         ? null
         : DateTime.fromMillisecondsSinceEpoch(lastPlayedAt),
+    reviewedAt: reviewedAt == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(reviewedAt),
+    favoriteToggledAt: favoriteToggledAt == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(favoriteToggledAt),
   );
 }
 
